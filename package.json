@@ -1,0 +1,38 @@
+{
+  "name": "opencode2-cow-worktree",
+  "version": "0.0.0",
+  "description": "Copy-on-write worktree strategy for opencode2: cheap, fully independent working directories for parallel agents",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "opencode",
+    "opencode2",
+    "plugin",
+    "worktree",
+    "copy-on-write",
+    "reflink",
+    "ficlone",
+    "agents"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@opencode-ai/plugin": "^0.0.0-beta-17639",
+    "@types/bun": "latest",
+    "typescript": "^5.9.2"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=0.0.0-beta-17639"
+  }
+}
