@@ -29,9 +29,11 @@ The implementation is here and it runs. This plugin:
 - has a Linux backend (per-file `COPYFILE_FICLONE_FORCE` reflink) and a macOS
   backend (`copyfile(3)` with `COPYFILE_CLONE_FORCE` through `bun:ffi`) behind a
   platform seam;
-- passes 68 unit tests across 8 files;
+- passes the unit suite (`bun test`);
 - passes an e2e harness run against a real
-  `opencode2 v0.0.0-next-20260910` server: 80 of 80 checks.
+  `opencode2 v0.0.0-next-20260910` server;
+- is installed and activated in a real opencode2 config, with CI measuring the
+  macOS backend's shared extents on both an arm64 and an x86_64 runner.
 
 What the e2e run proved: plugin installation through the real loader, a fan-out
 of three parallel **Worktrees** each with a session of its own, genuine
@@ -45,9 +47,7 @@ tmpfs source, and clean removal.
 What it did **not** prove: the run drove `POST /api/worktree` and
 `POST /api/session` directly and performed the per-worktree edits itself. The
 isolated config had no provider credentials, so this was not a real multi-agent
-LLM fan-out — it proves filesystem isolation, not model behaviour. The macOS
-backend is unit-tested with an injected syscall only; it remains unverified on
-real APFS hardware (issue #7). Green CI does not close that.
+LLM fan-out — it proves filesystem isolation, not model behaviour.
 
 - [x] Glossary (`CONTEXT.md`) and ADRs 0001–0002
 - [x] CoW capability predicate (attempts a clone, not filesystem inspection)
@@ -55,10 +55,13 @@ real APFS hardware (issue #7). Green CI does not close that.
 - [x] `cow` Strategy registration
 - [x] `spawn_workspace` tool with an opt-in `git` fallback
 - [x] Linux and macOS backends behind a platform seam
-- [x] 68 unit tests
-- [x] e2e harness against a real opencode2 server (80/80 checks)
-- [ ] macOS/APFS on real hardware — issue #7 needs a human there
-- [ ] The fallback exercised through a real tool invocation against the server — issue #9
+- [x] Unit tests, and an e2e harness against a real opencode2 server
+- [x] macOS/APFS on real hardware — CI measures shared extents on arm64 and
+      x86_64 runners (issue #7)
+- [x] The fallback exercised through a real tool invocation against the server
+      (issue #9)
+- [x] Installed and dogfooded in a real opencode2 config
+      (`scripts/dogfood-install-check.ts`)
 - [ ] A published release (the package is `private: true`)
 
 ## How it plugs in
@@ -119,11 +122,20 @@ line. Today you install it by pointing opencode2 at a local plugin directory.
 A configured plugin target must be a **directory**, not a file. opencode2 logs
 `configured plugin path must be a directory` and skips a file target. The
 directory needs an `index` or `server` entrypoint that opencode2's `Host.resolve`
-can find; for this repo, an `index.ts` that re-exports the plugin entry works:
+can find:
 
 ```ts
-// /absolute/path/to/cow-plugin/index.ts
-export { default } from "/absolute/path/to/opencode2-cow-worktree/src/plugin.ts";
+// ~/.config/opencode/plugins/opencode2-cow-worktree/index.ts
+export { default } from "opencode2-cow-worktree";
+```
+
+For that bare specifier to resolve, the directory needs the package in a
+`node_modules` beside it. Symlink the checkout — opencode2's runtime is Bun, so
+tracked working-tree edits are picked up live with no build step:
+
+```sh
+ln -sfn /path/to/opencode2-cow-worktree \
+  ~/.config/opencode/plugins/opencode2-cow-worktree/node_modules/opencode2-cow-worktree
 ```
 
 Then declare it in `opencode.json`. The config field is **`plugins` (plural)**,
@@ -133,7 +145,7 @@ with entries of `{ package, options }`:
 {
   "plugins": [
     {
-      "package": "/absolute/path/to/cow-plugin",
+      "package": "~/.config/opencode/plugins/opencode2-cow-worktree",
       "options": { "fallback": "none" }
     }
   ]
@@ -142,6 +154,14 @@ with entries of `{ package, options }`:
 
 The field is `plugins`, not `plugin`. Declaring `plugin` (singular) produces a
 configuration diagnostic and the plugin silently never loads (findings #1).
+
+The install can be checked without touching a live session:
+`bun scripts/dogfood-install-check.ts` boots a throwaway server against the
+installed directory and asserts the plugin activates
+(`GET /api/plugin` reports `state.status: "active"`) and that a worktree create
+with **no** `strategy` field produces a Deep clone, which proves the `cow`
+Strategy became the Location default. Note `GET /api/plugin` returns
+`{ location, data }`, not a bare array.
 
 `options.fallback` controls the tool's fallback policy:
 
@@ -179,8 +199,11 @@ Runtime requirements:
   non-CoW filesystem the `cow` Strategy fails loudly. The source and the clone
   must also be on the same filesystem: a reflink does not cross a device
   boundary.
-- The macOS backend is `copyfile(3)` with `COPYFILE_CLONE_FORCE` on APFS, and is
-  unverified on real hardware — see issue #7.
+- The macOS backend is `copyfile(3)` with `COPYFILE_CLONE_FORCE` on APFS. It is
+  verified on real APFS hardware: CI measures shared extents with
+  `F_LOG2PHYS_EXT` on both an arm64 and an x86_64 macOS runner (`method:
+  F_LOG2PHYS_EXT`, block-level Jaccard overlap 1.000000), and mutating a byte
+  moves the block while leaving the source unchanged (ADR 0002).
 
 If you are checking an install, note that `GET /api/plugin` does not await
 activation; the configured plugin appears only after
@@ -190,9 +213,10 @@ immediately after boot can wrongly look empty.
 ## Testing
 
 ```sh
-bun test                     # unit tests
-bun run typecheck            # tsc --noEmit
-bun scripts/e2e/harness.ts   # end-to-end; needs opencode2 on PATH, git, cp, btrfs
+bun test                          # unit tests
+bun run typecheck                 # tsc --noEmit
+bun scripts/e2e/harness.ts        # end-to-end; needs opencode2 on PATH, git, cp, btrfs
+bun scripts/dogfood-install-check.ts  # proves a real config install; needs opencode2 on PATH, git
 ```
 
 The unit tests cover capability classification, the recursive Deep clone,
@@ -208,13 +232,8 @@ fail-loud, and removal checks. The recorded run is
 
 What remains unproven, and is not papered over here:
 
-- **macOS/APFS** on real hardware. Issue #7 needs a human on an APFS Mac pasting
-  the probe output; the Darwin tests inject the syscall and cannot substitute for
-  it. Green CI does not close it.
-- The **fallback through a real tool invocation** against the server. The API
-  path cannot reach it, so it is deferred to issue #9. It is covered at the tool
-  seam by `test/plugin-fallback.test.ts`.
-- Filesystems other than btrfs (positive) and tmpfs (negative).
+- Filesystems other than btrfs (positive) and tmpfs (negative). The macOS
+  backend is proven on real APFS by CI, not by the local harness.
 - A real **multi-agent LLM fan-out**. The harness asserts filesystem facts, not
   model reasoning.
 

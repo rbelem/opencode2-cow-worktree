@@ -32,8 +32,8 @@ There is no publish or release job; the package is `private: true`.
     filesystem tests, which discover their roots at runtime (below).
 - On macOS only, that the above also holds on Darwin.
 - **On macOS only, in `apfs-verification`, that the real Darwin backend
-  produces a clone with genuinely shared physical extents.** This is the job
-  that produces issue #7's evidence. See below.
+  produces a clone with genuinely shared physical extents.** This is what
+  verified and closed issue #7. See below.
 
 ## The `apfs-verification` job
 
