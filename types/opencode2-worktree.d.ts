@@ -1,10 +1,13 @@
 // Augmentations for opencode2 plugin API members that the running binary
 // implements but the published @opencode-ai/plugin beta has not yet typed.
 //
-// The installed beta (0.0.0-beta-17639) Context has no `worktree` domain and no
-// `location`; the running opencode2 build (v2 HEAD, packages/plugin 1.18.15)
-// exposes both. `Plugin.define` is an identity function at runtime, so code
-// using them runs today and type-checks once the published package catches up.
+// The installed plugin package is the old v1 build: its `Context` is a v1
+// `PluginInput` with no `worktree` domain and no `location`. An interface merge
+// would collide with the v1 members' types, so the augmentation adds a *new*
+// `Context` interface instead — exactly the v2 promise Context shape
+// (packages/plugin/src/promise/plugin.ts), with the worktree and location
+// domains filled in below. The running opencode2 binary (v2 HEAD) provides
+// both, so the code runs today and type-checks once the package catches up.
 //
 // Remove this file when `ctx.worktree` and `ctx.location` appear in
 // node_modules/@opencode-ai/plugin/dist/promise/plugin.d.ts.
