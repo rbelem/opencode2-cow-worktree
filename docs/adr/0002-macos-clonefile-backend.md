@@ -102,8 +102,9 @@ GitHub-hosted macOS runner:
    is required because `du`/`st_blocks` **double-count clones on APFS** — there
    is no `btrfs filesystem du` equivalent — so a clone looks like a full copy in
    those numbers. `ls -la` link counts are meaningless here. The syscall runs in
-   the `scripts/verify-apfs/log2phys.py` helper (Python `ctypes`, a child
-   process), **not** through `bun:ffi` — see "The varargs ABI hazard" below.
+   the `scripts/verify-apfs/log2phys.py` helper (the stdlib `fcntl` module, a
+   child process), **not** through `bun:ffi` — see "The varargs ABI hazard"
+   below.
    If the helper is unavailable or `F_LOG2PHYS_EXT` is refused, the job falls
    back to a `df` free-space delta around the clone (≈0 growth), and **says so
    in the output and the artifact**; the method is never left implicit.
@@ -174,19 +175,43 @@ while `fcntl` faults. The struct layout (20 bytes, `#pragma pack(4)`), the
 constant `F_LOG2PHYS_EXT = 65`, the `i32` command width, and the `Buffer`-as-
 `ptr` marshalling were all verified correct and were **not** the bug.
 
-**The fix removes `fcntl` from `bun:ffi` entirely.** `log2phys.py` makes the
-identical call via Python `ctypes` in a **child process**. `ctypes` also cannot
-declare varargs, but it does not need to: the call executes in that child's C
-runtime, so a bad ABI or a kernel refusal kills the helper and becomes a
-non-zero exit code (`log2phys` exits 3 off-Darwin, 5 on kernel refusal, 2 on
-usage error) that `extents.ts` turns into an `ExtentReadError`. The
-verification process itself can no longer fault at the FFI boundary. This is
-arch-independent, so **both matrix legs run the strong measurement**.
+**The fix removes `fcntl` from `bun:ffi` entirely and calls it through the
+stdlib `fcntl` module** in `log2phys.py`, a **child process**. The child-process
+boundary is for containment: a bad ABI or a kernel refusal kills the helper and
+becomes a non-zero exit code (`log2phys` exits 3 off-Darwin, 5 on kernel
+refusal, 2 on usage error) that `extents.ts` turns into an `ExtentReadError`,
+so the verification process can no longer fault at the FFI boundary.
+
+The module choice is the ABI fix. An earlier revision used Python `ctypes`
+here, on the mistaken belief that moving the call out of `bun:ffi` was
+sufficient. **`ctypes` cannot express varargs either, and that mattered.** With
+`argtypes` unset, CPython treats `fcntl` as fixed-arity — it only reaches
+`ffi_prep_cif_var` when `argtypes` is set and shorter than the supplied
+argument list (`Modules/_ctypes/callproc.c`). On Apple arm64, libffi gates the
+variadic register/stack split on `cif->aarch64_nfixedargs`, which the
+fixed-arity path leaves `0`; all three arguments go in `x0/x1/x2` while Apple
+clang compiled `fcntl` as variadic, so `va_arg(ap, void *)` read an unwritten
+**stack** slot and the kernel's `copyin` failed with `EFAULT` (errno 14). This
+is the same ABI split as the original `bun:ffi` bug — it merely downgraded the
+arm64 failure from a Bun segfault to a clean helper exit, not to a working
+measurement. `macos-latest` (arm64) reported `F_LOG2PHYS_EXT unavailable:
+log2phys helper exited 5: ... EFAULT (errno 14)` and fell back to `df-delta`,
+while `macos-15-intel` still measured correctly because x86_64 System V passes
+fixed and variadic arguments identically.
+
+The stdlib `fcntl.fcntl(fd, F_LOG2PHYS_EXT, packed_bytes)` call is correct **by
+construction**: it is made from C compiled against the real
+`int fcntl(int, int, ...)` prototype, so the anonymous argument lands wherever
+the kernel's `va_arg` reads it on every architecture. (`fcntl.fcntl` returns the
+mutated argument buffer as a new `bytes` object; the helper `struct.unpack`s the
+device offset back out.) This is arch-independent, so **both matrix legs run the
+strong measurement**.
 
 This is a genuinely useful lesson beyond this repo: a fixed-arity `bun:ffi`
-binding to a variadic libc function is silently wrong on x86_64 and
-segmenting on arm64. The reproduction is recorded here rather than filed
-upstream.
+binding to a variadic libc function is silently wrong on x86_64 and segfaulting
+on arm64, and marshalling the same call through `ctypes` without `argtypes`
+inherits the identical arm64 ABI bug. The reproduction is recorded here rather
+than filed upstream.
 
 ### Caveats that genuinely remain
 
@@ -198,18 +223,21 @@ upstream.
   then lost the evidence file entirely, so the `upload-artifact` step reported
   "No files were found". Both the invocation (now the `df`-resolved mount
   point) and the report guarantee (written on every exit path) are fixed.
-  The **second** failure was the arm64 `fcntl` fault described above; moving
-  the call to `log2phys.py` removes the ABI hazard, but the fix itself has not
-  yet run on a real runner. Everything past the platform check still has not
-  been observed to work on a real runner.
+  The **second** failure was the arm64 `fcntl` fault described above: moving
+  the call out of `bun:ffi` into a `ctypes` child stopped the Bun segfault but
+  produced a clean `EFAULT` on arm64, because `ctypes` also cannot express the
+  variadic prototype. The **third** state — the stdlib `fcntl` module, which
+  makes the ABI-correct call from C — has not yet run on a real runner.
+  Everything past the platform check still has not been observed to work on a
+  real runner.
 - **`F_LOG2PHYS_EXT` is assumed to be accepted by APFS.** The constant (65) and
   the 20-byte `#pragma pack(4)` `struct log2phys` are confirmed against XNU
   `bsd/sys/fcntl.h`, but `F_LOG2PHYS` was historically HFS-oriented and kernel
-  acceptance on APFS has still not been observed. The `ctypes` prototype
-  passes the struct by pointer with `use_errno=True`, so an `EINVAL`/`ENOTTY`
-  from the kernel becomes a clear helper exit rather than a fault. A refusal
-  falls back to the labelled `df`-delta method and prints the errno loudly; it
-  is not treated as success.
+  acceptance on APFS has still not been observed. The stdlib `fcntl` call
+  marshals the struct as raw `bytes`, and `fcntl` raises `OSError` for an
+  errno, so an `EINVAL`/`ENOTTY` from the kernel becomes a clear helper exit
+  rather than a fault. A refusal falls back to the labelled `df`-delta method
+  and prints the errno loudly; it is not treated as success.
 - **The helper adds a `python3` dependency.** The GitHub-hosted macOS images
   ship `/usr/bin/python3`. If it is absent, `execFileSync` throws `ENOENT`,
   which becomes an `ExtentReadError` and a labelled `df-delta` fallback; the
@@ -235,8 +263,9 @@ upstream.
   macOS runner, which measures shared extents.
 - The extent measurement does not share the `bun:ffi` binding style of the
   backend: the backend's `copyfile` is fixed-arity and safe, but any future
-  variadic libc call must go through `log2phys.py`-style `ctypes` rather than a
-  fixed-arity `bun:ffi` prototype.
+  variadic libc call must go through the stdlib binding (here, the `fcntl`
+  module used by `log2phys.py`) rather than a fixed-arity `bun:ffi` prototype
+  or a `ctypes` call with unset `argtypes` — both are wrong on arm64.
 - **Nothing here is verified on real APFS hardware until that job runs.** That
   is the ticket's acceptance criterion; the job produces the evidence and a
   human approves it. A green run alone does not close #7.
@@ -249,7 +278,7 @@ upstream.
 - XNU `bsd/sys/errno.h` (`__error`, `ENOTSUP` = 45 on Darwin)
 - XNU `bsd/sys/fcntl.h` (`F_LOG2PHYS_EXT` = 65, `struct log2phys`, and the
   variadic `int fcntl(int, int, ...)` prototype)
-- `scripts/verify-apfs/log2phys.py` — the `ctypes` helper the fix moved the
-  call into
+- `scripts/verify-apfs/log2phys.py` — the stdlib-`fcntl` helper the fix moved
+  the call into
 - Issue #7 research comment (libuv history, Bun behavior)
 - `scripts/verify-apfs/` — the CI evidence job for the acceptance criterion

@@ -10,10 +10,10 @@
  *      `df -T`) and print the raw mount facts;
  *   2. clone a block of bytes through the real backend;
  *   3. measure shared extents with `fcntl(fd, F_LOG2PHYS_EXT)` physical block
- *      mapping (Jaccard overlap ≈ 1.0), executed by the `log2phys.py` `ctypes`
- *      helper in a child process rather than through `bun:ffi` — Darwin's
- *      `fcntl` is variadic and a fixed-arity `bun:ffi` binding faults on arm64
- *      (see `extents.ts`). `df` free-space delta is the labelled fallback when
+ *      mapping (Jaccard overlap ≈ 1.0), executed by the `log2phys.py` helper
+ *      (stdlib `fcntl`) in a child process rather than through `bun:ffi` —
+ *      Darwin's `fcntl` is variadic and a fixed-arity `bun:ffi` binding faults
+ *      on arm64 (see `extents.ts`). `df` free-space delta is the labelled fallback when
  *      the helper is unavailable or the kernel refuses, because `du`/`st_blocks`
  *      double-count clones on APFS and link counts say nothing about CoW;
  *   4. mutate one byte in the clone; the source must be untouched and the
@@ -246,9 +246,10 @@ async function tryClone(source: string, clone: string, say: Reporter): Promise<n
 
 /**
  * Attempts the `F_LOG2PHYS_EXT` block map first — through the `log2phys.py`
- * `ctypes` helper, never a `bun:ffi` call, so a bad ABI or a crashed helper is
- * a child exit code here, not a fault in this process. Falls back to the `df`
- * free-space delta and labels the evidence with whichever method produced it.
+ * stdlib-`fcntl` helper, never a `bun:ffi` call, so a bad ABI or a crashed
+ * helper is a child exit code here, not a fault in this process. Falls back to
+ * the `df` free-space delta and labels the evidence with whichever method
+ * produced it.
  */
 async function measureExtents(
   source: string,

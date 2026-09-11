@@ -21,13 +21,25 @@
  * before it could write its report. No `try`/`catch` can recover from that:
  * the fault is at/through the FFI boundary.
  *
- * `log2phys.py` makes the identical `fcntl` call through Python `ctypes` in a
- * **child process**. The ABI hazard is thus confined: a bad call kills the
- * helper, not the verification run, and surfaces as a non-zero child exit the
- * caller falls back from. `ctypes` uses `use_errno=True` and passes the
- * `struct log2phys` by pointer, so the interface to libSystem stays narrow.
- * This is arch-independent, so both matrix legs (`macos-latest` arm64 and
- * `macos-15-intel`) run the strong measurement.
+ * `log2phys.py` makes the identical `fcntl` call through Python's stdlib
+ * `fcntl` module in a **child process**. The child boundary confines a bad ABI
+ * or a kernel refusal: it kills the helper, not the verification run, and
+ * surfaces as a non-zero child exit the caller falls back from. The stdlib
+ * module is the ABI fix itself — it issues the call from C compiled against
+ * the real `int fcntl(int, int, ...)` prototype, so Apple arm64's rule that
+ * anonymous arguments go on the stack is satisfied by construction.
+ *
+ * An earlier revision used `ctypes` here, believing the child process was
+ * sufficient. It was not: `ctypes` cannot express varargs, and with `argtypes`
+ * unset CPython treats `fcntl` as fixed-arity (it only reaches
+ * `ffi_prep_cif_var` when `argtypes` is set and shorter than the supplied
+ * argument list). On Apple arm64 libffi leaves `aarch64_nfixedargs` at `0`, so
+ * all three arguments go in registers while the variadic callee `va_arg`s an
+ * unwritten stack slot; `copyin` failed with `EFAULT`. That downgraded the
+ * failure from a Bun segfault to a clean helper exit, not to a measurement.
+ *
+ * The stdlib call is arch-independent, so both matrix legs (`macos-latest`
+ * arm64 and `macos-15-intel`) run the strong measurement.
  *
  * Struct layout and constants (`bsd/sys/fcntl.h`, XNU `main`; verified):
  * `#pragma pack(4)` gives `struct log2phys { unsigned int l2p_flags; off_t

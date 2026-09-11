@@ -60,7 +60,7 @@ What it does, in order:
    mapping and compares the source's and clone's block sets (Jaccard overlap
    ≈ 1.0). `du`/`st_blocks` **cannot** be used: APFS double-counts clones, so a
    genuine clone reads as a full copy there. The syscall runs in the
-   `scripts/verify-apfs/log2phys.py` helper (Python `ctypes`, a child
+   `scripts/verify-apfs/log2phys.py` helper (the stdlib `fcntl` module, a child
    process), **not** through `bun:ffi`: Darwin's `fcntl` is variadic and a
    fixed-arity `bun:ffi` binding works on x86_64 but segfaults the whole Bun
    process on arm64, taking the report with it. If the helper is unavailable
@@ -97,14 +97,28 @@ garbage: `macos-latest` panicked with `Segmentation fault at address
 surfaced during exception unwinding, so a `try`/`catch` around the FFI call
 could not have recovered the process or the artifact.
 
-The fix deletes the `bun:ffi` `fcntl` binding. `scripts/verify-apfs/log2phys.py`
-performs the same `fcntl(F_LOG2PHYS_EXT)` through Python `ctypes` in a **child
-process** (`use_errno=True`, struct passed by pointer). Any ABI or kernel
-problem now kills the helper and surfaces as a non-zero exit that `extents.ts`
-converts into an `ExtentReadError` — the process running the verification, and
-the report it writes in its `finally`, are never at risk. The call is
-arch-independent, so **both matrix legs run the strong measurement**. The
-helper is a `python3` dependency; every GitHub-hosted macOS image ships
+The first fix deleted the `bun:ffi` `fcntl` binding and moved the call into
+`scripts/verify-apfs/log2phys.py` using Python `ctypes`. That was **not
+enough**: `ctypes` cannot express varargs either, and with `argtypes` unset
+CPython treats `fcntl` as fixed-arity (it reaches `ffi_prep_cif_var` only when
+`argtypes` is set and shorter than the supplied argument list). On Apple arm64
+libffi gates the variadic register/stack split on `aarch64_nfixedargs`, which
+the fixed-arity path leaves `0`; all three arguments go in `x0/x1/x2` while the
+variadic callee `va_arg`s a stack slot that was never written. The run no
+longer segfaulted, but `macos-latest` reported `F_LOG2PHYS_EXT unavailable:
+log2phys helper exited 5: ... EFAULT (errno 14)` and fell back to the weaker
+`df-delta` method. `macos-15-intel` was unaffected — x86_64 System V passes
+fixed and variadic arguments identically.
+
+The correct fix is the stdlib `fcntl` module. `fcntl.fcntl(fd,
+F_LOG2PHYS_EXT, packed_bytes)` issues the call from C compiled against the real
+`int fcntl(int, int, ...)` prototype, so the anonymous argument lands wherever
+the kernel's `va_arg` reads it on every architecture. It still runs in a
+**child process**, so a bad ABI or a kernel refusal surfaces as a non-zero exit
+that `extents.ts` converts into an `ExtentReadError` — the process running the
+verification, and the report it writes in its `finally`, are never at risk. The
+call is arch-independent, so **both matrix legs run the strong measurement**.
+The helper is a `python3` dependency; every GitHub-hosted macOS image ships
 `/usr/bin/python3`, and an interpreter that is missing becomes the labelled
 `df` fallback rather than an error.
 
