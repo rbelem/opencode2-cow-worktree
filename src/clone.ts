@@ -1,6 +1,5 @@
-import { constants, type Dirent } from "node:fs";
+import { type Dirent } from "node:fs";
 import {
-  copyFile,
   lstat,
   mkdir,
   readdir,
@@ -8,18 +7,19 @@ import {
   symlink,
 } from "node:fs/promises";
 import { join } from "node:path";
+import { cloneFile } from "./platform";
 
 /**
- * Reflink one regular file, sharing its extents with `source`.
+ * CoW-clone one regular file, sharing its extents with `source`.
  *
- * `COPYFILE_FICLONE_FORCE` makes the copy fail when copy-on-write is
- * unavailable instead of silently falling back to a full byte copy. The error
- * is propagated, never swallowed: a filesystem that cannot share extents must
- * surface as a failure, not as a correct-looking clone made by the wrong
- * mechanism.
+ * Dispatches to the platform backend: `COPYFILE_FICLONE_FORCE` on Linux, and
+ * `copyfile(3)` with `COPYFILE_CLONE_FORCE` on macOS. Both fail instead of
+ * falling back to a full byte copy; the error is propagated, never swallowed.
+ * A filesystem that cannot share extents must surface as a failure, not as a
+ * correct-looking clone made by the wrong mechanism.
  */
 export async function reflinkFile(source: string, target: string): Promise<void> {
-  await copyFile(source, target, constants.COPYFILE_FICLONE_FORCE);
+  await cloneFile(source, target);
 }
 
 /**

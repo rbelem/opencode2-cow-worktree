@@ -27,10 +27,11 @@ export type CowCloneAttempt = (
 ) => Promise<void>;
 
 /**
- * Default clone operation: `reflinkFile` uses `COPYFILE_FICLONE_FORCE`, which
- * fails instead of silently degrading to a byte copy — the semantics this
- * predicate needs. Plain `COPYFILE_FICLONE` would report `supported` on a
- * filesystem without CoW support.
+ * Default clone operation: `reflinkFile`, which is the platform's forced CoW
+ * clone — `COPYFILE_FICLONE_FORCE` on Linux, `copyfile(3)` with
+ * `COPYFILE_CLONE_FORCE` on macOS. Both fail instead of silently degrading to a
+ * byte copy, which is the semantics this predicate needs; a best-try flag would
+ * report `supported` on a filesystem without CoW support.
  */
 const cloneWithReflink: CowCloneAttempt = reflinkFile;
 
