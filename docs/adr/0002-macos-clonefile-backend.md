@@ -101,10 +101,12 @@ GitHub-hosted macOS runner:
    `fcntl(fd, F_LOG2PHYS_EXT)` and compares them (Jaccard overlap ≈ 1.0). This
    is required because `du`/`st_blocks` **double-count clones on APFS** — there
    is no `btrfs filesystem du` equivalent — so a clone looks like a full copy in
-   those numbers. `ls -la` link counts are meaningless here.
-   If `F_LOG2PHYS_EXT` is unavailable, the job falls back to a `df` free-space
-   delta around the clone (≈0 growth), and **says so in the output and the
-   artifact**; the method is never left implicit.
+   those numbers. `ls -la` link counts are meaningless here. The syscall runs in
+   the `scripts/verify-apfs/log2phys.py` helper (Python `ctypes`, a child
+   process), **not** through `bun:ffi` — see "The varargs ABI hazard" below.
+   If the helper is unavailable or `F_LOG2PHYS_EXT` is refused, the job falls
+   back to a `df` free-space delta around the clone (≈0 growth), and **says so
+   in the output and the artifact**; the method is never left implicit.
 4. **Copy-on-write is confirmed** by mutating one byte in the clone and
    re-measuring: the source must be byte-unchanged and the mutated block must
    move to a new device offset (or the volume must grow, under the fallback). A
@@ -138,23 +140,81 @@ on a Mac as:
 bun run scripts/verify-apfs/verify-apfs.ts --report=/tmp/apfs.txt
 ```
 
+### The varargs ABI hazard (`fd → F_LOG2PHYS_EXT`)
+
+The extent measurement originally reached `fcntl` through `bun:ffi`, the same
+mechanism as the backend under test — a fixed-arity binding:
+
+```ts
+fcntl: { args: ["i32", "i32", "ptr"], returns: "i32" }
+```
+
+That is wrong in a way that is invisible on one architecture and fatal on the
+other. Darwin's `fcntl` is **variadic** (`bsd/sys/fcntl.h`:
+`int fcntl(int, int, ...) __DARWIN_ALIAS_C(fcntl);`) and **`bun:ffi` cannot
+express varargs** — `FFIFunction.args` is fixed-arity. The consequences differ
+by ABI:
+
+- **x86_64 (System V):** fixed and variadic arguments are passed in the same
+  registers, so the fixed-arity binding accidentally works. The
+  `macos-15-intel` leg produced correct Intel evidence (`method:
+  F_LOG2PHYS_EXT`, `overlap (Jaccard) = 1.000000`, `mutation: source
+  changed=false block moved=true`).
+- **arm64 (AAPCS64):** anonymous arguments are placed on the stack, so the
+  kernel's `va_arg(ap, void *)` read a garbage pointer.
+  `macos-latest` (arm64) died with `panic(main thread): Segmentation fault at
+  address 0xF9BC600000000008` / exit 139, **before writing its report**. The
+  fault surfaced during JSC exception unwinding after the bad call, so no
+  `try`/`catch` around the FFI call could have saved the process or the
+  artifact.
+
+The control experiment is in the same job's logs: `copyfile` — fixed-arity and
+correctly declared — is bound from the *same* `dlopen` and works on arm64,
+while `fcntl` faults. The struct layout (20 bytes, `#pragma pack(4)`), the
+constant `F_LOG2PHYS_EXT = 65`, the `i32` command width, and the `Buffer`-as-
+`ptr` marshalling were all verified correct and were **not** the bug.
+
+**The fix removes `fcntl` from `bun:ffi` entirely.** `log2phys.py` makes the
+identical call via Python `ctypes` in a **child process**. `ctypes` also cannot
+declare varargs, but it does not need to: the call executes in that child's C
+runtime, so a bad ABI or a kernel refusal kills the helper and becomes a
+non-zero exit code (`log2phys` exits 3 off-Darwin, 5 on kernel refusal, 2 on
+usage error) that `extents.ts` turns into an `ExtentReadError`. The
+verification process itself can no longer fault at the FFI boundary. This is
+arch-independent, so **both matrix legs run the strong measurement**.
+
+This is a genuinely useful lesson beyond this repo: a fixed-arity `bun:ffi`
+binding to a variadic libc function is silently wrong on x86_64 and
+segmenting on arm64. The reproduction is recorded here rather than filed
+upstream.
+
 ### Caveats that genuinely remain
 
-- **First executed on a macOS runner on 2026-09-11, and it failed.** The failure
-  was in the APFS assertion, before the backend was reached: `diskutil info`
-  was handed the scratch *subdirectory*, which is not a disk, and returned
-  `Could not find disk: /Users/runner/work/_temp/cow-apfs-XXXX`; the uncaught
-  `execFileSync` throw then lost the evidence file entirely, so the
-  `upload-artifact` step reported "No files were found". Both the invocation
-  (now the `df`-resolved mount point) and the report guarantee (written on every
-  exit path) are fixed. Everything past the platform check still has not been
-  observed to work on a real runner.
+- **First executed on a macOS runner on 2026-09-11, and it failed.** The first
+  failure was in the APFS assertion, before the backend was reached:
+  `diskutil info` was handed the scratch *subdirectory*, which is not a disk,
+  and returned `Could not find disk:
+  /Users/runner/work/_temp/cow-apfs-XXXX`; the uncaught `execFileSync` throw
+  then lost the evidence file entirely, so the `upload-artifact` step reported
+  "No files were found". Both the invocation (now the `df`-resolved mount
+  point) and the report guarantee (written on every exit path) are fixed.
+  The **second** failure was the arm64 `fcntl` fault described above; moving
+  the call to `log2phys.py` removes the ABI hazard, but the fix itself has not
+  yet run on a real runner. Everything past the platform check still has not
+  been observed to work on a real runner.
 - **`F_LOG2PHYS_EXT` is assumed to be accepted by APFS.** The constant (65) and
   the 20-byte `#pragma pack(4)` `struct log2phys` are confirmed against XNU
-  `bsd/sys/fcntl.h`, but `F_LOG2PHYS` was historically HFS-oriented and neither
-  kernel acceptance on APFS nor the `bun:ffi`/libSystem ABI has been observed. A
-  refusal falls back to the labelled `df`-delta method and prints the errno
-  loudly; it is not treated as success.
+  `bsd/sys/fcntl.h`, but `F_LOG2PHYS` was historically HFS-oriented and kernel
+  acceptance on APFS has still not been observed. The `ctypes` prototype
+  passes the struct by pointer with `use_errno=True`, so an `EINVAL`/`ENOTTY`
+  from the kernel becomes a clear helper exit rather than a fault. A refusal
+  falls back to the labelled `df`-delta method and prints the errno loudly; it
+  is not treated as success.
+- **The helper adds a `python3` dependency.** The GitHub-hosted macOS images
+  ship `/usr/bin/python3`. If it is absent, `execFileSync` throws `ENOENT`,
+  which becomes an `ExtentReadError` and a labelled `df-delta` fallback; the
+  evidence says the helper could not be run. On Linux, the helper exits 3 and
+  the same fallback applies, but the verification job skips before then.
 - A green run attests to **that runner image's macOS version and one APFS
   volume**. It cannot attest to an arbitrary user's machine.
 - **Cross-volume clones are not covered** and correctly return `EXDEV`; the
@@ -173,6 +233,10 @@ bun run scripts/verify-apfs/verify-apfs.ts --report=/tmp/apfs.txt
 - The Darwin decision logic is unit-tested with an injected syscall. The real
   `copyfile(3)` binding is exercised by the `apfs-verification` CI job on a
   macOS runner, which measures shared extents.
+- The extent measurement does not share the `bun:ffi` binding style of the
+  backend: the backend's `copyfile` is fixed-arity and safe, but any future
+  variadic libc call must go through `log2phys.py`-style `ctypes` rather than a
+  fixed-arity `bun:ffi` prototype.
 - **Nothing here is verified on real APFS hardware until that job runs.** That
   is the ticket's acceptance criterion; the job produces the evidence and a
   human approves it. A green run alone does not close #7.
@@ -183,6 +247,9 @@ bun run scripts/verify-apfs/verify-apfs.ts --report=/tmp/apfs.txt
 - `copyfile(3)` man page:
   <https://keith.github.io/xcode-man-pages/copyfile.3.html>
 - XNU `bsd/sys/errno.h` (`__error`, `ENOTSUP` = 45 on Darwin)
-- XNU `sys/fcntl.h` (`F_LOG2PHYS_EXT` = 65, `struct log2phys`)
+- XNU `bsd/sys/fcntl.h` (`F_LOG2PHYS_EXT` = 65, `struct log2phys`, and the
+  variadic `int fcntl(int, int, ...)` prototype)
+- `scripts/verify-apfs/log2phys.py` — the `ctypes` helper the fix moved the
+  call into
 - Issue #7 research comment (libuv history, Bun behavior)
 - `scripts/verify-apfs/` — the CI evidence job for the acceptance criterion

@@ -10,8 +10,11 @@
  *      `df -T`) and print the raw mount facts;
  *   2. clone a block of bytes through the real backend;
  *   3. measure shared extents with `fcntl(fd, F_LOG2PHYS_EXT)` physical block
- *      mapping (Jaccard overlap ≈ 1.0). `df` free-space delta is the labelled
- *      fallback when `F_LOG2PHYS_EXT` is impractical, because `du`/`st_blocks`
+ *      mapping (Jaccard overlap ≈ 1.0), executed by the `log2phys.py` `ctypes`
+ *      helper in a child process rather than through `bun:ffi` — Darwin's
+ *      `fcntl` is variadic and a fixed-arity `bun:ffi` binding faults on arm64
+ *      (see `extents.ts`). `df` free-space delta is the labelled fallback when
+ *      the helper is unavailable or the kernel refuses, because `du`/`st_blocks`
  *      double-count clones on APFS and link counts say nothing about CoW;
  *   4. mutate one byte in the clone; the source must be untouched and the
  *      mutated block must move to a new device offset (or the volume must grow
@@ -242,7 +245,9 @@ async function tryClone(source: string, clone: string, say: Reporter): Promise<n
 }
 
 /**
- * Attempts the `F_LOG2PHYS_EXT` block map first; falls back to the `df`
+ * Attempts the `F_LOG2PHYS_EXT` block map first — through the `log2phys.py`
+ * `ctypes` helper, never a `bun:ffi` call, so a bad ABI or a crashed helper is
+ * a child exit code here, not a fault in this process. Falls back to the `df`
  * free-space delta and labels the evidence with whichever method produced it.
  */
 async function measureExtents(
@@ -284,7 +289,14 @@ async function measureExtents(
     say(`F_LOG2PHYS_EXT unavailable: ${error instanceof Error ? error.message : String(error)}`);
     say(`errno code: ${errorCode(error) ?? "none"}`);
     say("Falling back to the df free-space delta; the evidence is labelled with the method used.");
-    return { method: "df-delta", overlap: undefined, cloneGrowthBytes, module: undefined, sourceMap: undefined, stride: 4096 };
+    return {
+      method: "df-delta",
+      overlap: undefined,
+      cloneGrowthBytes,
+      module: undefined,
+      sourceMap: undefined,
+      stride: 4096,
+    };
   }
 }
 
@@ -498,12 +510,7 @@ function deviceOffsetAt(
   offset: number,
   stride: number,
 ): bigint {
-  const fd = openSync(path, "r");
-  try {
-    return module.physicalMappingAt(fd, offset, stride).deviceOffset;
-  } finally {
-    closeSync(fd);
-  }
+  return module.physicalMappingAt(path, offset, stride).deviceOffset;
 }
 
 const exitCode = await main().catch((error: unknown) => {

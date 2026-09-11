@@ -8,9 +8,26 @@
  * nothing about CoW. This is the method the CI evidence is built on; the
  * `df` free-space delta in `verify-apfs.ts` is the labelled fallback.
  *
- * The syscall is reached through `bun:ffi`, the same mechanism as the backend
- * under test (`src/platform-darwin-ffi.ts`), so this runs on the runner with no
- * native build step.
+ * ## Why the call is a `python3` subprocess, not a `bun:ffi` binding
+ *
+ * Darwin's `fcntl` is **variadic** — `int fcntl(int, int, ...)` per XNU
+ * `bsd/sys/fcntl.h` — and `bun:ffi` cannot declare a variadic prototype:
+ * `FFIFunction.args` is fixed-arity. A fixed-arity binding still produced
+ * correct Intel evidence because System V passes the third argument the same
+ * way the variadic callee reads it, but on arm64 (AAPCS64) the anonymous
+ * argument is read from a different place. The kernel then dereferenced a
+ * garbage pointer and the whole Bun process faulted during exception
+ * unwinding (`Segmentation fault at address 0xF9BC600000000008`, exit 139)
+ * before it could write its report. No `try`/`catch` can recover from that:
+ * the fault is at/through the FFI boundary.
+ *
+ * `log2phys.py` makes the identical `fcntl` call through Python `ctypes` in a
+ * **child process**. The ABI hazard is thus confined: a bad call kills the
+ * helper, not the verification run, and surfaces as a non-zero child exit the
+ * caller falls back from. `ctypes` uses `use_errno=True` and passes the
+ * `struct log2phys` by pointer, so the interface to libSystem stays narrow.
+ * This is arch-independent, so both matrix legs (`macos-latest` arm64 and
+ * `macos-15-intel`) run the strong measurement.
  *
  * Struct layout and constants (`bsd/sys/fcntl.h`, XNU `main`; verified):
  * `#pragma pack(4)` gives `struct log2phys { unsigned int l2p_flags; off_t
@@ -21,59 +38,46 @@
  * device offset).
  *
  * NOT verified: that a modern APFS kernel accepts this fcntl for regular files
- * (`F_LOG2PHYS` was historically HFS-oriented), and that `bun:ffi`'s
- * `fcntl(fd, cmd, ptr)` binding matches libSystem's ABI. The first real CI run
- * failed before this code was reached, so neither has been observed. A refusal
- * falls back to the labelled `df`-delta method rather than crashing, and
- * `physicalMappingAt` prints the reason loudly the first time it is refused.
+ * (`F_LOG2PHYS` was historically HFS-oriented). A refusal falls back to the
+ * labelled `df`-delta method rather than crashing, and `verify-apfs.ts` prints
+ * the helper's errno loudly the first time.
  */
-import { dlopen, FFIType, read } from "bun:ffi";
-import { closeSync, openSync, statSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { statSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 /** `F_LOG2PHYS_EXT` from XNU `bsd/sys/fcntl.h`. */
 export const F_LOG2PHYS_EXT = 65;
 
-/** `#pragma pack(4)` makes `struct log2phys` 20 bytes, not 24. */
-export const L2P_STRUCT_BYTES = 20;
-
 const DEFAULT_BLOCK_BYTES = 4096;
 
-const ERRNO_NAMES: Readonly<Record<number, string>> = {
-  1: "EPERM",
-  5: "EIO",
-  13: "EACCES",
-  14: "EFAULT",
-  18: "EXDEV",
-  22: "EINVAL",
-  25: "ENOTTY",
-  34: "ERANGE",
-  45: "ENOTSUP",
-  78: "ENOSYS",
-};
+/** The helper lives next to this module; `python3` is invoked with its path. */
+const HELPER_PATH = fileURLToPath(new URL("./log2phys.py", import.meta.url));
 
-interface Fcns {
-  readonly fcntl: (fd: number, cmd: number, arg: Buffer) => number;
-  readonly __error: () => number;
+/**
+ * A 64 MiB probe at `st_blksize` granularity is ~16k lines. The cap supports
+ * the 1M-sample ceiling with room to spare so `execFileSync` cannot throw
+ * `ENOBUFS` on a legitimate sample set.
+ */
+const HELPER_MAX_BUFFER = 64 * 1024 * 1024;
+
+/**
+ * Overridable for the same reason `PYTHON` is a convention in CI: a runner
+ * with a non-default interpreter name. Defaults to `python3`, which every
+ * GitHub-hosted macOS image ships as `/usr/bin/python3`.
+ */
+function pythonBin(): string {
+  return process.env.COW_LOG2PHYS_PYTHON ?? "python3";
 }
 
-let symbols: Fcns | undefined;
-
-function load(): Fcns {
-  if (symbols !== undefined) return symbols;
-  const loaded = dlopen("/usr/lib/libSystem.B.dylib", {
-    fcntl: { args: ["i32", "i32", "ptr"], returns: "i32" },
-    __error: { args: [], returns: FFIType.ptr },
-  }) as { symbols: Fcns };
-  symbols = loaded.symbols;
-  return symbols;
+/** One physical mapping as printed by `log2phys.py`. */
+export interface HelperSample {
+  readonly offset: bigint;
+  readonly deviceOffset: bigint;
+  readonly contiguousBytes: bigint;
 }
 
-function darwinErrno(fcns: Fcns): string {
-  const errno = read.i32(fcns.__error());
-  return ERRNO_NAMES[errno] ?? `ERRNO_${errno}`;
-}
-
-/** A failure reading the physical mapping, carrying the Darwin errno name. */
+/** A failure reading the physical mapping, carrying a Darwin/helper code. */
 export class ExtentReadError extends Error {
   readonly code: string;
 
@@ -84,54 +88,131 @@ export class ExtentReadError extends Error {
   }
 }
 
-let warnedOnce = false;
+/**
+ * Parses the helper's tab-separated stdout:
+ * `<offset>\t<deviceOffset>\t<contiguousBytes>` per line. Exported so the
+ * contract is unit-tested without a Mac.
+ */
+export function parseLog2Phys(stdout: string): readonly HelperSample[] {
+  const samples: HelperSample[] = [];
+  for (const line of stdout.split("\n")) {
+    if (line.trim() === "") continue;
+    const [rawOffset, rawDevice, rawContiguous] = line.trim().split("\t");
+    if (rawOffset === undefined || rawDevice === undefined) {
+      throw new ExtentReadError(`log2phys helper emitted an unparseable line: ${line}`, "EPROTO");
+    }
+    samples.push({
+      offset: toBigInt(rawOffset, line),
+      deviceOffset: toBigInt(rawDevice, line),
+      contiguousBytes: rawContiguous === undefined ? 0n : toBigInt(rawContiguous, line),
+    });
+  }
+  return samples;
+}
+
+function toBigInt(value: string, line: string): bigint {
+  try {
+    return BigInt(value);
+  } catch {
+    throw new ExtentReadError(`log2phys helper emitted a non-numeric field: ${line}`, "EPROTO");
+  }
+}
+
+interface HelperFailure {
+  readonly status: number | undefined;
+  readonly signal: string | undefined;
+  readonly sourceCode: string | undefined;
+  readonly stderr: string;
+}
+
+function describeHelperFailure(error: unknown): HelperFailure {
+  if (typeof error !== "object" || error === null) {
+    return { status: undefined, signal: undefined, sourceCode: undefined, stderr: String(error) };
+  }
+  const record = error as { status?: unknown; signal?: unknown; code?: unknown; stderr?: unknown };
+  return {
+    status: typeof record.status === "number" ? record.status : undefined,
+    signal: typeof record.signal === "string" ? record.signal : undefined,
+    sourceCode: typeof record.code === "string" ? record.code : undefined,
+    stderr: toText(record.stderr),
+  };
+}
+
+function toText(value: unknown): string {
+  if (typeof value === "string") return value.trim();
+  if (Buffer.isBuffer(value)) return value.toString("utf8").trim();
+  return "";
+}
+
+/** The first Darwin errno name the helper named (e.g. `ENOTSUP`), if any. */
+function firstErrnoName(stderr: string): string | undefined {
+  return stderr.match(/\b(E[A-Z][A-Z0-9_]*)\b/)?.[1];
+}
+
+function helperFailureCode(failure: HelperFailure): string {
+  return (
+    firstErrnoName(failure.stderr) ??
+    (failure.signal !== undefined ? `ESIGNAL_${failure.signal}` : undefined) ??
+    (failure.status !== undefined ? `EHELPER${failure.status}` : undefined) ??
+    failure.sourceCode ??
+    "EHELPER"
+  );
+}
+
+function helperFailureMessage(failure: HelperFailure): string {
+  const where =
+    failure.signal !== undefined
+      ? `log2phys helper killed by ${failure.signal}`
+      : failure.status !== undefined
+        ? `log2phys helper exited ${failure.status}`
+        : "could not run the log2phys helper";
+  return failure.stderr.length > 0 ? `${where}: ${failure.stderr}` : where;
+}
 
 /**
- * Prints the raw kernel refusal the first time. The fallback to `df` is
- * labelled in the report either way, but if `F_LOG2PHYS_EXT` is rejected on
- * APFS the reason must be visible, not inferred from a sudden switch of
- * measured method.
+ * Runs `log2phys.py` against `path` and returns its parsed samples. Any child
+ * failure — a missing `python3`, a non-Darwin platform, a kernel refusal, a
+ * crashed helper — becomes an `ExtentReadError`, never a fault in this
+ * process.
  */
-function warnOnce(code: string): void {
-  if (warnedOnce) return;
-  warnedOnce = true;
-  console.error(`[extents] F_LOG2PHYS_EXT refused by the kernel: ${code}`);
+function runHelper(
+  path: string,
+  stride: number,
+  extra: readonly string[],
+): readonly HelperSample[] {
+  let stdout: string;
+  try {
+    stdout = execFileSync(pythonBin(), [HELPER_PATH, path, "--stride", String(stride), ...extra], {
+      encoding: "utf8",
+      maxBuffer: HELPER_MAX_BUFFER,
+    });
+  } catch (error) {
+    const failure = describeHelperFailure(error);
+    throw new ExtentReadError(helperFailureMessage(failure), helperFailureCode(failure));
+  }
+  return parseLog2Phys(stdout);
+}
+
+/** Where the file's byte range starting at `logicalOffset` physically lives. */
+export function physicalMappingAt(
+  path: string,
+  logicalOffset: number,
+  queryBytes: number,
+): PhysicalMapping {
+  const samples = runHelper(path, queryBytes, ["--offset", String(logicalOffset)]);
+  const sample = samples[0];
+  if (sample === undefined) {
+    throw new ExtentReadError(
+      `log2phys helper returned no mapping for offset ${logicalOffset}`,
+      "EPROTO",
+    );
+  }
+  return { deviceOffset: sample.deviceOffset, contiguousBytes: sample.contiguousBytes };
 }
 
 export interface PhysicalMapping {
   readonly deviceOffset: bigint;
   readonly contiguousBytes: bigint;
-}
-
-/**
- * Where the file's byte range starting at `logicalOffset` physically lives.
- * Throws `ExtentReadError` on a kernel refusal.
- */
-export function physicalMappingAt(
-  fd: number,
-  logicalOffset: number,
-  queryBytes: number,
-): PhysicalMapping {
-  const fcns = load();
-  const struct = Buffer.alloc(L2P_STRUCT_BYTES);
-  struct.writeUInt32LE(0, 0);
-  struct.writeBigInt64LE(BigInt(queryBytes), 4);
-  struct.writeBigInt64LE(BigInt(logicalOffset), 12);
-
-  const result = fcns.fcntl(fd, F_LOG2PHYS_EXT, struct);
-  if (result === -1) {
-    const code = darwinErrno(fcns);
-    warnOnce(code);
-    throw new ExtentReadError(
-      `F_LOG2PHYS_EXT failed at offset ${logicalOffset} (${queryBytes} B queried)`,
-      code,
-    );
-  }
-
-  return {
-    contiguousBytes: struct.readBigInt64LE(4),
-    deviceOffset: struct.readBigInt64LE(12),
-  };
 }
 
 export interface PhysicalBlockMap {
@@ -150,23 +231,16 @@ export function blockStride(path: string): number {
 }
 
 /**
- * Samples the physical block map of `path` at `stride`-byte intervals. One
- * device offset is recorded per sampled logical offset; the Jaccard comparison
- * in `logic.ts` then reports how much of the map is shared.
+ * Samples the physical block map of `path` at `stride`-byte intervals, in one
+ * helper invocation. One device offset is recorded per sampled logical offset;
+ * the Jaccard comparison in `logic.ts` then reports how much of the map is
+ * shared.
  */
 export function samplePhysicalBlocks(path: string, maxSamples = 1_000_000): PhysicalBlockMap {
   const stride = blockStride(path);
   const fileSize = statSync(path).size;
-  const fd = openSync(path, "r");
-  try {
-    const offsets = new Set<bigint>();
-    let samples = 0;
-    for (let offset = 0; offset < fileSize && samples < maxSamples; offset += stride) {
-      offsets.add(physicalMappingAt(fd, offset, stride).deviceOffset);
-      samples += 1;
-    }
-    return { offsets, stride, fileSize, samples };
-  } finally {
-    closeSync(fd);
-  }
+  const samples = runHelper(path, stride, ["--max-samples", String(maxSamples)]);
+  const offsets = new Set<bigint>();
+  for (const sample of samples) offsets.add(sample.deviceOffset);
+  return { offsets, stride, fileSize, samples: samples.length };
 }

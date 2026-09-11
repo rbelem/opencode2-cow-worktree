@@ -24,6 +24,9 @@ There is no publish or release job; the package is `private: true`.
   - `scripts/verify-apfs/logic.test.ts` — the APFS verification verdict logic
     (`diskutil`/`df` parsing, the Jaccard overlap thresholds, and the
     copy-on-write mutation verdict). Platform-independent.
+  - `scripts/verify-apfs/log2phys.test.ts` — the `log2phys.py` helper's
+    argument contract, its non-Darwin guard, and the parser for its stdout.
+    Runs on Linux; the real device offsets only exist on macOS.
   - `test/clone.test.ts`, `test/strategy.test.ts`, `test/tool.test.ts`,
     `test/plugin-fallback.test.ts`, `test/platform.test.ts` — the real
     filesystem tests, which discover their roots at runtime (below).
@@ -56,9 +59,13 @@ What it does, in order:
 3. **Measures shared extents** with `fcntl(fd, F_LOG2PHYS_EXT)` physical block
    mapping and compares the source's and clone's block sets (Jaccard overlap
    ≈ 1.0). `du`/`st_blocks` **cannot** be used: APFS double-counts clones, so a
-   genuine clone reads as a full copy there. If `F_LOG2PHYS_EXT` is
-   unavailable, the job falls back to a `df` free-space delta (≈0 growth around
-   the clone) and **labels the evidence with the method used**.
+   genuine clone reads as a full copy there. The syscall runs in the
+   `scripts/verify-apfs/log2phys.py` helper (Python `ctypes`, a child
+   process), **not** through `bun:ffi`: Darwin's `fcntl` is variadic and a
+   fixed-arity `bun:ffi` binding works on x86_64 but segfaults the whole Bun
+   process on arm64, taking the report with it. If the helper is unavailable
+   or the kernel refuses, the job falls back to a `df` free-space delta (≈0
+   growth around the clone) and **labels the evidence with the method used**.
 4. **Confirms copy-on-write** by mutating one byte in the clone: the source
    must be byte-unchanged and the mutated block must move to a new device
    offset (or the volume must grow, under the fallback). A hardlink would
@@ -77,6 +84,29 @@ script wrote nothing, and the upload step then failed with "No files were found
 with the provided path". A failing verification no longer costs its own
 evidence. `macos-15-intel` is a one-off cross-check on a distinct image and
 architecture; drop it when `macos-15` retires in Fall 2027.
+
+### The arm64 `fcntl` fault (why the measurement is a `python3` helper)
+
+Earlier revisions bound `fcntl` through `bun:ffi` as a fixed-arity function.
+Darwin's `fcntl` is variadic, and `bun:ffi` cannot express varargs. On x86_64
+that mismatch is invisible — the third argument lands where the callee reads it
+— so `macos-15-intel` produced correct evidence. On arm64 (AAPCS64) the
+anonymous argument is read from the stack instead, so the kernel dereferenced
+garbage: `macos-latest` panicked with `Segmentation fault at address
+0xF9BC600000000008` (exit 139) **before writing its report**. The fault
+surfaced during exception unwinding, so a `try`/`catch` around the FFI call
+could not have recovered the process or the artifact.
+
+The fix deletes the `bun:ffi` `fcntl` binding. `scripts/verify-apfs/log2phys.py`
+performs the same `fcntl(F_LOG2PHYS_EXT)` through Python `ctypes` in a **child
+process** (`use_errno=True`, struct passed by pointer). Any ABI or kernel
+problem now kills the helper and surfaces as a non-zero exit that `extents.ts`
+converts into an `ExtentReadError` — the process running the verification, and
+the report it writes in its `finally`, are never at risk. The call is
+arch-independent, so **both matrix legs run the strong measurement**. The
+helper is a `python3` dependency; every GitHub-hosted macOS image ships
+`/usr/bin/python3`, and an interpreter that is missing becomes the labelled
+`df` fallback rather than an error.
 
 ### What the job does **not** prove
 
@@ -161,7 +191,7 @@ Skips are honest, in the test output, and countable. There is no
 | This btrfs host | **run** (real clone) | **run** (tmpfs) | run |
 | GitHub Linux runner | skip (no CoW fs) | run (tmpfs) | run |
 | GitHub macOS runner (`macos` job) | skip (no CoW fs) | skip if no non-CoW fs found | run |
-| GitHub macOS runner (`apfs-verification` job) | n/a — the dedicated APFS script runs the real Darwin clone and measures extents | n/a | `scripts/verify-apfs/logic.test.ts` runs as part of `bun test` on every job |
+| GitHub macOS runner (`apfs-verification` job) | n/a — the dedicated APFS script runs the real Darwin clone and measures extents | n/a | `scripts/verify-apfs/logic.test.ts` and `scripts/verify-apfs/log2phys.test.ts` run as part of `bun test` on every job |
 | ext4 developer laptop | skip (no CoW fs) | run (tmpfs or ext4) | run |
 
 On this project's btrfs machine the positive path runs for real — the tests do
@@ -185,6 +215,10 @@ never pretends the CoW clone ran when it did not.
   absent (`canMeasureBtrfsExtents`).
 - Tests that build scratch git repositories require `git` on PATH and skip via
   `hasGit()` when it is missing.
+- The `apfs-verification` extent measurement requires `python3` on PATH (the
+  `log2phys.py` helper; `COW_LOG2PHYS_PYTHON` overrides the binary). The
+  GitHub-hosted macOS images ship `/usr/bin/python3`; a missing interpreter is
+  not fatal — it becomes a labelled `df` fallback rather than a failure.
 - `/dev/shm` size is not an assumption: the negative tests write a small
   scratch tree only.
 

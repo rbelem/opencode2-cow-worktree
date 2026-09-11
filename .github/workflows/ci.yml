@@ -121,7 +121,11 @@ jobs:
   #   2. clones through the real backend;
   #   3. measures shared extents with `fcntl(fd, F_LOG2PHYS_EXT)` physical block
   #      mapping (Jaccard overlap ≈ 1.0), with a `df` free-space delta fallback.
-  #      `du`/`st_blocks` cannot be used: APFS double-counts clones;
+  #      `du`/`st_blocks` cannot be used: APFS double-counts clones. The fcntl
+  #      runs in scripts/verify-apfs/log2phys.py (ctypes, a child process), not
+  #      through `bun:ffi`: Darwin's fcntl is variadic, and a fixed-arity
+  #      `bun:ffi` binding works on x86_64 but segfaults Bun on arm64. A child
+  #      failure is a labelled fallback, never a crash that loses the report;
   #   4. mutates one byte, confirming the source is untouched and the block
   #      moved — a hardlink would change the source;
   #   5. fails loudly on ENOTSUP/EXDEV, on a non-APFS volume, and on an overlap
@@ -139,7 +143,10 @@ jobs:
   #
   # `macos-latest` is the primary target (macOS 26 arm64). `macos-15-intel` is a
   # one-off cross-check on a distinct image and x86_64, kept cheap by running
-  # the same short script once. Drop that matrix entry when `macos-15` retires.
+  # the same short script once. Both legs run the strong F_LOG2PHYS_EXT
+  # measurement: the ctypes helper is arch-independent, which is the point of
+  # moving the variadic fcntl out of `bun:ffi`. Drop the intel entry when
+  # `macos-15` retires.
   # ---------------------------------------------------------------------------
   apfs-verification:
     name: macOS APFS clone verification — #7 evidence (${{ matrix.runner }})
