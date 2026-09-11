@@ -15,34 +15,21 @@ jobs:
   # ---------------------------------------------------------------------------
   # Linux — gating checks.
   #
-  # Gating steps are the ones that can be answered honestly on a GitHub-hosted
-  # runner:
-  #   - `bun run typecheck`  — no filesystem dependency.
-  #   - the three listed unit-test files — no dependency on a copy-on-write
-  #     filesystem.
+  # The full suite runs everywhere. The filesystem-dependent tests discover
+  # their roots at runtime (`test/fs-roots.ts`): each probes for a CoW-capable
+  # directory and a definitively non-CoW directory and skips cleanly when one
+  # is absent. A GitHub-hosted runner has no CoW filesystem, so the positive
+  # CoW tests skip there (visibly, in the test output) and the non-CoW tests
+  # run against tmpfs. On a CoW-capable machine — this project's btrfs host —
+  # the positive path runs for real. There is no per-file exclusion list and no
+  # `continue-on-error`; a skip is honest, a failure is a failure.
   #
-  # What does NOT run here, and why (full write-up in docs/ci.md):
-  #   Five test files hardcode `/tmp/opencode` as a btrfs CoW root and
-  #   `/dev/shm` as a tmpfs (non-CoW) root. A GitHub-hosted runner has no
-  #   `/tmp/opencode` and no btrfs `/tmp`, so those tests fail (or error on a
-  #   missing directory) for *environmental* reasons, not from a code
-  #   regression. Running them here would create a permanently red check that
-  #   nobody could fix without editing the tests. That is a real portability
-  #   gap in the suite; it is documented and flagged as a follow-up, not
-  #   masked. The excluded files are:
-  #
-  #     test/clone.test.ts            needs /tmp/opencode (btrfs)
-  #     test/strategy.test.ts         needs /tmp/opencode (btrfs)
-  #     test/tool.test.ts             last two tests need /tmp/opencode (btrfs)
-  #     test/plugin-fallback.test.ts  two tests need /tmp/opencode (btrfs)
-  #     test/platform.test.ts         Linux CoW tests need /tmp/opencode (btrfs)
-  #
-  #   The positive CoW path is still exercised where it can be: `capability`
-  #   detects a CoW filesystem instead of assuming one, and the Darwin logic is
-  #   driven through an injected syscall.
+  # A green run on a runner is therefore not proof of the CoW clone itself;
+  # that proof needs a CoW filesystem. It is proof that the CoW code did not
+  # regress where it can be exercised, and that the non-CoW branches hold.
   # ---------------------------------------------------------------------------
   linux:
-    name: Linux — typecheck + filesystem-independent unit tests
+    name: Linux — typecheck + full unit suite
     runs-on: ubuntu-latest
     steps:
       - name: Check out
@@ -67,8 +54,8 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
-      - name: Unit tests (filesystem-independent)
-        run: bun test test/capability.test.ts test/config.test.ts test/platform-darwin.test.ts
+      - name: Unit tests
+        run: bun test
 
   # ---------------------------------------------------------------------------
   # macOS — EARLY WARNING ONLY. THIS IS NOT THE ACCEPTANCE CRITERION FOR #7.
@@ -83,9 +70,9 @@ jobs:
   # runs only on real hardware. A different code path or a runner that gets
   # those semantics wrong would still show green here.
   #
-  # Only the filesystem-independent checks run; the btrfs-dependent files are
-  # excluded for the same reason as on Linux (and macOS additionally has no
-  # `/dev/shm`).
+  # The full suite runs, the same root-discovery logic applies, and the same
+  # tests skip on a runner. macOS has no `/dev/shm`; `findNonCowRoot()` probes
+  # `tmpdir()`/`homedir()`/`cwd()` as well, so it may still find one.
   # ---------------------------------------------------------------------------
   macos:
     name: macOS — early warning only, NOT #7 acceptance
@@ -107,10 +94,10 @@ jobs:
             bun install
           fi
 
-      # Same filesystem-independent checks as Linux. This does not run the
-      # Darwin clone and cannot close #7.
+      # Same checks as Linux. This does not run the Darwin clone and cannot
+      # close #7.
       - name: Typecheck
         run: bun run typecheck
 
-      - name: Unit tests (filesystem-independent; Darwin backend not exercised)
-        run: bun test test/capability.test.ts test/config.test.ts test/platform-darwin.test.ts
+      - name: Unit tests (Darwin backend not exercised)
+        run: bun test

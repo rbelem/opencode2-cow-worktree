@@ -7,9 +7,11 @@ import type { Mechanism } from "../src/mechanism";
 import { spawnWorkspace } from "../src/tool";
 import type { SpawnWorkspaceDeps } from "../src/tool";
 import plugin from "../src/plugin";
+import { findCowRoot } from "./fs-roots";
 
-// Real CoW filesystem: the machine's /home (and /) is btrfs.
-const COW_ROOT = "/tmp/opencode";
+// The two tests that use a real filesystem need a CoW root; discover one
+// instead of hardcoding this machine's mount, and skip cleanly without it.
+const cowRoot = await findCowRoot();
 
 const scratchDirs: string[] = [];
 
@@ -20,7 +22,7 @@ afterEach(async () => {
 });
 
 async function scratchDir(): Promise<string> {
-  const dir = await mkdtemp(join(COW_ROOT, "cow-tool-"));
+  const dir = await mkdtemp(join(cowRoot!, "cow-tool-"));
   scratchDirs.push(dir);
   return dir;
 }
@@ -143,7 +145,7 @@ test("the reported mechanism always equals the strategy that produced the direct
   }
 });
 
-test("the real capability probe drives the decision on a btrfs directory", async () => {
+test.skipIf(cowRoot === undefined)("the real capability probe drives the decision on a btrfs directory", async () => {
   const dir = await scratchDir();
   const capability = await probeCowCapability(dir);
   expect(capability.status).toBe("supported");
@@ -159,7 +161,7 @@ test("the real capability probe drives the decision on a btrfs directory", async
   expect(calls.createWorktree[0]?.strategy).toBe("cow");
 });
 
-test("plugin setup registers the spawn_workspace tool behind the tool seam", async () => {
+test.skipIf(cowRoot === undefined)("plugin setup registers the spawn_workspace tool behind the tool seam", async () => {
   const registered: Array<{ name: string; execute: (input: unknown) => Promise<unknown> }> = [];
   const worktreeCreate = async (input: { strategy?: string }) => ({
     directory: `/worktrees/${input.strategy}-clone`,

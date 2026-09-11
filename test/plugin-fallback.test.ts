@@ -2,14 +2,14 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import plugin from "../src/plugin";
+import { findCowRoot, findNonCowRoot } from "./fs-roots";
 
-// /dev/shm is tmpfs: a real filesystem without CoW support, available without
-// root. The source directory need not be a git repository: the fallback path
-// only decides *which strategy to request*, and git worktree creation is
-// opencode2's job, covered end-to-end in the integration harness.
-const NON_COW_ROOT = "/dev/shm";
-// Real CoW filesystem: the machine's /home (and /) is btrfs.
-const COW_ROOT = "/tmp/opencode";
+// Discover the roots instead of hardcoding this machine's mounts. The source
+// directory need not be a git repository: the fallback path only decides
+// *which strategy to request*, and git worktree creation is opencode2's job,
+// covered end-to-end in the integration harness.
+const nonCowRoot = await findNonCowRoot();
+const cowRoot = await findCowRoot();
 
 const scratchDirs: string[] = [];
 
@@ -84,8 +84,8 @@ async function harness(options: Record<string, unknown> | undefined): Promise<Ha
   return { tool: registered, recorded };
 }
 
-test("fallback disabled: an unsupported filesystem fails and requests no git worktree", async () => {
-  const dir = await scratchDir(NON_COW_ROOT);
+test.skipIf(nonCowRoot === undefined)("fallback disabled: an unsupported filesystem fails and requests no git worktree", async () => {
+  const dir = await scratchDir(nonCowRoot!);
   const { tool, recorded } = await harness(undefined);
 
   await expect(tool.execute({ sourceDirectory: dir })).rejects.toThrow(/not supported/i);
@@ -93,16 +93,16 @@ test("fallback disabled: an unsupported filesystem fails and requests no git wor
   expect(recorded.removed).toEqual([]);
 });
 
-test("fallback explicitly none: the same hard error", async () => {
-  const dir = await scratchDir(NON_COW_ROOT);
+test.skipIf(nonCowRoot === undefined)("fallback explicitly none: the same hard error", async () => {
+  const dir = await scratchDir(nonCowRoot!);
   const { tool, recorded } = await harness({ fallback: "none" });
 
   await expect(tool.execute({ sourceDirectory: dir })).rejects.toThrow(/not supported/i);
   expect(recorded.strategies).toEqual([]);
 });
 
-test("fallback enabled: the same request produces a git worktree and reports git", async () => {
-  const dir = await scratchDir(NON_COW_ROOT);
+test.skipIf(nonCowRoot === undefined)("fallback enabled: the same request produces a git worktree and reports git", async () => {
+  const dir = await scratchDir(nonCowRoot!);
   const { tool, recorded } = await harness({ fallback: "git" });
 
   const result = await tool.execute({ sourceDirectory: dir });
@@ -111,8 +111,8 @@ test("fallback enabled: the same request produces a git worktree and reports git
   expect(recorded.strategies).toEqual(["git"]);
 });
 
-test("fallback enabled does not change behavior on a CoW filesystem", async () => {
-  const dir = await scratchDir(COW_ROOT);
+test.skipIf(cowRoot === undefined)("fallback enabled does not change behavior on a CoW filesystem", async () => {
+  const dir = await scratchDir(cowRoot!);
   const { tool, recorded } = await harness({ fallback: "git" });
 
   const result = await tool.execute({ sourceDirectory: dir });
@@ -121,8 +121,8 @@ test("fallback enabled does not change behavior on a CoW filesystem", async () =
   expect(recorded.strategies).toEqual(["cow"]);
 });
 
-test("an invalid fallback value fails the call loudly", async () => {
-  const dir = await scratchDir(COW_ROOT);
+test.skipIf(cowRoot === undefined)("an invalid fallback value fails the call loudly", async () => {
+  const dir = await scratchDir(cowRoot!);
   const { tool, recorded } = await harness({ fallback: "bogus" });
 
   await expect(tool.execute({ sourceDirectory: dir })).rejects.toThrow(/fallback/);

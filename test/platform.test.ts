@@ -6,13 +6,13 @@ import { join } from "node:path";
 import { cloneFile, cloneOnLinux, isDarwin } from "../src/platform";
 import type { PlatformCheck } from "../src/platform";
 import { cloneDirectory, reflinkFile } from "../src/clone";
+import { findCowRoot, findNonCowRoot } from "./fs-roots";
 
-// The machine's /tmp/opencode is btrfs: a real CoW filesystem. /dev/shm is
-// tmpfs: a real filesystem without CoW support, available without root. Both
-// are Linux-specific, so the real-filesystem tests are gated on `linux`; the
+// Discover the roots instead of hardcoding this machine's mounts. The
+// real-filesystem tests are gated on `linux` and on a discovered root; the
 // dispatch and Darwin-logic tests run anywhere.
-const COW_ROOT = "/tmp/opencode";
-const NON_COW_ROOT = "/dev/shm";
+const cowRoot = await findCowRoot();
+const nonCowRoot = await findNonCowRoot();
 const onLinux = process.platform === "linux";
 
 const scratchDirs: string[] = [];
@@ -35,8 +35,8 @@ test("isDarwin agrees with process.platform", () => {
   expect(isDarwin()).toBe(process.platform === "darwin");
 });
 
-test("cloneFile takes the Linux branch when the platform check says Linux", async () => {
-  const dir = await scratch();
+test.skipIf(cowRoot === undefined)("cloneFile takes the Linux branch when the platform check says Linux", async () => {
+  const dir = await scratch(cowRoot!);
   const source = join(dir, "source");
   const target = join(dir, "target");
   await writeFile(source, "same bytes\n");
@@ -50,8 +50,8 @@ test("cloneFile takes the Linux branch when the platform check says Linux", asyn
   expect(await readFile(target, "utf8")).toBe("same bytes\n");
 });
 
-test.skipIf(!onLinux)("cloneFile on Linux is byte-identical to the raw forced reflink", async () => {
-  const dir = await scratch(COW_ROOT);
+test.skipIf(!onLinux || cowRoot === undefined)("cloneFile on Linux is byte-identical to the raw forced reflink", async () => {
+  const dir = await scratch(cowRoot!);
   const source = join(dir, "source");
   await writeFile(source, "identical clone\n");
 
@@ -61,8 +61,8 @@ test.skipIf(!onLinux)("cloneFile on Linux is byte-identical to the raw forced re
   expect(await readFile(join(dir, "platform"))).toEqual(await readFile(join(dir, "raw")));
 });
 
-test.skipIf(!onLinux)("reflinkFile is the platform operation: it clones real bytes on btrfs", async () => {
-  const dir = await scratch(COW_ROOT);
+test.skipIf(!onLinux || cowRoot === undefined)("reflinkFile is the platform operation: it clones real bytes on btrfs", async () => {
+  const dir = await scratch(cowRoot!);
   const source = join(dir, "source");
   const target = join(dir, "target");
   await writeFile(source, "reflinked\n");
@@ -73,8 +73,8 @@ test.skipIf(!onLinux)("reflinkFile is the platform operation: it clones real byt
 
 // --- Linux path: real btrfs clone, real tmpfs failure ---------------------
 
-test.skipIf(!onLinux)("cloneFile clones a file on a CoW filesystem", async () => {
-  const dir = await scratch(COW_ROOT);
+test.skipIf(!onLinux || cowRoot === undefined)("cloneFile clones a file on a CoW filesystem", async () => {
+  const dir = await scratch(cowRoot!);
   const source = join(dir, "source");
   const target = join(dir, "target");
   await writeFile(source, "btrfs clone\n");
@@ -84,8 +84,8 @@ test.skipIf(!onLinux)("cloneFile clones a file on a CoW filesystem", async () =>
   expect(await readFile(target, "utf8")).toBe("btrfs clone\n");
 });
 
-test.skipIf(!onLinux)("cloneFile fails loudly on a filesystem without CoW support", async () => {
-  const dir = await scratch(NON_COW_ROOT);
+test.skipIf(!onLinux || nonCowRoot === undefined)("cloneFile fails loudly on a filesystem without CoW support", async () => {
+  const dir = await scratch(nonCowRoot!);
   const source = join(dir, "source");
   const target = join(dir, "target");
   await writeFile(source, "cannot clone\n");
@@ -101,8 +101,8 @@ test.skipIf(!onLinux)("cloneFile fails loudly on a filesystem without CoW suppor
   await expect(readFile(target)).rejects.toThrow();
 });
 
-test.skipIf(!onLinux)("cloneDirectory over the platform path is unchanged on Linux", async () => {
-  const dir = await scratch(COW_ROOT);
+test.skipIf(!onLinux || cowRoot === undefined)("cloneDirectory over the platform path is unchanged on Linux", async () => {
+  const dir = await scratch(cowRoot!);
   const source = join(dir, "source");
   await (await import("node:fs/promises")).mkdir(join(source, "nested"), { recursive: true });
   await writeFile(join(source, "a.txt"), "a\n");
@@ -116,8 +116,8 @@ test.skipIf(!onLinux)("cloneDirectory over the platform path is unchanged on Lin
 
 // --- Darwin dispatch is inert on Linux ------------------------------------
 
-test.skipIf(!onLinux)("cloneFile with no override takes the Linux branch on this machine", async () => {
-  const dir = await scratch(COW_ROOT);
+test.skipIf(!onLinux || cowRoot === undefined)("cloneFile with no override takes the Linux branch on this machine", async () => {
+  const dir = await scratch(cowRoot!);
   const source = join(dir, "source");
   await writeFile(source, "linux only\n");
 
@@ -128,8 +128,8 @@ test.skipIf(!onLinux)("cloneFile with no override takes the Linux branch on this
   expect(await readFile(join(dir, "target"), "utf8")).toBe("linux only\n");
 });
 
-test.skipIf(!onLinux)("the Darwin branch is unreachable on Linux even when forced", async () => {
-  const dir = await scratch(COW_ROOT);
+test.skipIf(!onLinux || cowRoot === undefined)("the Darwin branch is unreachable on Linux even when forced", async () => {
+  const dir = await scratch(cowRoot!);
   const source = join(dir, "source");
   await writeFile(source, "x\n");
   const alwaysDarwin: PlatformCheck = () => true;
@@ -162,7 +162,7 @@ test("cloneFileOnDarwin accepts an injected syscall so its logic is testable", a
 
 test("cloneFileOnDarwin rejects a non-clone result and removes the target", async () => {
   const { cloneFileOnDarwin } = await import("../src/platform-darwin");
-  const dir = await scratch(COW_ROOT);
+  const dir = await scratch();
   const target = join(dir, "target");
   // Simulate the syscall having written a full copy before reporting it did
   // not clone.

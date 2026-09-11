@@ -4,13 +4,15 @@ import { randomBytes } from "node:crypto";
 import { lstat, link, mkdir, mkdtemp, readFile, readdir, readlink, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { cloneDirectory, reflinkFile } from "../src/clone";
+import { findCowRoot, findNonCowRoot, hasGit } from "./fs-roots";
 
-// Scratch repositories live on the CoW filesystem under test. The machine's
-// /home (and /) is btrfs, so /tmp/opencode reflinks.
-const COW_ROOT = "/tmp/opencode";
-// /dev/shm is tmpfs: a real filesystem without CoW support, available without
-// root and without a loopback image. Used to prove the fail-loud branch.
-const NON_COW_ROOT = "/dev/shm";
+// Discover the roots instead of hardcoding this machine's mounts: the CoW
+// tests skip cleanly where no CoW filesystem exists, and the negative test
+// runs wherever a definitively non-CoW filesystem is found. Every test here
+// builds a scratch git repository, so a machine without git also skips.
+const cowRoot = await findCowRoot();
+const nonCowRoot = await findNonCowRoot();
+const gitOnPath = hasGit();
 
 const scratchDirs: string[] = [];
 
@@ -123,6 +125,23 @@ function btrfsDu(path: string): BtrfsUsage {
   };
 }
 
+/**
+ * `btrfs filesystem du` needs the btrfs-progs binary on PATH against a btrfs
+ * root; a CoW filesystem can be CoW without being btrfs. Detect both so the
+ * extent-sharing test skips rather than fails on such a machine.
+ */
+function btrfsDuAvailable(root: string): boolean {
+  try {
+    btrfsDu(root);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const canMeasureBtrfsExtents =
+  cowRoot !== undefined && btrfsDuAvailable(cowRoot);
+
 async function captureError(run: Promise<unknown>): Promise<{ code?: string } | undefined> {
   return run.then(
     () => undefined,
@@ -130,8 +149,8 @@ async function captureError(run: Promise<unknown>): Promise<{ code?: string } | 
   );
 }
 
-test("clones the whole tree: tracked, ignored, directories, links and .git", async () => {
-  const { repo, clone } = await makeScratchRepo(COW_ROOT);
+test.skipIf(cowRoot === undefined || !gitOnPath)("clones the whole tree: tracked, ignored, directories, links and .git", async () => {
+  const { repo, clone } = await makeScratchRepo(cowRoot!);
   await cloneDirectory(repo, clone);
 
   expect(await readFile(join(clone, "tracked.txt"), "utf8")).toBe("tracked contents\n");
@@ -151,8 +170,8 @@ test("clones the whole tree: tracked, ignored, directories, links and .git", asy
   expect(cloneTree).toContain(".git/HEAD");
 });
 
-test("recreates symbolic links as links, never following them", async () => {
-  const { repo, clone } = await makeScratchRepo(COW_ROOT);
+test.skipIf(cowRoot === undefined || !gitOnPath)("recreates symbolic links as links, never following them", async () => {
+  const { repo, clone } = await makeScratchRepo(cowRoot!);
   await cloneDirectory(repo, clone);
 
   const fileLink = join(clone, "link-to-tracked");
@@ -165,8 +184,8 @@ test("recreates symbolic links as links, never following them", async () => {
   expect(await readlink(dirLink)).toBe("src");
 });
 
-test("contains a standalone .git and reports the same git state as the source", async () => {
-  const { repo, clone } = await makeScratchRepo(COW_ROOT);
+test.skipIf(cowRoot === undefined || !gitOnPath)("contains a standalone .git and reports the same git state as the source", async () => {
+  const { repo, clone } = await makeScratchRepo(cowRoot!);
   await cloneDirectory(repo, clone);
 
   expect((await lstat(join(clone, ".git"))).isDirectory()).toBe(true);
@@ -183,8 +202,8 @@ test("contains a standalone .git and reports the same git state as the source", 
   expect(git(clone, "cat-file", "-p", "HEAD").length).toBeGreaterThan(0);
 });
 
-test("editing tracked and ignored files in the clone leaves the source byte-for-byte unchanged", async () => {
-  const { repo, clone } = await makeScratchRepo(COW_ROOT);
+test.skipIf(cowRoot === undefined || !gitOnPath)("editing tracked and ignored files in the clone leaves the source byte-for-byte unchanged", async () => {
+  const { repo, clone } = await makeScratchRepo(cowRoot!);
   const sourceTracked = join(repo, "tracked.txt");
   const sourceIgnored = join(repo, "node_modules", "dep", "index.js");
   const beforeTracked = await readFile(sourceTracked);
@@ -202,8 +221,8 @@ test("editing tracked and ignored files in the clone leaves the source byte-for-
   expect(await readFile(sourceIgnored)).toEqual(beforeIgnored);
 });
 
-test("cloning does not modify the source directory", async () => {
-  const { repo, clone } = await makeScratchRepo(COW_ROOT);
+test.skipIf(cowRoot === undefined || !gitOnPath)("cloning does not modify the source directory", async () => {
+  const { repo, clone } = await makeScratchRepo(cowRoot!);
   const before = await snapshot(repo);
 
   await cloneDirectory(repo, clone);
@@ -211,8 +230,8 @@ test("cloning does not modify the source directory", async () => {
   expect(await snapshot(repo)).toEqual(before);
 });
 
-test("shares file extents with the source instead of copying them", async () => {
-  const { dir, repo, clone } = await makeScratchRepo(COW_ROOT);
+test.skipIf(cowRoot === undefined || !git || !canMeasureBtrfsExtents)("shares file extents with the source instead of copying them", async () => {
+  const { dir, repo, clone } = await makeScratchRepo(cowRoot!);
   await cloneDirectory(repo, clone);
 
   // Control: the same bytes as a real byte copy, with reflinking disabled.
@@ -231,8 +250,8 @@ test("shares file extents with the source instead of copying them", async () => 
   expect(copied.shared).toBe(0);
 });
 
-test("fails explicitly on a filesystem without CoW support", async () => {
-  const { dir, repo, clone } = await makeScratchRepo(NON_COW_ROOT);
+test.skipIf(nonCowRoot === undefined || !gitOnPath)("fails explicitly on a filesystem without CoW support", async () => {
+  const { dir, repo, clone } = await makeScratchRepo(nonCowRoot!);
   // Sanity: prove this filesystem really rejects a forced reflink.
   const probe = await captureError(reflinkFile(join(repo, "tracked.txt"), join(dir, "probe")));
   expect(["ENOTSUP", "EOPNOTSUPP", "ENOSYS"]).toContain(probe?.code ?? "");

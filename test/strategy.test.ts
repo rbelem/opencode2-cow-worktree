@@ -14,13 +14,15 @@ import {
 import { join } from "node:path";
 import { cowStrategy } from "../src/strategy";
 import plugin from "../src/plugin";
+import { findCowRoot, findNonCowRoot, hasGit } from "./fs-roots";
 
-// Scratch repositories live on the CoW filesystem under test. The machine's
-// /home (and /) is btrfs, so /tmp/opencode reflinks.
-const COW_ROOT = "/tmp/opencode";
-// /dev/shm is tmpfs: a real filesystem without CoW support, available without
-// root and without a loopback image. Used to prove the fail-loud branch.
-const NON_COW_ROOT = "/dev/shm";
+// Discover the roots instead of hardcoding this machine's mounts. The CoW
+// tests skip cleanly where no CoW filesystem exists; the negative test needs a
+// filesystem that definitively refuses a clone. Tests that build a scratch git
+// repository also skip when git is absent.
+const cowRoot = await findCowRoot();
+const nonCowRoot = await findNonCowRoot();
+const gitOnPath = hasGit();
 
 const scratchDirs: string[] = [];
 
@@ -99,10 +101,10 @@ test("plugin setup registers exactly one strategy, with id cow", async () => {
   expect(added[0]?.definition).toBe(cowStrategy);
 });
 
-test("a worktree created through the registered strategy is a Deep clone", async () => {
+test.skipIf(cowRoot === undefined || !gitOnPath)("a worktree created through the registered strategy is a Deep clone", async () => {
   const added: Added[] = [];
   await plugin.setup(fakeContext(added));
-  const { repo } = await makeScratchRepo(COW_ROOT);
+  const { repo } = await makeScratchRepo(cowRoot!);
   const target = join(repo, "..", "clone");
   const signal = new AbortController().signal;
 
@@ -141,8 +143,8 @@ test("a worktree created through the registered strategy is a Deep clone", async
   expect(git(target, "status", "--porcelain")).toBe(" M tracked.txt\n");
 });
 
-test("removing a worktree through the strategy removes its directory", async () => {
-  const { repo } = await makeScratchRepo(COW_ROOT);
+test.skipIf(cowRoot === undefined || !gitOnPath)("removing a worktree through the strategy removes its directory", async () => {
+  const { repo } = await makeScratchRepo(cowRoot!);
   const target = join(repo, "..", "clone");
   const signal = new AbortController().signal;
   await cowStrategy.create({ sourceDirectory: repo, directory: target }, { signal });
@@ -157,8 +159,8 @@ test("list returns no entries, leaving inventory to opencode2", async () => {
   expect(await cowStrategy.list("/anywhere", { signal })).toEqual([]);
 });
 
-test("create fails loudly on a filesystem without CoW support and leaves no directory", async () => {
-  const { repo } = await makeScratchRepo(NON_COW_ROOT);
+test.skipIf(nonCowRoot === undefined || !gitOnPath)("create fails loudly on a filesystem without CoW support and leaves no directory", async () => {
+  const { repo } = await makeScratchRepo(nonCowRoot!);
   const target = join(repo, "..", "clone");
   const signal = new AbortController().signal;
 
@@ -173,8 +175,8 @@ test("create fails loudly on a filesystem without CoW support and leaves no dire
   await expect(lstat(target)).rejects.toThrow();
 });
 
-test("create rejects when the signal is already aborted", async () => {
-  const { repo } = await makeScratchRepo(COW_ROOT);
+test.skipIf(cowRoot === undefined || !gitOnPath)("create rejects when the signal is already aborted", async () => {
+  const { repo } = await makeScratchRepo(cowRoot!);
   const target = join(repo, "..", "clone");
   const controller = new AbortController();
   controller.abort();
