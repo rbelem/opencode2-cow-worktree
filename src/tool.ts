@@ -1,5 +1,5 @@
 import { stat } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { CowCapability } from "./capability";
 import type { Mechanism } from "./mechanism";
 
@@ -132,22 +132,12 @@ async function verifySameDevice(
   probeDevice: SpawnWorkspaceDeps["probeDevice"],
 ): Promise<void> {
   if (mechanism !== "cow") return;
-  const [sourceDevice, parentDevice] = await Promise.all([
-    probeDevice(source),
-    probeDevice(parent),
-  ]);
-  if (
-    sourceDevice === undefined ||
-    parentDevice === undefined ||
-    sourceDevice === parentDevice
-  ) {
-    return;
-  }
-  throw new Error(
-    `clone target ${parent} is on a different filesystem than ${source}; ` +
-      "a CoW clone cannot cross devices. Point the tool's targetRoot option at " +
-      "a directory on the source's filesystem.",
-  );
+  // A parent that does not exist yet (an injected fake in the unit tests, or a
+  // target root opencode2 has not created) is checked as-is: `probeDevice`
+  // returns `undefined` and the create proceeds rather than failing on an
+  // unreadable device. The strategy owns the nearest-ancestor walk, where the
+  // target is a full path opencode2 assembled.
+  await verifyCowSameDevice({ source, target: parent, probeDevice });
 }
 
 function selectFallback(policy: FallbackPolicy, sourceDirectory: string): Mechanism {
@@ -167,5 +157,84 @@ export async function deviceOf(path: string): Promise<number | undefined> {
     return stats.dev;
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * The actionable `cow` failure for a clone whose target sits on a different
+ * filesystem than its source. A reflink cannot cross a device boundary, so the
+ * remedy is always to move the target — never to fall back silently.
+ *
+ * Shared by the tool's pre-create guard and the strategy's own pre-flight so
+ * the two name the same cause and the same fix.
+ */
+export function crossDeviceError(source: string, target: string): Error {
+  return new Error(
+    `cow cannot clone ${source} into ${target}: the target is on a different ` +
+      "filesystem and a reflink cannot cross devices. Point opencode2's " +
+      "`worktree.directory` config (or the spawn_workspace `targetRoot` option) " +
+      "at a directory on the source's filesystem.",
+  );
+}
+
+/**
+ * Rejects a `cow` clone whose target device differs from the source's. Throws
+ * before any directory is created; an unreadable device on either side is not a
+ * mismatch, so an unknown device proceeds rather than fabricating a failure.
+ *
+ * The caller passes a path whose device decides the clone: the tool's worktree
+ * **parent** (opencode2 appends the name under it) or the strategy's resolved
+ * target parent. The strategy resolves a not-yet-created target to its nearest
+ * existing ancestor first, then calls `assertSameDevice`.
+ */
+export async function verifyCowSameDevice(input: {
+  readonly source: string;
+  readonly target: string;
+  readonly probeDevice: (path: string) => Promise<number | undefined>;
+}): Promise<void> {
+  const [sourceDevice, targetDevice] = await Promise.all([
+    input.probeDevice(input.source),
+    input.probeDevice(input.target),
+  ]);
+  assertSameDevice(input.source, sourceDevice, input.target, targetDevice);
+}
+
+/**
+ * The one cross-device rule: a `cow` clone may cross no device boundary.
+ * `undefined` on either side is unknown, not a mismatch.
+ */
+export function assertSameDevice(
+  source: string,
+  sourceDevice: number | undefined,
+  target: string,
+  targetDevice: number | undefined,
+): void {
+  if (
+    sourceDevice === undefined ||
+    targetDevice === undefined ||
+    sourceDevice === targetDevice
+  ) {
+    return;
+  }
+  throw crossDeviceError(source, target);
+}
+
+/**
+ * Resolves a target that may not exist yet to the first ancestor whose device
+ * can be read, so the strategy's pre-flight checks the filesystem the target
+ * will actually land on. The root's parent is itself, so the walk terminates;
+ * a fully unreadable chain returns `undefined` and the pre-flight proceeds.
+ */
+export async function nearestExistingDevice(
+  path: string,
+  probeDevice: (path: string) => Promise<number | undefined>,
+): Promise<number | undefined> {
+  let current = path;
+  for (;;) {
+    const device = await probeDevice(current);
+    if (device !== undefined) return device;
+    const parent = dirname(current);
+    if (parent === current) return undefined;
+    current = parent;
   }
 }

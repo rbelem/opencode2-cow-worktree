@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
@@ -185,4 +185,93 @@ test.skipIf(cowRoot === undefined || !gitOnPath)("create rejects when the signal
     cowStrategy.create({ sourceDirectory: repo, directory: target }, { signal: controller.signal }),
   ).rejects.toThrow();
   await expect(lstat(target)).rejects.toThrow();
+});
+
+// The strategy pre-flights the same cross-device rule the tool applies, so a
+// target on another filesystem fails with a message naming the cause and the
+// remedy instead of a bare EXDEV mid-walk. The target parent is a real
+// directory (so the nearest-existing walk lands on it) whose device the seam
+// reports as a different number, so no second mount is required.
+test("create rejects a cross-device target before cloning anything", async () => {
+  const { repo } = await makeScratchRepo("/tmp");
+  const otherDevice = await mkdtemp("/tmp/cow-other-device-");
+  scratchDirs.push(otherDevice);
+  const target = join(otherDevice, "clone");
+  const signal = new AbortController().signal;
+  const realDeviceOf = await import("../src/tool").then((m) => m.deviceOf);
+  const sourceDevice = await realDeviceOf(repo);
+  const otherDeviceNumber = (sourceDevice ?? 0) + 1;
+  // Report the target parent on a different device than the real source; all
+  // other paths keep their real device.
+  const probeDevice = async (path: string) =>
+    path === otherDevice ? otherDeviceNumber : realDeviceOf(path);
+
+  const spy = spyOn(await import("../src/tool"), "deviceOf").mockImplementation(probeDevice);
+  try {
+    const error = await cowStrategy
+      .create({ sourceDirectory: repo, directory: target }, { signal })
+      .then(() => undefined, (failure: unknown) => failure as Error);
+
+    expect(error).toBeDefined();
+    expect(error?.message).toContain(`cow cannot clone ${repo} into ${otherDevice}`);
+    expect(error?.message).toContain("different filesystem");
+    expect(error?.message).toContain("worktree.directory");
+    expect(error?.message).toContain("targetRoot");
+    // Exit before the walk: cloneDirectory would have created the target.
+    await expect(lstat(target)).rejects.toThrow();
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+test("create proceeds when source and target share a device", async () => {
+  // A real scratch tree under a CoW root (when one exists) so the clone itself
+  // runs; the device seam reports both sides the same. Without a CoW root the
+  // clone fails for an unrelated reason, but the pre-flight must not be it.
+  const { repo } = await makeScratchRepo(cowRoot ?? "/tmp");
+  const target = join(repo, "..", "clone");
+  const signal = new AbortController().signal;
+  const realDeviceOf = await import("../src/tool").then((m) => m.deviceOf);
+  const sourceDevice = await realDeviceOf(repo);
+  const probeDevice = async (path: string) => {
+    const device = await realDeviceOf(path);
+    // Report the target parent as the source's device: same-device, no reject.
+    return path === join(repo, "..") ? sourceDevice : device;
+  };
+
+  const spy = spyOn(await import("../src/tool"), "deviceOf").mockImplementation(probeDevice);
+  try {
+    // Same devices: the pre-flight never rejects, so on a CoW root the clone
+    // runs to completion. Off a CoW root the clone's own wrapper is the only
+    // acceptable failure — never the cross-device message.
+    const error = await cowStrategy
+      .create({ sourceDirectory: repo, directory: target }, { signal })
+      .then(() => undefined, (failure: unknown) => failure as Error);
+
+    expect(error?.message ?? "").not.toContain("different filesystem");
+    if (error !== undefined) {
+      expect(error.message).toContain("cow strategy failed to clone into");
+    }
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+test("create proceeds when a device is unreadable, leaving the failure to the clone", async () => {
+  // `deviceOf` returns undefined for a path it cannot read; that is "unknown",
+  // not a mismatch, so the pre-flight must not fabricate a cross-device error
+  // and the real clone attempt decides the outcome.
+  const signal = new AbortController().signal;
+
+  const error = await cowStrategy
+    .create(
+      { sourceDirectory: "/nowhere/source", directory: "/nowhere/clone" },
+      { signal },
+    )
+    .then(() => undefined, (failure: unknown) => failure as Error);
+
+  expect(error).toBeDefined();
+  expect(error?.message).not.toContain("different filesystem");
+  // It fails as the strategy's clone wrapper, not as a device rejection.
+  expect(error?.message).toContain("cow strategy failed to clone into");
 });
