@@ -1,0 +1,116 @@
+name: CI
+
+# Every push to main and every pull request. No other triggers: the package is
+# `private: true`, so there is deliberately no publish/release step.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# The workflow only reads the repository and runs checks.
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Linux — gating checks.
+  #
+  # Gating steps are the ones that can be answered honestly on a GitHub-hosted
+  # runner:
+  #   - `bun run typecheck`  — no filesystem dependency.
+  #   - the three listed unit-test files — no dependency on a copy-on-write
+  #     filesystem.
+  #
+  # What does NOT run here, and why (full write-up in docs/ci.md):
+  #   Five test files hardcode `/tmp/opencode` as a btrfs CoW root and
+  #   `/dev/shm` as a tmpfs (non-CoW) root. A GitHub-hosted runner has no
+  #   `/tmp/opencode` and no btrfs `/tmp`, so those tests fail (or error on a
+  #   missing directory) for *environmental* reasons, not from a code
+  #   regression. Running them here would create a permanently red check that
+  #   nobody could fix without editing the tests. That is a real portability
+  #   gap in the suite; it is documented and flagged as a follow-up, not
+  #   masked. The excluded files are:
+  #
+  #     test/clone.test.ts            needs /tmp/opencode (btrfs)
+  #     test/strategy.test.ts         needs /tmp/opencode (btrfs)
+  #     test/tool.test.ts             last two tests need /tmp/opencode (btrfs)
+  #     test/plugin-fallback.test.ts  two tests need /tmp/opencode (btrfs)
+  #     test/platform.test.ts         Linux CoW tests need /tmp/opencode (btrfs)
+  #
+  #   The positive CoW path is still exercised where it can be: `capability`
+  #   detects a CoW filesystem instead of assuming one, and the Darwin logic is
+  #   driven through an injected syscall.
+  # ---------------------------------------------------------------------------
+  linux:
+    name: Linux — typecheck + filesystem-independent unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.x
+
+      # No lockfile is committed yet (see docs/ci.md). Resolve fresh until one
+      # exists; once it does, --frozen-lockfile keeps CI on the developer's
+      # exact dependency graph.
+      - name: Install dependencies
+        run: |
+          if [ -f bun.lock ] || [ -f bun.lockb ]; then
+            bun install --frozen-lockfile
+          else
+            bun install
+          fi
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Unit tests (filesystem-independent)
+        run: bun test test/capability.test.ts test/config.test.ts test/platform-darwin.test.ts
+
+  # ---------------------------------------------------------------------------
+  # macOS — EARLY WARNING ONLY. THIS IS NOT THE ACCEPTANCE CRITERION FOR #7.
+  #
+  # Issue #7 requires a human on real APFS hardware pasting verification output
+  # (an independent clone with genuinely shared extents). A green run here does
+  # not close #7 and must never be read as doing so.
+  #
+  # The Darwin backend is NOT exercised by this job. Its *logic* is tested with
+  # an injected fake syscall (`test/platform-darwin.test.ts`); the real
+  # `copyfile(3)` path — APFS semantics, xattrs, resource forks, hard links —
+  # runs only on real hardware. A different code path or a runner that gets
+  # those semantics wrong would still show green here.
+  #
+  # Only the filesystem-independent checks run; the btrfs-dependent files are
+  # excluded for the same reason as on Linux (and macOS additionally has no
+  # `/dev/shm`).
+  # ---------------------------------------------------------------------------
+  macos:
+    name: macOS — early warning only, NOT #7 acceptance
+    runs-on: macos-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.x
+
+      - name: Install dependencies
+        run: |
+          if [ -f bun.lock ] || [ -f bun.lockb ]; then
+            bun install --frozen-lockfile
+          else
+            bun install
+          fi
+
+      # Same filesystem-independent checks as Linux. This does not run the
+      # Darwin clone and cannot close #7.
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Unit tests (filesystem-independent; Darwin backend not exercised)
+        run: bun test test/capability.test.ts test/config.test.ts test/platform-darwin.test.ts
