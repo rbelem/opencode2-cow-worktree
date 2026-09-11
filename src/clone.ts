@@ -6,7 +6,7 @@ import {
   readlink,
   symlink,
 } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { cloneFile } from "./platform";
 
 /**
@@ -32,26 +32,58 @@ export async function reflinkFile(source: string, target: string): Promise<void>
  * gets a genuine standalone metadata directory and no dependency on the
  * source's object store. Throws when reflinking is unavailable; there is no
  * copy fallback.
+ *
+ * A target inside the source is legitimate — opencode2 resolves a relative
+ * `worktree.directory` against the project checkout — so the target subtree is
+ * skipped rather than copied into itself. A target that contains the source is
+ * rejected: writing the clone over the tree being walked has no coherent
+ * meaning.
  */
 export async function cloneDirectory(source: string, target: string): Promise<void> {
+  const from = resolve(source);
+  const to = resolve(target);
+
+  if (from === to) {
+    throw new Error(`cannot clone ${from} into itself`);
+  }
+  if (isInside(from, to)) {
+    throw new Error(`cannot clone ${from} into ${to}: the target contains the source`);
+  }
+
   await mkdir(target, { recursive: true });
-  await cloneInto(source, target);
+  await cloneInto(from, to, to);
 }
 
-async function cloneInto(source: string, target: string): Promise<void> {
+async function cloneInto(source: string, target: string, skip: string): Promise<void> {
   for (const entry of await readdir(source, { withFileTypes: true })) {
     const from = join(source, entry.name);
+    // The target (when it lives inside the source) must not be copied: it is
+    // being populated by this very walk, so descending into it clones the
+    // clone into itself without bound. Everything else — including the
+    // target's ancestors and their other children — is copied normally.
+    if (from === skip) continue;
     const to = join(target, entry.name);
     const kind = await kindOf(entry, from);
     if (kind === "directory") {
       await mkdir(to);
-      await cloneInto(from, to);
+      await cloneInto(from, to, skip);
     } else if (kind === "symlink") {
       await symlink(await readlink(from), to);
     } else {
       await reflinkFile(from, to);
     }
   }
+}
+
+/**
+ * True when `child` lies inside `parent`, compared by path components rather
+ * than by string prefix: `/a/bc` is not inside `/a/b`, and a child literally
+ * named `..foo` is not an escape. `relative` yields exactly that check, and an
+ * absolute result means a different root and therefore not contained.
+ */
+function isInside(child: string, parent: string): boolean {
+  const rel = relative(parent, child);
+  return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
 
 type EntryKind = "file" | "directory" | "symlink";

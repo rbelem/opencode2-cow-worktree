@@ -117,43 +117,57 @@ cannot start, the tool removes that Worktree before the error propagates. See
 ## Install and configure
 
 The package is `private: true` and unpublished, so there is no `npm install`
-line. Today you install it by pointing opencode2 at a local plugin directory.
+line. You install it as a **local plugin directory**.
 
-A configured plugin target must be a **directory**, not a file. opencode2 logs
-`configured plugin path must be a directory` and skips a file target. The
-directory needs an `index` or `server` entrypoint that opencode2's `Host.resolve`
-can find:
+opencode2 auto-discovers every `.ts`/`.js` file under `plugins/`, and a
+directory under `plugins/` whose `index`/`server` entrypoint it can resolve. So
+the install is a directory with an `index.ts`:
 
 ```ts
 // ~/.config/opencode/plugins/opencode2-cow-worktree/index.ts
 export { default } from "opencode2-cow-worktree";
 ```
 
-For that bare specifier to resolve, the directory needs the package in a
-`node_modules` beside it. Symlink the checkout — opencode2's runtime is Bun, so
-tracked working-tree edits are picked up live with no build step:
+For that bare specifier to resolve, the package must be in a `node_modules`
+beside it. Symlink the checkout — opencode2's runtime is Bun, so tracked
+working-tree edits are live with no build step:
 
 ```sh
 ln -sfn /path/to/opencode2-cow-worktree \
   ~/.config/opencode/plugins/opencode2-cow-worktree/node_modules/opencode2-cow-worktree
 ```
 
-Then declare it in `opencode.json`. The config field is **`plugins` (plural)**,
-with entries of `{ package, options }`:
+**Do not also declare it in the `plugins` array.** Directory discovery already
+picks it up; declaring the same path as a `package` makes opencode2 load the
+tree twice, and the package-sourced copy fails with `Plugin failed to load`
+because the loader does not follow the symlinked local tree. Verified: with only
+directory discovery, `GET /api/plugin` reports
+`opencode2-cow-worktree [local] active` and no plugin fails.
+
+### Required: point the worktree directory at the source's filesystem
+
+opencode2's default worktree parent is
+`$XDG_DATA_HOME/opencode/worktree/<project>`. A reflink cannot cross a device,
+and on many setups (including a separate `/home` or `/tmp`) that default is a
+different filesystem from the project — so `cow` fails on the default path while
+the built-in `git` strategy is unaffected. opencode2 exposes the setting:
 
 ```json
 {
-  "plugins": [
-    {
-      "package": "~/.config/opencode/plugins/opencode2-cow-worktree",
-      "options": { "fallback": "none" }
-    }
-  ]
+  "worktree": { "directory": ".opencode/worktrees" }
 }
 ```
 
-The field is `plugins`, not `plugin`. Declaring `plugin` (singular) produces a
-configuration diagnostic and the plugin silently never loads (findings #1).
+A **relative** value resolves against the project checkout (opencode2's
+`opencode.config.worktree` plugin does `path.resolve(location.project.canonical,
+directory)`), which puts the clone on the source's own filesystem by
+construction. An absolute value is used as-is and must be on the same
+filesystem as each project. This is the same concern the tool's `options.targetRoot`
+addresses for `spawn_workspace`; the config setting covers the API and UI paths
+that call the Strategy directly.
+
+A nested directory like `.opencode/worktrees` is supported: `cloneDirectory`
+skips the target subtree rather than cloning the target into itself.
 
 The install can be checked without touching a live session:
 `bun scripts/dogfood-install-check.ts` boots a throwaway server against the
@@ -198,7 +212,8 @@ Runtime requirements:
   enabled. The forced reflink fails rather than silently byte-copying, so on a
   non-CoW filesystem the `cow` Strategy fails loudly. The source and the clone
   must also be on the same filesystem: a reflink does not cross a device
-  boundary.
+  boundary. This is why `worktree.directory` must be set (above): opencode2's
+  default target is often on a different device.
 - The macOS backend is `copyfile(3)` with `COPYFILE_CLONE_FORCE` on APFS. It is
   verified on real APFS hardware: CI measures shared extents with
   `F_LOG2PHYS_EXT` on both an arm64 and an x86_64 macOS runner (`method:

@@ -277,3 +277,52 @@ test.skipIf(nonCowRoot === undefined || !gitOnPath)("fails explicitly on a files
   // Fail loud, not silently: the blob was never materialized as a full copy.
   await expect(readFile(join(clone, "blob.bin"))).rejects.toThrow();
 });
+
+test.skipIf(cowRoot === undefined || !gitOnPath)("clones into a subdirectory of the source without cloning the target into itself", async () => {
+  const { repo } = await makeScratchRepo(cowRoot!);
+  // The natural opencode2 shape: a relative `worktree.directory` resolved
+  // against the project checkout, so the target lives inside the source. The
+  // walk must skip it — descending would clone the clone into itself forever.
+  const nested = join(repo, ".opencode", "worktrees", "one");
+  await mkdir(join(repo, ".opencode", "keep"), { recursive: true });
+  await writeFile(join(repo, ".opencode", "keep", "marker.txt"), "sibling of the target\n");
+
+  await cloneDirectory(repo, nested);
+
+  // The clone is a faithful copy of everything that is not the target.
+  expect(await readFile(join(nested, "tracked.txt"), "utf8")).toBe("tracked contents\n");
+  expect(await readFile(join(nested, "src", "app.ts"), "utf8")).toBe("export const answer = 42;\n");
+  expect(await readFile(join(nested, "node_modules", "dep", "index.js"), "utf8")).toBe(
+    "module.exports = 1;\n",
+  );
+  expect(await readFile(join(nested, "debug.log"), "utf8")).toBe("ignored log line\n");
+  expect((await lstat(join(nested, ".git"))).isDirectory()).toBe(true);
+  // The target's ancestors are ordinary directories: their other children are
+  // cloned. Only the target subtree itself is skipped.
+  expect(await readFile(join(nested, ".opencode", "keep", "marker.txt"), "utf8")).toBe(
+    "sibling of the target\n",
+  );
+
+  // Nothing was copied into itself: no `one/one` nesting, and the skipped
+  // directory does not appear in the clone.
+  await expect(lstat(join(nested, ".opencode", "worktrees", "one"))).rejects.toThrow();
+  expect(await listTree(nested)).not.toContain(".opencode/worktrees/one");
+
+  // Termination plus the recursive reflink contract: a second walk into a fresh
+  // sibling target (not inside the source) still succeeds unchanged.
+  const sibling = join(repo, "..", "sibling-clone");
+  await cloneDirectory(repo, sibling);
+  expect(await readFile(join(sibling, "tracked.txt"), "utf8")).toBe("tracked contents\n");
+});
+
+test.skipIf(cowRoot === undefined || !gitOnPath)("rejects a target that contains the source", async () => {
+  const { repo } = await makeScratchRepo(cowRoot!);
+  // Cloning a subtree into an ancestor would write the clone over the very
+  // tree being walked; that is not a shape the walk can satisfy, so it fails
+  // fast and clearly instead of recursing.
+  const error = await captureError(cloneDirectory(join(repo, "src"), repo));
+  expect(error).toBeDefined();
+  expect((error as Error).message).toMatch(/target contains the source/i);
+  // Nothing was produced by the rejected call.
+  await expect(lstat(join(repo, "src", "src"))).rejects.toThrow();
+});

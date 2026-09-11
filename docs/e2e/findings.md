@@ -169,7 +169,8 @@ the rest of the stream, not the URL.
 
 ## What the harness cannot prove
 
-- Anything about macOS/APFS — no such machine; #7 is gated on a human there.
+- Anything about macOS/APFS from the local harness — #7 is verified by CI
+  measuring shared extents on real arm64 and x86_64 macOS runners instead.
 - Correctness on filesystems other than btrfs (positive) and tmpfs (negative).
 - The fallback opt-in against the real server (finding 5/6).
 - That the plugin's `spawn_workspace` *tool* is reachable from a session
@@ -178,3 +179,83 @@ the rest of the stream, not the URL.
 - That the plugin is "tested enough" — a release judgement made by a person over
   time, deliberately not encoded in this ticket.
 - Agent reasoning: the harness asserts filesystem facts, not model behaviour.
+
+## 11. Directory discovery already loads a `plugins/` child; declaring it too double-loads it
+
+Found while installing the plugin into a real opencode2 config. Every
+`.ts`/`.js` under `plugins/` is auto-discovered, and so is a directory there
+whose entrypoint resolves. A `plugins/opencode2-cow-worktree/index.ts` is
+therefore loaded **without any `plugins` array entry**.
+
+Declaring that same path as `{ package: "~/.config/opencode/plugins/opencode2-cow-worktree" }`
+loaded the tree twice: the discovered copy reported
+
+```
+opencode2-cow-worktree [local] active
+```
+
+and the package-sourced copy reported
+
+```
+{"source":{"type":"package","target":"~/.config/opencode/plugins/opencode2-cow-worktree"},
+ "state":{"status":"failed","error":"Plugin failed to load","ref":"err_bda47926"}}
+```
+
+The package loader does not follow the `node_modules` symlink a local install
+uses. Removing the array entry leaves one active copy and no failures.
+
+## 12. The default worktree target is on the wrong device for a reflink
+
+`Worktree.create` defaults the parent to
+`path.join(global.data, "worktree", projectID.slice(0, 6))` — i.e. under
+`$XDG_DATA_HOME/opencode/worktree/<6 chars>` — and opencode2 creates that parent
+itself, then hands the Strategy `path.join(parent, name)`. On this machine that
+is a different device from the project (device 60 vs 43), and a reflink cannot
+cross a device boundary, so:
+
+```
+400 WorktreeError: Worktree strategy cow failed to create:
+cow strategy failed to clone into /home/rodrigo/.local/share/opencode/worktree/a5922b/real-cow
+```
+
+The built-in `git` strategy is unaffected (a git worktree shares no extents), so
+`cow` is the strategy that breaks on the default. opencode2 exposes the setting
+`worktree.directory`, described as *"relative to the project's primary checkout
+when not absolute"*; its builtin `opencode.config.worktree` plugin resolves it
+with `path.resolve(location.project.canonical, directory)`. A **relative** value
+therefore lands on the source's own filesystem by construction:
+
+```json
+{ "worktree": { "directory": ".opencode/worktrees" } }
+```
+
+`Worktree.service` has an internal `editor.configure({ directory })`, and that is
+exactly what opencode2's own builtin `opencode.config.worktree` plugin calls. It
+is **not exposed to user plugins**: the editor handed to a plugin forwards only
+`add` (`packages/core/src/plugin/host.ts:491-502`, and the promise adapter in
+`packages/plugin/src/promise/adapter.ts:553-566`), and the published
+`WorktreeEditor` type declares `add` alone. A plugin therefore cannot set the
+default target; it can only register a Strategy. The setting above is the
+mechanism, and because `ConfigWorktreePlugin` activates in the `post` group
+(`packages/core/src/plugin/internal.ts:242`), it reliably lands after any user
+plugin's transforms.
+
+The strategy is the one that adds a same-device constraint the host never
+promised: the built-in `git` strategy is unaffected because a git worktree
+shares no extents.
+
+## 13. A target inside the source made the clone recurse forever
+
+A direct consequence of finding 12: once the target is a subdirectory of the
+project, `cloneDirectory` walked into it and cloned the target into itself:
+
+```
+Error: ENAMETOOLONG: name too long, open
+  .../project/.opencode/worktrees/one/.opencode/worktrees/one/.opencode/worktrees/one/.../.git/objects/c2/6
+```
+
+The clone succeeded with a sibling target and failed with a nested one. Fixed by
+skipping the resolved target subtree during the walk; a target that *contains*
+the source is now rejected before anything is created. This is the natural
+configuration (finding 12), not an edge case, and it was only reachable by
+running the plugin against a real config with a real relative target.
