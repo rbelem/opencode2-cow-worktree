@@ -68,7 +68,9 @@ jobs:
   # an injected fake syscall (`test/platform-darwin.test.ts`); the real
   # `copyfile(3)` path — APFS semantics, xattrs, resource forks, hard links —
   # runs only on real hardware. A different code path or a runner that gets
-  # those semantics wrong would still show green here.
+  # those semantics wrong would still show green here. The job that actually
+  # runs the Darwin backend and measures shared extents is `apfs-verification`
+  # below; that one produces the #7 evidence.
   #
   # The full suite runs, the same root-discovery logic applies, and the same
   # tests skip on a runner. macOS has no `/dev/shm`; `findNonCowRoot()` probes
@@ -101,3 +103,74 @@ jobs:
 
       - name: Unit tests (Darwin backend not exercised)
         run: bun test
+
+  # ---------------------------------------------------------------------------
+  # macOS APFS clone verification — THE EVIDENCE JOB FOR #7.
+  #
+  # Unlike `macos` above, this job runs the plugin's real Darwin backend
+  # (`copyfile(3)` with `COPYFILE_CLONE_FORCE` through `bun:ffi`, via
+  # `reflinkFile`) on a real APFS volume, then proves the clone genuinely
+  # shares physical extents with its source. It is gated on measured evidence,
+  # not on exit code: a clean clone alone is not enough.
+  #
+  # `scripts/verify-apfs/verify-apfs.ts`:
+  #   1. asserts the volume is APFS with `diskutil info` (macOS has no `df -T`);
+  #   2. clones through the real backend;
+  #   3. measures shared extents with `fcntl(fd, F_LOG2PHYS_EXT)` physical block
+  #      mapping (Jaccard overlap ≈ 1.0), with a `df` free-space delta fallback.
+  #      `du`/`st_blocks` cannot be used: APFS double-counts clones;
+  #   4. mutates one byte, confirming the source is untouched and the block
+  #      moved — a hardlink would change the source;
+  #   5. fails loudly on ENOTSUP/EXDEV, on a non-APFS volume, and on an overlap
+  #      that shows a byte copy. `--require` turns any clean local skip into a
+  #      hard failure, so a skip can never masquerade as a pass.
+  #
+  # No official GitHub document states the runner volume is APFS, so the job
+  # asserts it at runtime before trusting anything else.
+  #
+  # This job is deliberately NOT `continue-on-error`. A green run does not close
+  # #7 by itself: a human still approves the uploaded artifact. See docs/ci.md.
+  #
+  # `macos-latest` is the primary target (macOS 26 arm64). `macos-15-intel` is a
+  # one-off cross-check on a distinct image and x86_64, kept cheap by running
+  # the same short script once. Drop that matrix entry when `macos-15` retires.
+  # ---------------------------------------------------------------------------
+  apfs-verification:
+    name: macOS APFS clone verification — #7 evidence (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-latest, macos-15-intel]
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.x
+
+      - name: Install dependencies
+        run: |
+          if [ -f bun.lock ] || [ -f bun.lockb ]; then
+            bun install --frozen-lockfile
+          else
+            bun install
+          fi
+
+      - name: Verify a real APFS clone with shared extents
+        run: >-
+          bun run scripts/verify-apfs/verify-apfs.ts
+          --require
+          --report=apfs-verification-${{ matrix.runner }}.txt
+
+      # `always()` so the evidence survives a failing verification — the human
+      # approving #7 needs the measurement even when the verdict is FAIL.
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apfs-verification-${{ matrix.runner }}
+          path: apfs-verification-${{ matrix.runner }}.txt
+          if-no-files-found: error

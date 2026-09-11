@@ -77,59 +77,86 @@ Fail closed, twice:
 The capability predicate shares the same operation, so on macOS it does not
 probe with `COPYFILE_FICLONE_FORCE` and never answers `unsupported` on APFS.
 
-## Verification on real APFS hardware (open)
+## Verification on real APFS hardware
 
-The ticket's acceptance criterion is a human on real APFS hardware pasting
-output. On an Apple Silicon Mac with Bun 1.4.x:
+The ticket's acceptance criterion is a human approving evidence of a real APFS
+clone with genuinely shared extents. That evidence is now produced by a CI job —
+`apfs-verification` in `.github/workflows/ci.yml` — which runs on a
+GitHub-hosted macOS runner:
+
+1. **The volume is asserted to be APFS** with `diskutil info` (macOS has no
+   `df -T`). No official GitHub document states the runner volume's filesystem,
+   so the job proves it at runtime before trusting anything else, and fails
+   loudly if it is not APFS.
+2. **The real backend runs**: `reflinkFile` → `cloneFile` → `copyfile(3)` with
+   `COPYFILE_ALL | COPYFILE_CLONE_FORCE` through `bun:ffi`. Not an injected
+   syscall — the actual Darwin code path.
+3. **Shared extents are measured**, not inferred from a clean exit. The job
+   samples the source's and clone's physical block maps with
+   `fcntl(fd, F_LOG2PHYS_EXT)` and compares them (Jaccard overlap ≈ 1.0). This
+   is required because `du`/`st_blocks` **double-count clones on APFS** — there
+   is no `btrfs filesystem du` equivalent — so a clone looks like a full copy in
+   those numbers. `ls -la` link counts are meaningless here.
+   If `F_LOG2PHYS_EXT` is unavailable, the job falls back to a `df` free-space
+   delta around the clone (≈0 growth), and **says so in the output and the
+   artifact**; the method is never left implicit.
+4. **Copy-on-write is confirmed** by mutating one byte in the clone and
+   re-measuring: the source must be byte-unchanged and the mutated block must
+   move to a new device offset (or the volume must grow, under the fallback). A
+   hardlink would change the source; a stale/byte copy would not have moved the
+   block. A clean overlap of 1.0 alone cannot distinguish a clone from a
+   hardlink, which is why this step is required.
+5. **Fail loud**: `ENOTSUP`/`EXDEV`, a non-APFS volume, or an overlap that shows
+   a byte copy all fail the job. The CI invocation passes `--require`, which
+   converts even a clean "wrong platform" skip into a failure, so a skip can
+   never masquerade as a pass. The job is not `continue-on-error`.
+
+The evidence — `diskutil` output, macOS version, `df`, the sampled block counts,
+the overlap ratio, and the mutation result — is printed to the job log and
+uploaded as the `apfs-verification-<runner>` artifact.
+
+**A green CI run does not close #7 by itself.** The acceptance bar is "CI emits
+measured shared-extent evidence for a real APFS clone, and a human approves that
+evidence". The remaining human step is to read the uploaded artifact and confirm
+the verdict; there is no longer a need for a human to own a Mac and paste
+terminal output.
+
+The same script runs on Linux and **skips cleanly** (exit 0, a named reason)
+without `--require`, so a developer without a Mac can invoke it. Run it locally
+on a Mac as:
 
 ```sh
-# 1. Confirm the runtime is Bun (the backend depends on bun:ffi).
-opencode2 --version
-bun --version
-
-# 2. Capability predicate: must report supported on APFS, unsupported on tmpfs.
-bun -e '
-import { mkdtemp } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { probeCowCapability } from "./src/capability";
-const apfs = await mkdtemp(join(process.env.HOME, ".cow-probe-"));
-console.log("APFS  :", await probeCowCapability(apfs));
-console.log("tmpfs :", await probeCowCapability("/tmp"));
-'
-
-# 3. Real clone + shared extents. On APFS a clone's `du` should be a small
-#    fraction of the file size; a full copy reports the full size. Also print
-#    `st_blocks` (512-byte units) for source and clone.
-bun -e '
-import { execFileSync } from "node:child_process";
-import { mkdtemp, stat, writeFile, rm } from "node:fs/promises";
-import { join } from "node:path";
-import { randomBytes } from "node:crypto";
-import { reflinkFile, cloneDirectory } from "./src/clone";
-const dir = await mkdtemp(join(process.env.HOME, ".cow-clone-"));
-await writeFile(join(dir, "src"), randomBytes(64 * 1024 * 1024));
-await reflinkFile(join(dir, "src"), join(dir, "clone"));
-console.log(execFileSync("du", ["-h", dir], { encoding: "utf8" }));
-const s = await stat(join(dir, "src"));
-const c = await stat(join(dir, "clone"));
-console.log("src blocks:", s.blocks, "clone blocks:", c.blocks);
-await cloneDirectory(dir, join(dir, "deep"));
-console.log("deep clone ok:", execFileSync("ls", [join(dir, "deep")], { encoding: "utf8" }));
-await rm(dir, { recursive: true, force: true });
-'
+bun run scripts/verify-apfs/verify-apfs.ts --report=/tmp/apfs.txt
 ```
 
-Paste the full output on issue #7. A green CI run does not substitute for it.
+### Caveats that genuinely remain
+
+- **Not yet executed on a Mac by the author of this document.** The job was
+  written and validated on Linux (typecheck + unit tests; the script skips
+  cleanly there). It has not been run on a macOS runner at the time of writing;
+  the first CI run is the first execution. If the runner volume is not APFS, the
+  job fails with that finding rather than pretending.
+- A green run attests to **that runner image's macOS version and one APFS
+  volume**. It cannot attest to an arbitrary user's machine.
+- **Cross-volume clones are not covered** and correctly return `EXDEV`; the
+  runner's scratch and clone are on the same volume by construction.
+- `F_LOG2PHYS_EXT` samples at the file's `st_blksize` granularity; the reported
+  overlap is a sampled ratio, not an exhaustive extent walk. The sampling is
+  deterministic (same logical offsets in both files), so a byte copy still
+  reads ≈0 and a clone ≈1.0.
+- Intel support ends when `macos-15` retires in Fall 2027; the primary target is
+  `macos-latest` (macOS 26 arm64).
 
 ## Consequences
 
 - The platform seam (`cloneFile`, `isDarwin`) dispatches by OS. On Linux the
   macOS module is never imported, so the backend is inert there.
 - The Darwin decision logic is unit-tested with an injected syscall. The real
-  `copyfile(3)` binding cannot be exercised on this machine.
-- **Nothing here is verified on real APFS hardware.** That is the ticket's
-  acceptance criterion and is still open. Green CI does not close it.
+  `copyfile(3)` binding is exercised by the `apfs-verification` CI job on a
+  macOS runner, which measures shared extents.
+- **Nothing here is verified on real APFS hardware until that job runs.** That
+  is the ticket's acceptance criterion; the job produces the evidence and a
+  human approves it. A green run alone does not close #7.
 
 ## References
 
@@ -137,4 +164,6 @@ Paste the full output on issue #7. A green CI run does not substitute for it.
 - `copyfile(3)` man page:
   <https://keith.github.io/xcode-man-pages/copyfile.3.html>
 - XNU `bsd/sys/errno.h` (`__error`, `ENOTSUP` = 45 on Darwin)
+- XNU `sys/fcntl.h` (`F_LOG2PHYS_EXT` = 65, `struct log2phys`)
 - Issue #7 research comment (libuv history, Bun behavior)
+- `scripts/verify-apfs/` — the CI evidence job for the acceptance criterion
