@@ -134,6 +134,12 @@ export interface WorktreeDomain {
     readonly strategy?: string;
     readonly name?: string;
     readonly location?: { readonly directory?: string };
+    /**
+     * `Worktree.CreateInput.directory` — the **parent** directory for the new
+     * worktree, not the worktree path. opencode2 appends the name. Unset
+     * defaults to the server's data directory.
+     */
+    readonly directory?: string;
   }) => Promise<WorktreeResult>;
   readonly remove: (input: {
     readonly directory: string;

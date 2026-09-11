@@ -1,7 +1,7 @@
 import type { Context } from "@opencode-ai/plugin";
 import { probeCowCapability } from "./capability";
-import { fallbackPolicy } from "./config";
-import { spawnWorkspace } from "./tool";
+import { fallbackPolicy, targetRoot } from "./config";
+import { deviceOf, spawnWorkspace } from "./tool";
 import type { SpawnWorkspaceDeps, SpawnWorkspaceInput } from "./tool";
 import { cowStrategy } from "./strategy";
 
@@ -59,18 +59,23 @@ const spawnWorkspaceOutput = {
  * the layer that owns the strategy choice, so the capability probe and the
  * worktree/session APIs meet here and nowhere else.
  *
- * The fallback policy is read from the plugin's configured options and defaults
- * to `"none"`: a request for `cow` is a statement about what the caller gets,
- * so the tool never produces a Shallow worktree unless the opt-in was set.
+ * The fallback policy and the Worktree target root are read from the plugin's
+ * configured options. The fallback defaults to `"none"`: a request for `cow` is
+ * a statement about what the caller gets, so the tool never produces a Shallow
+ * worktree unless the opt-in was set. The target root defaults to unset, which
+ * makes the tool place the Worktree beside the source — the same-filesystem
+ * parent a CoW clone requires.
  */
 function liveDeps(ctx: Context): SpawnWorkspaceDeps {
   return {
     probe: probeCowCapability,
+    probeDevice: deviceOf,
     createWorktree: (input) =>
       ctx.worktree.create({
         strategy: input.strategy,
         name: input.name,
         location: { directory: input.sourceDirectory },
+        directory: input.parentDirectory,
       }),
     createSession: async (directory, name) => {
       const session = await ctx.session.create({ title: name, location: { directory } });
@@ -79,6 +84,7 @@ function liveDeps(ctx: Context): SpawnWorkspaceDeps {
     removeWorktree: (directory) =>
       ctx.worktree.remove({ directory, force: true }),
     fallback: fallbackPolicy(ctx.options),
+    targetRoot: targetRoot(ctx.options),
   };
 }
 

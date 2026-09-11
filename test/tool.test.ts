@@ -1,17 +1,19 @@
 import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
+
 import { probeCowCapability } from "../src/capability";
 import type { CowCapability } from "../src/capability";
 import type { Mechanism } from "../src/mechanism";
-import { spawnWorkspace } from "../src/tool";
+import { deviceOf, spawnWorkspace } from "../src/tool";
 import type { SpawnWorkspaceDeps } from "../src/tool";
 import plugin from "../src/plugin";
-import { findCowRoot } from "./fs-roots";
+import { findCowRoot, findNonCowRoot } from "./fs-roots";
 
 // The two tests that use a real filesystem need a CoW root; discover one
 // instead of hardcoding this machine's mount, and skip cleanly without it.
 const cowRoot = await findCowRoot();
+const nonCowRoot = await findNonCowRoot();
 
 const scratchDirs: string[] = [];
 
@@ -29,7 +31,12 @@ async function scratchDir(): Promise<string> {
 
 /** Records each seam call so the decision table can assert what ran. */
 interface Calls {
-  readonly createWorktree: Array<{ sourceDirectory: string; strategy: Mechanism; name?: string }>;
+  readonly createWorktree: Array<{
+    sourceDirectory: string;
+    parentDirectory: string;
+    strategy: Mechanism;
+    name?: string;
+  }>;
   readonly createSession: Array<{ directory: string; name?: string }>;
   readonly removed: string[];
 }
@@ -39,11 +46,15 @@ function fakeDeps(
   options: {
     readonly fallback?: "none" | "git";
     readonly failSession?: boolean;
+    readonly targetRoot?: string;
+    /** Devices keyed by the exact path the tool probes; absent means "unknown". */
+    readonly devices?: Readonly<Record<string, number>>;
   } = {},
 ): { deps: SpawnWorkspaceDeps; calls: Calls } {
   const calls: Calls = { createWorktree: [], createSession: [], removed: [] };
   const deps: SpawnWorkspaceDeps = {
     probe: async () => capability,
+    probeDevice: async (path) => options.devices?.[path],
     createWorktree: async (input) => {
       calls.createWorktree.push(input);
       return { directory: `/worktrees/${input.strategy}-clone` };
@@ -57,6 +68,7 @@ function fakeDeps(
       calls.removed.push(directory);
     },
     fallback: options.fallback,
+    targetRoot: options.targetRoot,
   };
   return { deps, calls };
 }
@@ -71,10 +83,93 @@ test("supported + fallback none creates a cow clone and starts a session in it",
     mechanism: "cow",
   });
   expect(calls.createWorktree).toEqual([
-    { sourceDirectory: "/src", strategy: "cow", name: "worker" },
+    {
+      sourceDirectory: "/src",
+      parentDirectory: join("/src", ".."),
+      strategy: "cow",
+      name: "worker",
+    },
   ]);
   expect(calls.createSession).toEqual([{ directory: "/worktrees/cow-clone", name: "worker" }]);
   expect(calls.removed).toEqual([]);
+});
+
+test("the default parent is a sibling of the source, on the source's device", async () => {
+  const { deps, calls } = fakeDeps({ status: "supported" });
+  await spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, deps);
+
+  // A sibling shares the source's filesystem by construction, which is what a
+  // CoW clone requires; opencode2 appends the name below this parent.
+  expect(calls.createWorktree[0]?.parentDirectory).toBe(join("/src", ".."));
+});
+
+test("a configured target root is honoured as the worktree parent", async () => {
+  const { deps, calls } = fakeDeps(
+    { status: "supported" },
+    { targetRoot: "/mnt/same-device" },
+  );
+  await spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, deps);
+
+  expect(calls.createWorktree[0]?.parentDirectory).toBe("/mnt/same-device");
+});
+
+test("a configured target root on another device fails, naming the mismatch", async () => {
+  const { deps, calls } = fakeDeps(
+    { status: "supported" },
+    {
+      targetRoot: "/mnt/other-device",
+      devices: { "/src": 60, "/mnt/other-device": 43 },
+    },
+  );
+
+  await expect(
+    spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, deps),
+  ).rejects.toThrow(/different filesystem.*cannot cross devices/i);
+  // The failure is decided before the create is attempted: nothing to clean up.
+  expect(calls.createWorktree).toEqual([]);
+});
+
+test("a same-device configured target root proceeds", async () => {
+  const { deps, calls } = fakeDeps(
+    { status: "supported" },
+    {
+      targetRoot: "/mnt/other-device",
+      devices: { "/src": 60, "/mnt/other-device": 60 },
+    },
+  );
+  await spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, deps);
+
+  expect(calls.createWorktree[0]?.parentDirectory).toBe("/mnt/other-device");
+});
+
+test("an unknown device on either side is not treated as a mismatch", async () => {
+  // `probeDevice` returning undefined (path not yet created / unreadable) must
+  // not fabricate a cross-device error; the create proceeds.
+  const { deps, calls } = fakeDeps(
+    { status: "supported" },
+    { targetRoot: "/mnt/other-device", devices: { "/src": 60 } },
+  );
+  const result = await spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, deps);
+
+  expect(result.mechanism).toBe("cow");
+  expect(calls.createWorktree).toHaveLength(1);
+});
+
+test("the cross-device guard does not apply to the git mechanism", async () => {
+  // `git` builds a Shallow worktree without shared extents; a different device
+  // is not an obstacle, so the guard is `cow`-only.
+  const { deps, calls } = fakeDeps(
+    { status: "unsupported" },
+    {
+      fallback: "git",
+      targetRoot: "/mnt/other-device",
+      devices: { "/src": 60, "/mnt/other-device": 43 },
+    },
+  );
+  const result = await spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, deps);
+
+  expect(result.mechanism).toBe("git");
+  expect(calls.createWorktree[0]?.parentDirectory).toBe("/mnt/other-device");
 });
 
 test("unsupported + fallback none rejects and creates nothing", async () => {
@@ -160,6 +255,44 @@ test.skipIf(cowRoot === undefined)("the real capability probe drives the decisio
   expect(result.mechanism).toBe("cow");
   expect(calls.createWorktree[0]?.strategy).toBe("cow");
 });
+
+test.skipIf(cowRoot === undefined || nonCowRoot === undefined)(
+  "a real target root on a different filesystem is rejected as a device mismatch",
+  async () => {
+    // A real CoW source on one filesystem and a real non-CoW directory on
+    // another — the runner's mounts, discovered, never hardcoded. The two roots
+    // necessarily differ in device; the guard must name that, not surface EXDEV.
+    const source = await scratchDir();
+    const target = await mkdtemp(join(nonCowRoot!, "cow-tool-target-"));
+    scratchDirs.push(target);
+
+    expect(await deviceOf(source)).not.toBe(await deviceOf(target));
+
+    const { deps, calls } = fakeDeps({ status: "supported" }, { targetRoot: target });
+    await expect(
+      spawnWorkspace(
+        { sourceDirectory: source, name: "worker" },
+        { ...deps, probe: probeCowCapability, probeDevice: deviceOf },
+      ),
+    ).rejects.toThrow(/different filesystem.*cannot cross devices/i);
+    expect(calls.createWorktree).toEqual([]);
+  },
+);
+
+test.skipIf(cowRoot === undefined)(
+  "the default parent lands the target on the source's own device",
+  async () => {
+    const source = await scratchDir();
+    const { deps, calls } = fakeDeps({ status: "supported" });
+    await spawnWorkspace(
+      { sourceDirectory: source, name: "worker" },
+      { ...deps, probe: probeCowCapability, probeDevice: deviceOf },
+    );
+
+    const parent = calls.createWorktree[0]!.parentDirectory;
+    expect(await deviceOf(parent)).toBe(await deviceOf(source));
+  },
+);
 
 test.skipIf(cowRoot === undefined)("plugin setup registers the spawn_workspace tool behind the tool seam", async () => {
   const registered: Array<{ name: string; execute: (input: unknown) => Promise<unknown> }> = [];

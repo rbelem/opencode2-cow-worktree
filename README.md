@@ -103,7 +103,11 @@ Registering `cow` makes it the Location default; passing `strategy: "git"` still
 selects the built-in `git` strategy explicitly. `spawn_workspace` is the
 caller-facing tool: it probes CoW capability for the source directory, requests
 `cow` or the fallback `git`, starts a session in the new directory, and returns
-`{ sessionID, directory, mechanism }`. If a Worktree is created but the session
+`{ sessionID, directory, mechanism }`. It places the Worktree under a parent on
+the **source's own filesystem** — a sibling by default, or `options.targetRoot`
+when configured — because a reflink cannot cross a device. If the chosen parent
+is on a different filesystem the call fails naming the mismatch, rather than
+surfacing a bare `EXDEV`. If a Worktree is created but the session
 cannot start, the tool removes that Worktree before the error propagates. See
 `docs/adr/0001`.
 
@@ -147,6 +151,18 @@ configuration diagnostic and the plugin silently never loads (findings #1).
   may request opencode2's built-in `git` strategy and report `mechanism: "git"`.
 
 Any other value throws when the tool runs, rather than silently degrading.
+
+`options.targetRoot` controls where the tool places the Worktree. It is the
+**parent** directory opencode2 creates the worktree under:
+
+- unset (the default) — a sibling of the source (`<source>/..`), which is on the
+  source's filesystem by construction.
+- a path — used verbatim. If it names a different filesystem than the source,
+  a `cow` call fails naming the mismatch; the `git` fallback is unaffected
+  because a Shallow worktree shares no extents.
+
+Any other value throws when the tool runs, rather than silently relocating every
+clone.
 
 The fallback is **tool-only**. `POST /api/worktree {strategy: "cow"}` invokes the
 `cow` Strategy directly, and that Strategy always fails loudly on a non-CoW

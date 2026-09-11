@@ -28,6 +28,8 @@ async function scratchDir(root: string): Promise<string> {
 interface Recorded {
   readonly strategies: string[];
   readonly removed: string[];
+  /** The `Worktree.CreateInput.directory` parent each create was given. */
+  readonly parents: Array<string | undefined>;
 }
 
 interface RegisteredTool {
@@ -48,14 +50,15 @@ interface Harness {
  * This is the smallest surface the registered tool's live bindings touch.
  */
 async function harness(options: Record<string, unknown> | undefined): Promise<Harness> {
-  const recorded: Recorded = { strategies: [], removed: [] };
+  const recorded: Recorded = { strategies: [], removed: [], parents: [] };
   let registered: RegisteredTool | undefined;
 
   const ctx = {
     options,
     worktree: {
-      create: async (input: { strategy?: string }) => {
+      create: async (input: { strategy?: string; directory?: string }) => {
         recorded.strategies.push(input.strategy ?? "default");
+        recorded.parents.push(input.directory);
         return { directory: `/worktrees/${input.strategy}-worktree` };
       },
       remove: async (input: { directory: string }) => {
@@ -128,3 +131,40 @@ test.skipIf(cowRoot === undefined)("an invalid fallback value fails the call lou
   await expect(tool.execute({ sourceDirectory: dir })).rejects.toThrow(/fallback/);
   expect(recorded.strategies).toEqual([]);
 });
+
+test.skipIf(cowRoot === undefined)(
+  "by default the tool asks opencode2 to parent the worktree beside the source",
+  async () => {
+    const dir = await scratchDir(cowRoot!);
+    const { tool, recorded } = await harness(undefined);
+
+    await tool.execute({ sourceDirectory: dir, name: "worker" });
+
+    // `Worktree.CreateInput.directory` is the parent, so the default is the
+    // source's own parent — same device by construction.
+    expect(recorded.parents).toEqual([join(dir, "..")]);
+  },
+);
+
+test.skipIf(cowRoot === undefined)(
+  "a configured targetRoot is passed through as the worktree parent",
+  async () => {
+    const dir = await scratchDir(cowRoot!);
+    const { tool, recorded } = await harness({ targetRoot: "/mnt/worktrees" });
+
+    await tool.execute({ sourceDirectory: dir, name: "worker" });
+
+    expect(recorded.parents).toEqual(["/mnt/worktrees"]);
+  },
+);
+
+test.skipIf(cowRoot === undefined)(
+  "an invalid targetRoot fails the call loudly before any worktree is requested",
+  async () => {
+    const dir = await scratchDir(cowRoot!);
+    const { tool, recorded } = await harness({ targetRoot: 42 });
+
+    await expect(tool.execute({ sourceDirectory: dir })).rejects.toThrow(/targetRoot/);
+    expect(recorded.strategies).toEqual([]);
+  },
+);

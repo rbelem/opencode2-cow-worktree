@@ -1,3 +1,5 @@
+import { stat } from "node:fs/promises";
+import { join } from "node:path";
 import type { CowCapability } from "./capability";
 import type { Mechanism } from "./mechanism";
 
@@ -19,9 +21,21 @@ export type FallbackPolicy = "none" | "git";
 export interface SpawnWorkspaceDeps {
   /** Answers the CoW capability question for a directory. */
   readonly probe: (directory: string) => Promise<CowCapability>;
-  /** Creates a Worktree with the named Strategy, returning its directory. */
+  /**
+   * Reports the device a path's filesystem belongs to, or `undefined` when it
+   * cannot be read. Injected so a cross-device target is testable without a
+   * second mount.
+   */
+  readonly probeDevice: (path: string) => Promise<number | undefined>;
+  /**
+   * Creates a Worktree with the named Strategy, returning its directory.
+   * `parentDirectory` is opencode2's `Worktree.CreateInput.directory`: the
+   * **parent** the worktree is created under, not the worktree path itself.
+   * opencode2 appends the name, so it is what decides the target device.
+   */
   readonly createWorktree: (input: {
     readonly sourceDirectory: string;
+    readonly parentDirectory: string;
     readonly strategy: Mechanism;
     readonly name?: string;
   }) => Promise<{ readonly directory: string }>;
@@ -31,6 +45,8 @@ export interface SpawnWorkspaceDeps {
   readonly removeWorktree: (directory: string) => Promise<void>;
   /** Defaults to `"none"`: a request for `cow` is a statement about what you get. */
   readonly fallback?: FallbackPolicy;
+  /** Worktree parent. Defaults to a same-filesystem sibling of the source. */
+  readonly targetRoot?: string;
 }
 
 export interface SpawnWorkspaceInput {
@@ -47,6 +63,12 @@ export interface SpawnWorkspaceInput {
  * fails, even with fallback enabled: it is not the same answer as "not
  * supported", and honouring the fallback there would hide a real problem behind
  * a git worktree. The fallback only applies to a genuine negative.
+ *
+ * A CoW clone cannot cross a filesystem boundary, so the tool creates the
+ * Worktree under a parent on the source's own device — a sibling by default, or
+ * the configured target root. When the chosen parent is on a different device
+ * the call fails with an explicit device-mismatch error rather than letting a
+ * bare `EXDEV` surface as an unexplained clone failure.
  *
  * There is no silent fallback by default. If the probe says unsupported and no
  * fallback is configured, the call throws rather than fabricating a mechanism —
@@ -74,8 +96,12 @@ export async function spawnWorkspace(
       ? "cow"
       : selectFallback(deps.fallback ?? "none", input.sourceDirectory);
 
+  const parent = deps.targetRoot ?? join(input.sourceDirectory, "..");
+  await verifySameDevice(input.sourceDirectory, parent, mechanism, deps.probeDevice);
+
   const worktree = await deps.createWorktree({
     sourceDirectory: input.sourceDirectory,
+    parentDirectory: parent,
     strategy: mechanism,
     name: input.name,
   });
@@ -89,9 +115,57 @@ export async function spawnWorkspace(
   }
 }
 
+/**
+ * Rejects a `cow` parent on a different filesystem than the source before the
+ * create is attempted. A reflink cannot cross devices, so this is a distinct,
+ * actionable failure and must not surface as a generic clone error. The `git`
+ * mechanism does not share extents and is left untouched.
+ *
+ * An unreadable device on either side is not a mismatch — `probeDevice` returns
+ * `undefined` rather than throwing, and the create proceeds to report whatever
+ * the filesystem actually does.
+ */
+async function verifySameDevice(
+  source: string,
+  parent: string,
+  mechanism: Mechanism,
+  probeDevice: SpawnWorkspaceDeps["probeDevice"],
+): Promise<void> {
+  if (mechanism !== "cow") return;
+  const [sourceDevice, parentDevice] = await Promise.all([
+    probeDevice(source),
+    probeDevice(parent),
+  ]);
+  if (
+    sourceDevice === undefined ||
+    parentDevice === undefined ||
+    sourceDevice === parentDevice
+  ) {
+    return;
+  }
+  throw new Error(
+    `clone target ${parent} is on a different filesystem than ${source}; ` +
+      "a CoW clone cannot cross devices. Point the tool's targetRoot option at " +
+      "a directory on the source's filesystem.",
+  );
+}
+
 function selectFallback(policy: FallbackPolicy, sourceDirectory: string): Mechanism {
   if (policy === "git") return "git";
   throw new Error(
     `copy-on-write is not supported for ${sourceDirectory} and no fallback is enabled`,
   );
+}
+
+/**
+ * The device a path's filesystem belongs to, or `undefined` when it cannot be
+ * read (a path that does not exist yet, or a permission failure).
+ */
+export async function deviceOf(path: string): Promise<number | undefined> {
+  try {
+    const stats = await stat(path);
+    return stats.dev;
+  } catch {
+    return undefined;
+  }
 }
