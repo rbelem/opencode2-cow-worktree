@@ -138,6 +138,10 @@ export interface FallbackResult {
   enabledStatus?: number;
   enabledMechanism?: string;
   enabledText?: string;
+  simulation?: unknown;
+  spawnSimulation?: unknown;
+  simulationFallbackGit?: unknown;
+  simulationFallbackNone?: unknown;
   readonly notes: string[];
 }
 

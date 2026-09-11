@@ -14,6 +14,7 @@
  * on exit unless `--keep` is passed.
  */
 import { execFileSync } from "node:child_process";
+import { mkdtemp } from "node:fs/promises";
 import { pluginLogLines, startServer, type Server } from "./server";
 import { Assertions } from "./assertions";
 import { join } from "node:path";
@@ -27,6 +28,7 @@ import {
   runNonCowServer,
   type WorktreeRun,
 } from "./scenarios";
+import { runSimulationScenario } from "./simulation";
 import { writeRunLog } from "./runlog";
 import { makeConfigRoot, makeSourceProject, installPlugin, declarePlugin, removePath } from "./lib";
 
@@ -85,6 +87,83 @@ async function main(): Promise<number> {
       `${nonCowOptIn.enabledStatus} ${nonCowOptIn.enabledText}`,
     );
     fallback.notes.push(...nonCow.notes, ...nonCowOptIn.notes);
+
+    // Issue #9: reach the fallback through a real tool invocation. The model's
+    // bytes are scripted by the drive controller; the session loop, tool
+    // registry, and tool execution are production code.
+    const simulation = await runSimulationScenario({
+      port: PORT + 3,
+      fallback: "git",
+      scriptedTool: { name: "shell", input: { command: "echo sim-shell-ran" } },
+    });
+    assertions.check(
+      "simulation: a real session ran the scripted tool call",
+      simulation.scriptedToolStatus === "completed",
+      `${simulation.scriptedToolStatus} ${simulation.scriptedToolOutput ?? ""}`,
+    );
+    assertions.check(
+      "simulation: the scripted shell command actually executed",
+      (simulation.scriptedToolOutput ?? "").includes("sim-shell-ran"),
+      simulation.scriptedToolOutput ?? "no output",
+    );
+    const spawnScenario = await runSimulationScenario({
+      port: PORT + 4,
+      fallback: "git",
+      scriptedTool: { name: "spawn_workspace", input: { name: "sim" } },
+    });
+    assertions.check(
+      "simulation: spawn_workspace is offered to the session by name",
+      spawnScenario.pluginToolOffered === true,
+      spawnScenario.toolNames.join(", "),
+    );
+    assertions.check(
+      "simulation: the real session executed spawn_workspace",
+      spawnScenario.scriptedToolStatus === "completed",
+      `${spawnScenario.scriptedToolStatus} ${spawnScenario.scriptedToolOutput ?? ""}`,
+    );
+
+    // The fallback policy, end to end, through a real tool invocation on a real
+    // non-CoW filesystem. Each scenario needs its own root: it creates and
+    // commits its source repo.
+    const nonCowGitRoot = await mkdtemp(join("/dev/shm", "cow-harness-fb-"));
+    const fallbackGit = await runSimulationScenario({
+      port: PORT + 5,
+      fallback: "git",
+      sourceRoot: nonCowGitRoot,
+      scriptedTool: { name: "spawn_workspace", input: { name: "fb" } },
+    });
+    assertions.check(
+      "simulation fallback: non-CoW source + fallback git completes",
+      fallbackGit.scriptedToolStatus === "completed",
+      `${fallbackGit.scriptedToolStatus} ${fallbackGit.scriptedToolOutput ?? ""}`,
+    );
+    assertions.check(
+      "simulation fallback: the result reports the git mechanism",
+      (fallbackGit.scriptedToolOutput ?? "").includes("git"),
+      fallbackGit.scriptedToolOutput ?? "no output",
+    );
+    const nonCowNoneRoot = await mkdtemp(join("/dev/shm", "cow-harness-fl-"));
+    const fallbackNone = await runSimulationScenario({
+      port: PORT + 6,
+      fallback: "none",
+      sourceRoot: nonCowNoneRoot,
+      scriptedTool: { name: "spawn_workspace", input: { name: "fl" } },
+    });
+    assertions.check(
+      "simulation fallback: non-CoW source + fallback none fails loudly",
+      (fallbackNone.scriptedToolStatus ?? "").includes("not supported") &&
+        (fallbackNone.scriptedToolStatus ?? "").includes("no fallback"),
+      fallbackNone.scriptedToolStatus ?? "no status",
+    );
+
+    fallback.notes.push(...simulation.notes.map((note) => `simulation: ${note}`));
+    fallback.notes.push(...spawnScenario.notes.map((note) => `simulation(spawn_workspace): ${note}`));
+    fallback.notes.push(...fallbackGit.notes.map((note) => `simulation(fallback git): ${note}`));
+    fallback.notes.push(...fallbackNone.notes.map((note) => `simulation(fallback none): ${note}`));
+    fallback.simulation = simulation;
+    fallback.spawnSimulation = spawnScenario;
+    fallback.simulationFallbackGit = fallbackGit;
+    fallback.simulationFallbackNone = fallbackNone;
 
     await writeRunLog({ config, source, server, runtime, runs, assertions, fallback, version: serverVersion() });
 

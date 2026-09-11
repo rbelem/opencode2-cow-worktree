@@ -203,3 +203,68 @@ test.skipIf(cowRoot === undefined)("plugin setup registers the spawn_workspace t
   expect(result.output.directory).toBe("/worktrees/cow-clone");
   expect(result.output.sessionID).toBe("ses_live");
 });
+
+// Two registration defects the e2e simulation found (#9). Both are invisible to
+// a fake ctx that only checks the tool executes, so they are asserted here on
+// the registration itself.
+test("the registered tool is kept on the native tool list, not behind CodeMode", async () => {
+  const registered: Array<{ name: string; options?: { codemode?: boolean } }> = [];
+
+  const ctx = {
+    worktree: {
+      transform: async (callback: (editor: unknown) => void) => {
+        callback({ add: () => {} });
+        return { dispose: async () => {} };
+      },
+    },
+    tool: {
+      transform: async (callback: (editor: unknown) => void) => {
+        callback({
+          add: (tool: { name: string; options?: { codemode?: boolean } }) => registered.push(tool),
+        });
+        return { dispose: async () => {} };
+      },
+    },
+  } as unknown as Parameters<typeof plugin.setup>[0];
+
+  await plugin.setup(ctx);
+
+  const tool = registered.find((entry) => entry.name === "spawn_workspace");
+  expect(tool).toBeDefined();
+  // Unset defaults into CodeMode, where the model only sees `execute`.
+  expect(tool!.options?.codemode).toBe(false);
+});
+
+test("the registered tool declares the output schema it returns", async () => {
+  const registered: Array<{ name: string; output?: unknown }> = [];
+
+  const ctx = {
+    worktree: {
+      transform: async (callback: (editor: unknown) => void) => {
+        callback({ add: () => {} });
+        return { dispose: async () => {} };
+      },
+    },
+    tool: {
+      transform: async (callback: (editor: unknown) => void) => {
+        callback({
+          add: (tool: { name: string; output?: unknown }) => registered.push(tool),
+        });
+        return { dispose: async () => {} };
+      },
+    },
+  } as unknown as Parameters<typeof plugin.setup>[0];
+
+  await plugin.setup(ctx);
+
+  const tool = registered.find((entry) => entry.name === "spawn_workspace");
+  expect(tool).toBeDefined();
+  // A result with an `output` field and no declared schema is a hard defect in
+  // opencode2, not a recoverable error.
+  expect(tool!.output).toBeDefined();
+  expect((tool!.output as { required?: string[] }).required).toEqual([
+    "sessionID",
+    "directory",
+    "mechanism",
+  ]);
+});

@@ -57,6 +57,18 @@ export interface ToolInfo {
   readonly name: string;
   readonly description: string;
   readonly input: unknown;
+  /**
+   * The declared output schema. A tool that returns an `output` field must
+   * declare it; opencode2 dies on an undeclared output rather than treating it
+   * as a recoverable error.
+   */
+  readonly output?: unknown;
+  /**
+   * `Tool.Options` (packages/schema/src/tool.ts). `codemode: false` keeps the
+   * tool on the provider's native tool list; the default routes it through
+   * CodeMode, where the model only sees `execute`.
+   */
+  readonly options?: { readonly codemode?: boolean } & Readonly<Record<string, unknown>>;
   readonly execute: (input: any, context: unknown) => Promise<ToolResult>;
 }
 

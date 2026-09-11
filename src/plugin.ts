@@ -27,6 +27,34 @@ const spawnWorkspaceInput = {
 } as const;
 
 /**
+ * The tool's declared output, as a JSON Schema. A tool that returns an `output`
+ * field must declare its schema: opencode2 treats an undeclared output as a
+ * defect ("Tool result declared output without an output schema"), not as a
+ * recoverable error. The reported mechanism is part of the contract, so the
+ * structured result is declared rather than flattened into text.
+ */
+const spawnWorkspaceOutput = {
+  type: "object",
+  properties: {
+    sessionID: {
+      type: "string",
+      description: "The session started in the created directory.",
+    },
+    directory: {
+      type: "string",
+      description: "The working directory that was produced.",
+    },
+    mechanism: {
+      type: "string",
+      enum: ["cow", "git"],
+      description: "The mechanism that produced the directory.",
+    },
+  },
+  required: ["sessionID", "directory", "mechanism"],
+  additionalProperties: false,
+} as const;
+
+/**
  * Binds `spawnWorkspace`'s seams to the live opencode2 context. The tool is
  * the layer that owns the strategy choice, so the capability probe and the
  * worktree/session APIs meet here and nowhere else.
@@ -78,6 +106,11 @@ export default {
         description:
           "Create a worktree and start a session in it, reporting the mechanism that produced the directory.",
         input: spawnWorkspaceInput,
+        output: spawnWorkspaceOutput,
+        // A tool defaults into CodeMode, which advertises it to the model only
+        // through `execute`. This tool must be callable by name, so it is kept
+        // on the provider's native tool list.
+        options: { codemode: false },
         execute: async (input: SpawnWorkspaceInput) => {
           const result = await spawnWorkspace(input, liveDeps(ctx));
           return {

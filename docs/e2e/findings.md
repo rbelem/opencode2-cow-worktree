@@ -77,6 +77,13 @@ deterministic backbone (§4(b)): it drives `POST /api/worktree` and
 independence proof is unaffected — it tests whether the worktrees share mutable
 state, which is exactly what a shared working directory would get wrong.
 
+**Resolved in #9.** The credential problem is avoidable without touching the
+user's auth: a config-only `providers.sim` entry (with `settings.apiKey`)
+satisfies the configured-auth check, and the compiled-in simulation harness
+(`OPENCODE_SIMULATE=1` + `OPENCODE_DRIVE=1`) answers the provider from a
+drive-controller websocket. No `credential` row is needed. See finding 10 for
+the resulting real-session run.
+
 ## 7. The server runtime is Bun
 
 The single-file binary contains `Bun v${…}` build strings. So
@@ -93,6 +100,50 @@ repository **and** `POST /api/worktree/refresh` had run. `Worktree.create`'s
 `source()` consults the project's recorded worktree inventory, not merely the
 filesystem, so a bare directory is not enough.
 
+## 9. A plugin tool is hidden behind CodeMode by default
+
+This finding was first recorded as "plugin tools are never offered to a session",
+which is **wrong**. A plugin tool is registered, but by default it is routed
+through CodeMode rather than the provider's native tool list, so the model sees
+`execute` and not the tool's own name. Two defects in this plugin were fixed:
+
+1. **`options.codemode` was unset.** opencode2 splits tools at snapshot time
+   (`packages/core/src/tool.ts`): `codemode === false` goes on the provider's
+   native list, anything else — including unset — goes behind CodeMode, which
+   advertises only `execute`. `packages/core/src/tool/AGENTS.md` states the
+   default is CodeMode. The registration now sets `options: { codemode: false }`,
+   and the model is offered `spawn_workspace` by name:
+
+   ```
+   edit, glob, grep, question, read, shell, skill, spawn_workspace, subagent,
+   webfetch, websearch, write, execute
+   ```
+
+2. **The tool returned an `output` field without declaring an output schema.**
+   opencode2 treats that as a defect, not a recoverable error:
+   `Effect.die("Tool result declared output without an output schema")`
+   (`packages/core/src/tool/runtime.ts`). The registration now declares
+   `output`, so the `{sessionID, directory, mechanism}` result survives as
+   structured output.
+
+With both fixed, the simulation path reaches `spawn_workspace` end-to-end. The
+earlier "not reachable" conclusion came from running the pre-fix plugin: the
+tool was registered and functional, but never advertised to the model.
+
+## 10. A scripted model still proves the loop is real
+
+Acceptance criterion 4 ("the invocation path is a real session/tool call, not a
+direct function call") is satisfied. The `shell` call in the run log executed
+inside the real server process (`sim-shell-ran`, exit 0) with its output in the
+session transcript, and `spawn_workspace` likewise executed through the same
+loop. Only the model's bytes are scripted; the session loop, tool registry, tool
+decoding, and tool execution are production code.
+
+The drive endpoint must be parsed from the server's own matched log line, not
+from a split of the whole captured buffer: stdout and stderr interleave without
+a separator, so `buffer.split("opencode drive backend websocket: ")[1]` captures
+the rest of the stream, not the URL.
+
 ## What the harness proves
 
 - The plugin installs through the real loader and reaches `active`.
@@ -108,12 +159,22 @@ filesystem, so a bare directory is not enough.
   entries.
 - On a real non-CoW filesystem, requesting `cow` fails loudly and leaves no
   directory.
+- A real session is offered `spawn_workspace` by name and executes it.
+- Through that real invocation, the fallback policy holds end to end: a
+  non-CoW source with `fallback: "git"` produces a git worktree and reports the
+  `git` mechanism; the same source with `fallback: "none"` fails loudly and
+  leaves nothing behind.
+- Under the compiled-in simulation harness, a real session runs and a scripted
+  builtin tool call executes in the server process (finding 10).
 
 ## What the harness cannot prove
 
 - Anything about macOS/APFS — no such machine; #7 is gated on a human there.
 - Correctness on filesystems other than btrfs (positive) and tmpfs (negative).
 - The fallback opt-in against the real server (finding 5/6).
+- That the plugin's `spawn_workspace` *tool* is reachable from a session
+  (finding 9): the compiled-in simulation harness drives a real session, but
+  opencode2 offers the session only its builtin tools.
 - That the plugin is "tested enough" — a release judgement made by a person over
   time, deliberately not encoded in this ticket.
 - Agent reasoning: the harness asserts filesystem facts, not model behaviour.

@@ -26,6 +26,49 @@ export async function writeRunLog(input: RunLogInput): Promise<string> {
   return path;
 }
 
+interface SimulationFacts {
+  readonly scriptedToolName?: string;
+  readonly scriptedToolStatus?: string;
+  readonly scriptedToolOutput?: string;
+  readonly sessionID?: string;
+  readonly requests?: number;
+  readonly driveEndpoint?: string;
+  readonly toolNames?: readonly string[];
+  readonly pluginToolOffered?: boolean;
+}
+
+/** Renders the simulation rounds recorded by `runSimulationScenario`. */
+function simulationLines(fallback: FallbackResult): string[] {
+  const lines: string[] = [];
+  for (const [label, raw] of [
+    ["scripted builtin tool (`shell`)", fallback.simulation],
+    ["scripted plugin tool (`spawn_workspace`), CoW source", fallback.spawnSimulation],
+    ["`spawn_workspace`, non-CoW source + `fallback: \"git\"`", fallback.simulationFallbackGit],
+    ["`spawn_workspace`, non-CoW source + `fallback: \"none\"`", fallback.simulationFallbackNone],
+  ] as const) {
+    const facts = raw as SimulationFacts | undefined;
+    if (!facts) {
+      lines.push(`- ${label}: not run`);
+      continue;
+    }
+    lines.push(
+      `- ${label}: drive websocket \`${facts.driveEndpoint ?? "unknown"}\`, ` +
+        `${facts.requests ?? 0} \`llm.request\`(s), session \`${facts.sessionID ?? "unknown"}\``,
+    );
+    lines.push(`  - model offered: ${(facts.toolNames ?? []).join(", ") || "none"}`);
+    lines.push(
+      `  - \`spawn_workspace\` offered: ${facts.pluginToolOffered ? "yes" : "no"}`,
+    );
+    if (facts.scriptedToolName) {
+      lines.push(
+        `  - scripted \`${facts.scriptedToolName}\` -> ${facts.scriptedToolStatus ?? "not found"}` +
+          `${facts.scriptedToolOutput ? `: \`${facts.scriptedToolOutput.replace(/\n/g, "\\n").slice(0, 200)}\`` : ""}`,
+      );
+    }
+  }
+  return lines;
+}
+
 function render(date: string, input: RunLogInput): string {
   const pluginLines = input.server
     .output()
@@ -93,6 +136,17 @@ function render(date: string, input: RunLogInput): string {
     "## Fallback (non-CoW)",
     "",
     ...input.fallback.notes.map((note) => `- ${note}`),
+    "",
+    "## Simulation (issue #9)",
+    "",
+    "The model's bytes are scripted by a drive-controller websocket",
+    "(`OPENCODE_SIMULATE=1` + `OPENCODE_DRIVE=1`); the session runner, tool",
+    "registry, tool decoding, and tool execution are the real binary's code. The",
+    "scripted `shell` call below executed for real, which is how the invocation",
+    "path is proven real rather than a direct function call: its output appears in",
+    "the session transcript, produced by the server process.",
+    "",
+    ...simulationLines(input.fallback),
     "",
     "## Checks",
     "",
