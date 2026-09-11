@@ -114,7 +114,10 @@ jobs:
   # not on exit code: a clean clone alone is not enough.
   #
   # `scripts/verify-apfs/verify-apfs.ts`:
-  #   1. asserts the volume is APFS with `diskutil info` (macOS has no `df -T`);
+  #   1. resolves the scratch directory's mount point with `df -Pk`, then
+  #      asserts the volume is APFS with `diskutil info <mount point>` (macOS
+  #      has no `df -T`, and `diskutil info <subdir>` is invalid — it answers
+  #      "Could not find disk", which the first real run proved);
   #   2. clones through the real backend;
   #   3. measures shared extents with `fcntl(fd, F_LOG2PHYS_EXT)` physical block
   #      mapping (Jaccard overlap ≈ 1.0), with a `df` free-space delta fallback.
@@ -124,6 +127,9 @@ jobs:
   #   5. fails loudly on ENOTSUP/EXDEV, on a non-APFS volume, and on an overlap
   #      that shows a byte copy. `--require` turns any clean local skip into a
   #      hard failure, so a skip can never masquerade as a pass.
+  #
+  # The report is written on every exit path, including a skip and an unexpected
+  # exception, and uploaded from `runner.temp` with `if-no-files-found: warn`.
   #
   # No official GitHub document states the runner volume is APFS, so the job
   # asserts it at runtime before trusting anything else.
@@ -163,14 +169,29 @@ jobs:
         run: >-
           bun run scripts/verify-apfs/verify-apfs.ts
           --require
-          --report=apfs-verification-${{ matrix.runner }}.txt
+          --report=${{ runner.temp }}/apfs-verification-${{ matrix.runner }}.txt
+
+      # The first real run lost its report to an uncaught throw, so make the
+      # resolved paths explicit in the log. Harmless on success; diagnosis fuel
+      # when the report is missing.
+      - name: Locate the verification report
+        if: always()
+        run: |
+          echo "runner.temp=${{ runner.temp }}"
+          ls -la "${{ runner.temp }}/apfs-verification-${{ matrix.runner }}.txt" || echo "report not found in runner.temp"
+          ls -la "apfs-verification-${{ matrix.runner }}.txt" 2>/dev/null || echo "report not found in workspace root"
 
       # `always()` so the evidence survives a failing verification — the human
       # approving #7 needs the measurement even when the verdict is FAIL.
+      # `if-no-files-found: warn`, not `error`: a missing report must not fail
+      # the upload step and obscure the verification step's own failure. The
+      # script writes on every exit path, so a missing file means the script
+      # died before it could write — which the verification step already fails
+      # on, loudly, and the step above shows where to look.
       - name: Upload verification evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: apfs-verification-${{ matrix.runner }}
-          path: apfs-verification-${{ matrix.runner }}.txt
-          if-no-files-found: error
+          path: ${{ runner.temp }}/apfs-verification-${{ matrix.runner }}.txt
+          if-no-files-found: warn

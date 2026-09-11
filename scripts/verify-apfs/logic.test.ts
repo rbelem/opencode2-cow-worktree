@@ -7,7 +7,9 @@ import {
   evaluateExtentSharing,
   jaccardOverlap,
   parseDfPk,
+  parseDfVolume,
   parseFilesystemPersonality,
+  parseMountFsType,
   parseOptions,
 } from "./logic";
 
@@ -29,8 +31,59 @@ test("parseFilesystemPersonality reads APFS from diskutil output", () => {
   expect(parseFilesystemPersonality(DISKUTIL_APFS)).toBe("APFS");
 });
 
+test("parseFilesystemPersonality falls back to the bundle and user-visible labels", () => {
+  expect(parseFilesystemPersonality("   Type (Bundle):             apfs\n")).toBe("apfs");
+  expect(parseFilesystemPersonality("   Name (User Visible):       APFS\n")).toBe("APFS");
+});
+
 test("parseFilesystemPersonality returns undefined when the field is absent", () => {
   expect(parseFilesystemPersonality("   Device Identifier: disk1\n")).toBeUndefined();
+});
+
+// --- df volume resolution -------------------------------------------------
+
+// `diskutil info` takes a volume (device node, disk id, or mount point) and is
+// NOT valid on an arbitrary subdirectory — `diskutil info <subdir>` fails with
+// "Could not find disk". The scratch dir's mount point is resolved from df.
+const DF_MACOS_SCRATCH = [
+  "Filesystem 1024-blocks      Used Available Capacity Mounted on",
+  "/dev/disk3s5  971350180 123456789  45678901    73%   /System/Volumes/Data",
+  "",
+].join("\n");
+
+test("parseDfVolume reads the device node and mount point", () => {
+  expect(parseDfVolume(DF_MACOS_SCRATCH)).toEqual({
+    device: "/dev/disk3s5",
+    mountPoint: "/System/Volumes/Data",
+  });
+});
+
+test("parseDfVolume keeps spaces inside the mount point", () => {
+  const output = [
+    "Filesystem 1024-blocks Used Available Capacity Mounted on",
+    "/dev/disk4s1 100 20 80 20% /Volumes/My Data Disk",
+  ].join("\n");
+  expect(parseDfVolume(output)).toEqual({
+    device: "/dev/disk4s1",
+    mountPoint: "/Volumes/My Data Disk",
+  });
+});
+
+test("parseDfVolume returns undefined on junk", () => {
+  expect(parseDfVolume("not a df line")).toBeUndefined();
+});
+
+test("parseMountFsType matches the volume by mount point, not by path prefix", () => {
+  // On modern macOS /Users is a firmlink into /System/Volumes/Data, so a
+  // path-prefix match would wrongly pick the read-only System volume at "/".
+  const mountOutput = [
+    "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)",
+    "/dev/disk3s5 on /System/Volumes/Data (apfs, local, journaled, nobrowse)",
+    "devfs on /dev (devfs, local, nobrowse)",
+  ].join("\n");
+  expect(parseMountFsType(mountOutput, { device: "/dev/disk3s5", mountPoint: "/System/Volumes/Data" })).toBe("apfs");
+  expect(parseMountFsType(mountOutput, { device: "/dev/disk3s1s1", mountPoint: "/" })).toBe("apfs");
+  expect(parseMountFsType(mountOutput, { device: "/dev/disk9s9", mountPoint: "/nope" })).toBeUndefined();
 });
 
 // --- df parsing -----------------------------------------------------------

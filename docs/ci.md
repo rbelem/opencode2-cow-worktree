@@ -41,10 +41,15 @@ and gates on **measured evidence**, not on exit code.
 
 What it does, in order:
 
-1. **Asserts the volume is APFS** with `diskutil info` (macOS has no `df -T`)
-   and prints the raw output, the macOS version, and `df -Pk`. No official
-   GitHub document states the runner volume's filesystem, so the job proves it
-   at runtime and fails loudly if it is not APFS.
+1. **Asserts the volume is APFS** with `diskutil info` on the scratch
+   directory's **mount point** (macOS has no `df -T`) and prints the raw
+   output, the macOS version, and `df -Pk`. `diskutil info` accepts a device
+   node or a mount point, not an arbitrary subdirectory: the job's first real
+   run passed the scratch dir and got `Could not find disk`, which is why the
+   mount point is now resolved from `df` first, with the `mount(8)` type as a
+   labelled fallback. No official GitHub document states the runner volume's
+   filesystem, so the job proves it at runtime and fails loudly if it is not
+   APFS.
 2. **Runs the real backend**: `reflinkFile` → `cloneFile` → `copyfile(3)` with
    `COPYFILE_ALL | COPYFILE_CLONE_FORCE` through `bun:ffi`. Not an injected
    syscall.
@@ -64,9 +69,14 @@ What it does, in order:
    job is **not** `continue-on-error`.
 
 The full evidence is printed to the job log and uploaded as the
-`apfs-verification-<runner>` artifact (uploaded with `always()`, so a FAIL run
-still preserves its measurement). `macos-15-intel` is a one-off cross-check on a
-distinct image and architecture; drop it when `macos-15` retires in Fall 2027.
+`apfs-verification-<runner>` artifact. The report is written on **every** exit
+path — including a skip and an unexpected exception — to `${{ runner.temp }}`,
+and the upload uses `always()` with `if-no-files-found: warn`. That guarantee
+was added after the first real run: an uncaught `execFileSync` throw meant the
+script wrote nothing, and the upload step then failed with "No files were found
+with the provided path". A failing verification no longer costs its own
+evidence. `macos-15-intel` is a one-off cross-check on a distinct image and
+architecture; drop it when `macos-15` retires in Fall 2027.
 
 ### What the job does **not** prove
 
@@ -161,6 +171,14 @@ never pretends the CoW clone ran when it did not.
 
 ### Residual environment assumptions
 
+- `df -Pk` is used for two things: resolving the scratch directory's mount
+  point (for `diskutil info`) and measuring free-space deltas. `-P` forces the
+  POSIX column layout on macOS *and* GNU/Linux (`Filesystem 1024-blocks Used
+  Available Capacity Mounted on`), so the same indices parse on both. GNU `df
+  -P` may wrap a long device name onto its own line and repeat
+  `Filesystem 1024-blocks ...` in the first column; the parser reads the last
+  line, whose first field is a real device (`/dev/...`). A first field without
+  a `/` is rejected rather than mistaken for a device.
 - `test/clone.test.ts` drives `btrfs filesystem du` for the extent-sharing
   test. A CoW filesystem need not be btrfs, so that test additionally requires
   btrfs-progs on PATH against the discovered root; it skips when either is
@@ -183,6 +201,10 @@ reasonable follow-up; it is not required for CI to work.
 `apfs-verification-<runner>` (e.g. `apfs-verification-macos-latest`). Each
 contains the full raw evidence: `diskutil info`, the macOS version, `df -Pk`,
 the sampled physical block counts, the Jaccard overlap, the mutation result, and
-the final `VERDICT`. The upload uses `if: always()`, so a failing run still
-preserves its measurement for review. Approving that artifact is the human step
-that closes #7.
+the final `VERDICT`. The report path is
+`${{ runner.temp }}/apfs-verification-<runner>.txt` and the upload uses
+`if: always()`, so a failing run still preserves its measurement for review;
+`if-no-files-found` is `warn` rather than `error` so a genuinely missing report
+cannot mask the verification step's own failure. The script itself writes the
+report on every exit path. Approving that artifact is the human step that closes
+#7.

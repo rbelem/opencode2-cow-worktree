@@ -82,19 +82,102 @@ function parseSize(raw: string, fallback: number): number {
 }
 
 /**
- * `diskutil info <path>` reports the volume's personality on a line like
- * `   File System Personality:   APFS`. Returns the trimmed value, or
- * `undefined` when the line is absent.
+ * The labels `diskutil info` uses for a volume's file system personality. The
+ * canonical one is `File System Personality:`; the bundle and user-visible
+ * names are accepted as fallbacks so a label change in a future macOS cannot
+ * turn a real APFS volume into a hard failure.
+ */
+const PERSONALITY_PATTERNS: readonly RegExp[] = [
+  /File System Personality:\s*(.+)/i,
+  /Type \(Bundle\):\s*(.+)/i,
+  /Name \(User Visible\):\s*(.+)/i,
+];
+
+/**
+ * Reads the volume's file system personality from `diskutil info` output, e.g.
+ * the `File System Personality:   APFS` line, or `undefined` when none of the
+ * known labels is present.
+ *
+ * `diskutil info` must be given a volume — a device node or a **mount point** —
+ * not an arbitrary subdirectory. `diskutil info <subdir>` fails with
+ * `Could not find disk`, which is the bug this job hit on its first real run:
+ * resolve the mount point with `df` first (see `parseDfVolume`).
  */
 export function parseFilesystemPersonality(diskutilStdout: string): string | undefined {
-  const match = diskutilStdout.match(/File System Personality:\s*(.+)/i);
-  const value = match?.[1]?.trim();
-  return value && value.length > 0 ? value : undefined;
+  for (const pattern of PERSONALITY_PATTERNS) {
+    const match = diskutilStdout.match(pattern);
+    const value = match?.[1]?.trim();
+    if (value && value.length > 0) return value;
+  }
+  return undefined;
+}
+
+/** The device node and mount point backing a path, as `df -Pk` reports them. */
+export interface DfVolume {
+  readonly device: string | undefined;
+  readonly mountPoint: string | undefined;
 }
 
 /**
- * Parses the data line of `df -Pk <path>`: `Filesystem 1024-blocks Used
- * Available Capacity Mounted-on`. Returns used and available in KiB.
+ * Parses the device node and mount point from the data line of
+ * `df -Pk <path>`: `Filesystem 1024-blocks Used Available Capacity Mounted on`.
+ *
+ * The mount point is everything after the `Capacity` field (the one ending in
+ * `%`), joined back up, so a mount point containing spaces survives. The mount
+ * point matters because it is what `diskutil info` accepts; a subdirectory is
+ * not a disk.
+ */
+export function parseDfVolume(dfStdout: string): DfVolume | undefined {
+  const dataLine = dfStdout.trim().split("\n").at(-1);
+  if (dataLine === undefined) return undefined;
+  const fields = dataLine.trim().split(/\s+/);
+  const device = fields[0];
+  // A real data line starts with a filesystem (a `/dev/...` node, an NFS
+  // `host:/path`, or `map`/`devfs`); reject header text and junk so a failed
+  // `df` never resolves the volume to the word "Filesystem".
+  if (device === undefined || !device.includes("/")) return undefined;
+  const capacityIndex = fields.findIndex((field) => /^\d+%$/.test(field));
+  const mountPoint =
+    capacityIndex >= 0 ? fields.slice(capacityIndex + 1).join(" ") : fields.at(-1);
+  return {
+    device,
+    mountPoint: mountPoint !== undefined && mountPoint.length > 0 ? mountPoint : undefined,
+  };
+}
+
+/**
+ * Reads a volume's file system type from `mount(8)` output, e.g.
+ * `/dev/disk3s5 on /System/Volumes/Data (apfs, local, journaled, nobrowse)`.
+ *
+ * Used only as a labelled fallback when `diskutil` reports no personality. The
+ * target device/mount point comes from `df`, not from prefix-matching the
+ * literal path: on modern macOS `/Users` is a firmlink into
+ * `/System/Volumes/Data`, so a path-prefix match would wrongly pick the
+ * read-only System volume mounted at `/`.
+ */
+export function parseMountFsType(mountStdout: string, target: DfVolume): string | undefined {
+  for (const line of mountStdout.split("\n")) {
+    const match = line.match(/^(.+) on (.+) \(([^,)]+)/);
+    if (match === null) continue;
+    const source = match[1]?.trim();
+    const mountPoint = match[2]?.trim();
+    const fsType = match[3]?.trim();
+    const sourceMatches = target.device !== undefined && source === target.device;
+    const mountMatches = target.mountPoint !== undefined && mountPoint === target.mountPoint;
+    if ((sourceMatches || mountMatches) && fsType !== undefined && fsType.length > 0) {
+      return fsType;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Parses the data line of `df -Pk <path>`. On macOS this is `Filesystem
+ * 1024-blocks Used Available Capacity Mounted on`; on GNU/Linux `-P` forces
+ * the POSIX layout `Filesystem 1024-blocks Used Available Capacity Mounted on`
+ * as well (the `-k` makes the block column 1024-blocks). The first data field
+ * is the device, so `Used` is index 2 and `Available` index 3 on both. Returns
+ * used and available in KiB.
  */
 export function parseDfPk(dfStdout: string): { usedKb: number; availableKb: number } | undefined {
   const dataLine = dfStdout.trim().split("\n").at(-1);

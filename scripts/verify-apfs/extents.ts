@@ -12,12 +12,20 @@
  * under test (`src/platform-darwin-ffi.ts`), so this runs on the runner with no
  * native build step.
  *
- * Struct layout (`sys/fcntl.h`, XNU): `#pragma pack(4)` gives
- * `struct log2phys { u_int32_t l2p_flags; off_t l2p_contigbytes; off_t
- * l2p_devoffset; }` — 4 + 8 + 8 = 20 bytes, little-endian on Apple silicon and
- * Intel. `F_LOG2PHYS_EXT` is an in/out: `l2p_contigbytes` in = bytes to query
- * (out = contiguous bytes at the position), `l2p_devoffset` in = file offset
- * (out = device offset).
+ * Struct layout and constants (`bsd/sys/fcntl.h`, XNU `main`; verified):
+ * `#pragma pack(4)` gives `struct log2phys { unsigned int l2p_flags; off_t
+ * l2p_contigbytes; off_t l2p_devoffset; }` — 4 + 8 + 8 = 20 bytes,
+ * little-endian on Apple silicon and Intel. `#define F_LOG2PHYS_EXT 65`.
+ * `F_LOG2PHYS_EXT` is an in/out: `l2p_contigbytes` in = bytes to query (out =
+ * contiguous bytes at the position), `l2p_devoffset` in = file offset (out =
+ * device offset).
+ *
+ * NOT verified: that a modern APFS kernel accepts this fcntl for regular files
+ * (`F_LOG2PHYS` was historically HFS-oriented), and that `bun:ffi`'s
+ * `fcntl(fd, cmd, ptr)` binding matches libSystem's ABI. The first real CI run
+ * failed before this code was reached, so neither has been observed. A refusal
+ * falls back to the labelled `df`-delta method rather than crashing, and
+ * `physicalMappingAt` prints the reason loudly the first time it is refused.
  */
 import { dlopen, FFIType, read } from "bun:ffi";
 import { closeSync, openSync, statSync } from "node:fs";
@@ -76,6 +84,20 @@ export class ExtentReadError extends Error {
   }
 }
 
+let warnedOnce = false;
+
+/**
+ * Prints the raw kernel refusal the first time. The fallback to `df` is
+ * labelled in the report either way, but if `F_LOG2PHYS_EXT` is rejected on
+ * APFS the reason must be visible, not inferred from a sudden switch of
+ * measured method.
+ */
+function warnOnce(code: string): void {
+  if (warnedOnce) return;
+  warnedOnce = true;
+  console.error(`[extents] F_LOG2PHYS_EXT refused by the kernel: ${code}`);
+}
+
 export interface PhysicalMapping {
   readonly deviceOffset: bigint;
   readonly contiguousBytes: bigint;
@@ -98,9 +120,11 @@ export function physicalMappingAt(
 
   const result = fcns.fcntl(fd, F_LOG2PHYS_EXT, struct);
   if (result === -1) {
+    const code = darwinErrno(fcns);
+    warnOnce(code);
     throw new ExtentReadError(
       `F_LOG2PHYS_EXT failed at offset ${logicalOffset} (${queryBytes} B queried)`,
-      darwinErrno(fcns),
+      code,
     );
   }
 

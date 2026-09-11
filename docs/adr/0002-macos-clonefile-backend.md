@@ -84,10 +84,15 @@ clone with genuinely shared extents. That evidence is now produced by a CI job �
 `apfs-verification` in `.github/workflows/ci.yml` — which runs on a
 GitHub-hosted macOS runner:
 
-1. **The volume is asserted to be APFS** with `diskutil info` (macOS has no
-   `df -T`). No official GitHub document states the runner volume's filesystem,
-   so the job proves it at runtime before trusting anything else, and fails
-   loudly if it is not APFS.
+1. **The volume is asserted to be APFS** via `diskutil info` on the scratch
+   directory's **mount point** (macOS has no `df -T`). `diskutil info` accepts a
+   device node or a mount point, not an arbitrary subdirectory — passing the
+   scratch dir directly yields `Could not find disk`, which the job's first real
+   run proved. The mount point is resolved from `df -Pk`; the `mount(8)`
+   filesystem type is a labelled fallback if `diskutil` gives no personality. No
+   official GitHub document states the runner volume's filesystem, so the job
+   proves it at runtime before trusting anything else, and fails loudly if it is
+   not APFS.
 2. **The real backend runs**: `reflinkFile` → `cloneFile` → `copyfile(3)` with
    `COPYFILE_ALL | COPYFILE_CLONE_FORCE` through `bun:ffi`. Not an injected
    syscall — the actual Darwin code path.
@@ -113,7 +118,11 @@ GitHub-hosted macOS runner:
 
 The evidence — `diskutil` output, macOS version, `df`, the sampled block counts,
 the overlap ratio, and the mutation result — is printed to the job log and
-uploaded as the `apfs-verification-<runner>` artifact.
+uploaded as the `apfs-verification-<runner>` artifact. The report is written on
+**every** exit path (including a skip and an unexpected exception) to
+`${{ runner.temp }}`, and the upload runs with `always()` and
+`if-no-files-found: warn`, so a failing verification still leaves its evidence
+for review instead of failing the upload step too.
 
 **A green CI run does not close #7 by itself.** The acceptance bar is "CI emits
 measured shared-extent evidence for a real APFS clone, and a human approves that
@@ -131,11 +140,21 @@ bun run scripts/verify-apfs/verify-apfs.ts --report=/tmp/apfs.txt
 
 ### Caveats that genuinely remain
 
-- **Not yet executed on a Mac by the author of this document.** The job was
-  written and validated on Linux (typecheck + unit tests; the script skips
-  cleanly there). It has not been run on a macOS runner at the time of writing;
-  the first CI run is the first execution. If the runner volume is not APFS, the
-  job fails with that finding rather than pretending.
+- **First executed on a macOS runner on 2026-09-11, and it failed.** The failure
+  was in the APFS assertion, before the backend was reached: `diskutil info`
+  was handed the scratch *subdirectory*, which is not a disk, and returned
+  `Could not find disk: /Users/runner/work/_temp/cow-apfs-XXXX`; the uncaught
+  `execFileSync` throw then lost the evidence file entirely, so the
+  `upload-artifact` step reported "No files were found". Both the invocation
+  (now the `df`-resolved mount point) and the report guarantee (written on every
+  exit path) are fixed. Everything past the platform check still has not been
+  observed to work on a real runner.
+- **`F_LOG2PHYS_EXT` is assumed to be accepted by APFS.** The constant (65) and
+  the 20-byte `#pragma pack(4)` `struct log2phys` are confirmed against XNU
+  `bsd/sys/fcntl.h`, but `F_LOG2PHYS` was historically HFS-oriented and neither
+  kernel acceptance on APFS nor the `bun:ffi`/libSystem ABI has been observed. A
+  refusal falls back to the labelled `df`-delta method and prints the errno
+  loudly; it is not treated as success.
 - A green run attests to **that runner image's macOS version and one APFS
   volume**. It cannot attest to an arbitrary user's machine.
 - **Cross-volume clones are not covered** and correctly return `EXDEV`; the
