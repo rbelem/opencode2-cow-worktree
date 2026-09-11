@@ -18,6 +18,7 @@ declare module "@opencode-ai/plugin" {
     readonly worktree: WorktreeDomain;
     readonly tool: ToolDomain;
     readonly session: SessionDomain;
+    readonly options: Readonly<Record<string, unknown>>;
   }
 }
 

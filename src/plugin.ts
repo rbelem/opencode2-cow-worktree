@@ -1,5 +1,6 @@
 import type { Context } from "@opencode-ai/plugin";
 import { probeCowCapability } from "./capability";
+import { fallbackPolicy } from "./config";
 import { spawnWorkspace } from "./tool";
 import type { SpawnWorkspaceDeps, SpawnWorkspaceInput } from "./tool";
 import { cowStrategy } from "./strategy";
@@ -30,9 +31,9 @@ const spawnWorkspaceInput = {
  * the layer that owns the strategy choice, so the capability probe and the
  * worktree/session APIs meet here and nowhere else.
  *
- * The fallback policy is `"none"`: this plugin is fail-loud until the fallback
- * ticket wires configuration in. A request for `cow` is a statement about what
- * the caller gets, so the tool never silently produces a Shallow worktree.
+ * The fallback policy is read from the plugin's configured options and defaults
+ * to `"none"`: a request for `cow` is a statement about what the caller gets,
+ * so the tool never produces a Shallow worktree unless the opt-in was set.
  */
 function liveDeps(ctx: Context): SpawnWorkspaceDeps {
   return {
@@ -49,7 +50,7 @@ function liveDeps(ctx: Context): SpawnWorkspaceDeps {
     },
     removeWorktree: (directory) =>
       ctx.worktree.remove({ directory, force: true }),
-    fallback: "none",
+    fallback: fallbackPolicy(ctx.options),
   };
 }
 
