@@ -16,6 +16,8 @@ declare module "@opencode-ai/plugin" {
   interface Context {
     readonly location: LocationInfo;
     readonly worktree: WorktreeDomain;
+    readonly tool: ToolDomain;
+    readonly session: SessionDomain;
   }
 }
 
@@ -27,6 +29,50 @@ export interface LocationInfo {
     readonly directory: string;
     readonly canonical: string;
   };
+}
+
+/**
+ * A session handle as `createSession` needs it. Only the fields this plugin
+ * reads are typed; the v2 `SessionDomain` returns a much larger `Session.Info`.
+ * Keep this structural so the real API satisfies it without importing the v2
+ * client, which the installed package does not ship.
+ */
+export interface SessionInfo {
+  readonly id: string;
+}
+
+/** The slice of the v2 `SessionDomain` this plugin uses. */
+export interface SessionDomain {
+  readonly create: (input: {
+    readonly title?: string;
+    readonly location: { readonly directory: string };
+  }) => Promise<SessionInfo>;
+}
+
+/** The slice of the v2 `WorktreeApi` this plugin uses, folded into WorktreeDomain below. */
+
+/** A tool registered through the v2 `ToolEditor`. */
+export interface ToolInfo {
+  readonly name: string;
+  readonly description: string;
+  readonly input: unknown;
+  readonly execute: (input: any, context: unknown) => Promise<ToolResult>;
+}
+
+export interface ToolResult {
+  readonly output?: unknown;
+  readonly content?: string;
+  readonly metadata?: Readonly<Record<string, unknown>>;
+}
+
+export interface ToolEditor {
+  add(tool: ToolInfo): void;
+}
+
+export interface ToolDomain {
+  readonly transform: (
+    callback: (editor: ToolEditor) => void,
+  ) => Promise<{ dispose(): Promise<void> }>;
 }
 
 export interface WorktreeCreateInput {
@@ -71,6 +117,15 @@ export interface WorktreeEditor {
 }
 
 export interface WorktreeDomain {
+  readonly create: (input: {
+    readonly strategy?: string;
+    readonly name?: string;
+    readonly location?: { readonly directory?: string };
+  }) => Promise<WorktreeResult>;
+  readonly remove: (input: {
+    readonly directory: string;
+    readonly force: boolean;
+  }) => Promise<void>;
   readonly transform: (
     callback: (editor: WorktreeEditor) => void,
   ) => Promise<{ dispose(): Promise<void> }>;
