@@ -79,7 +79,13 @@ async function listTree(root: string, prefix = ""): Promise<string[]> {
   for (const entry of await readdir(root, { withFileTypes: true })) {
     const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
     const abs = join(root, entry.name);
-    const stats = await lstat(abs);
+    // Same race as `snapshot`: a transient `.git` lock file can vanish between
+    // the `readdir` and the `lstat`. Skip it rather than fail the walk.
+    const stats = await lstat(abs).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return undefined;
+      throw error;
+    });
+    if (stats === undefined) continue;
     out.push(stats.isSymbolicLink() ? `${rel}@` : stats.isDirectory() ? `${rel}/` : rel);
     if (stats.isDirectory()) out.push(...(await listTree(abs, rel)));
   }
@@ -92,7 +98,16 @@ async function snapshot(root: string, prefix = ""): Promise<Record<string, strin
   for (const entry of await readdir(root, { withFileTypes: true })) {
     const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
     const abs = join(root, entry.name);
-    const stats = await lstat(abs);
+    // git runs background maintenance in a freshly-initialized repo and briefly
+    // creates `.git/objects/maintenance.lock`. A file that appears or vanishes
+    // between the `readdir` and the `lstat` is not a modification of the tree,
+    // so an ENOENT here is skipped rather than thrown. Comparing two snapshots
+    // of the same tree still holds: a file present in both walks is compared.
+    const stats = await lstat(abs).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return undefined;
+      throw error;
+    });
+    if (stats === undefined) continue;
     out[rel] = `${stats.mode}:${stats.size}:${stats.mtimeMs}:${stats.ino}`;
     if (stats.isDirectory()) Object.assign(out, await snapshot(abs, rel));
   }
