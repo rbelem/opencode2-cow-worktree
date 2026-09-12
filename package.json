@@ -10,6 +10,8 @@
   },
   "files": [
     "src",
+    "tui.tsx",
+    "strategy-badge.ts",
     "README.md",
     "LICENSE"
   ],
