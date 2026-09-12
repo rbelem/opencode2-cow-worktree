@@ -58,6 +58,27 @@ for (const code of UNEXPECTED) {
   });
 }
 
+test("reports an error when the clone throws a plain Error without a code", async () => {
+  // The coded-error branch above classifies by `code`; this covers the other
+  // shape a filesystem failure can take — an Error with no `.code` at all,
+  // which must land in `error`, not `unsupported`.
+  const dir = await scratchDir();
+  try {
+    const plain = new Error("plain failure");
+    const attempt: CowCloneAttempt = async () => {
+      throw plain;
+    };
+    const result = await probeCowCapability(dir, attempt);
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.error).toBe(plain);
+    }
+    expect(await readdir(dir)).toEqual([]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("reports an error, without throwing, for a missing directory", async () => {
   const parent = await scratchDir();
   try {

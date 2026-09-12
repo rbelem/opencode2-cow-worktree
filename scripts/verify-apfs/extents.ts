@@ -130,7 +130,7 @@ function toBigInt(value: string, line: string): bigint {
   }
 }
 
-interface HelperFailure {
+export interface HelperFailure {
   readonly status: number | undefined;
   readonly signal: string | undefined;
   readonly sourceCode: string | undefined;
@@ -182,6 +182,19 @@ function helperFailureMessage(failure: HelperFailure): string {
 }
 
 /**
+ * Turns whatever `child_process` threw into the code/message pair the caller
+ * reports. Exported (and therefore pure) so every failure shape is testable
+ * without a Mac; the precedence and message shapes are the helper's contract.
+ */
+export function classifyHelperFailure(error: unknown): {
+  readonly code: string;
+  readonly message: string;
+} {
+  const failure = describeHelperFailure(error);
+  return { code: helperFailureCode(failure), message: helperFailureMessage(failure) };
+}
+
+/**
  * Runs `log2phys.py` against `path` and returns its parsed samples. Any child
  * failure — a missing `python3`, a non-Darwin platform, a kernel refusal, a
  * crashed helper — becomes an `ExtentReadError`, never a fault in this
@@ -199,8 +212,8 @@ function runHelper(
       maxBuffer: HELPER_MAX_BUFFER,
     });
   } catch (error) {
-    const failure = describeHelperFailure(error);
-    throw new ExtentReadError(helperFailureMessage(failure), helperFailureCode(failure));
+    const { code, message } = classifyHelperFailure(error);
+    throw new ExtentReadError(message, code);
   }
   return parseLog2Phys(stdout);
 }
@@ -237,8 +250,11 @@ export interface PhysicalBlockMap {
 }
 
 /** The allocation granularity to sample at; APFS uses 4096-byte blocks. */
-export function blockStride(path: string): number {
-  const { blksize } = statSync(path);
+export function blockStride(
+  path: string,
+  stat: (path: string) => { blksize: number } = statSync,
+): number {
+  const { blksize } = stat(path);
   return blksize > 0 ? blksize : DEFAULT_BLOCK_BYTES;
 }
 

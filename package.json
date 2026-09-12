@@ -15,6 +15,7 @@
   ],
   "scripts": {
     "test": "bun test",
+    "test:coverage": "bun test --coverage --coverage-reporter=lcov && bun scripts/check-coverage.ts",
     "typecheck": "tsc --noEmit"
   },
   "keywords": [

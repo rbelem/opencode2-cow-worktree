@@ -249,3 +249,16 @@ test("under df-delta, a block-sized growth after mutation passes", () => {
   });
   expect(result.ok).toBe(true);
 });
+
+test("F_LOG2PHYS_EXT without a measured overlap fails rather than passes", () => {
+  const result = evaluateExtentSharing({
+    method: "F_LOG2PHYS_EXT",
+    overlap: undefined,
+    cloneGrowthBytes: 0,
+    fileSizeBytes: 1,
+  });
+  expect(result).toEqual({
+    ok: false,
+    failures: ["F_LOG2PHYS_EXT was selected but no overlap was measured"],
+  });
+});

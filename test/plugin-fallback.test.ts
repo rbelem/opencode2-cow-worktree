@@ -49,7 +49,10 @@ interface Harness {
  * returns a directory keyed to it, and whose options carry the fallback policy.
  * This is the smallest surface the registered tool's live bindings touch.
  */
-async function harness(options: Record<string, unknown> | undefined): Promise<Harness> {
+async function harness(
+  options: Record<string, unknown> | undefined,
+  harnessOptions: { readonly sessionCreateError?: Error } = {},
+): Promise<Harness> {
   const recorded: Recorded = { strategies: [], removed: [], parents: [] };
   let registered: RegisteredTool | undefined;
 
@@ -79,7 +82,14 @@ async function harness(options: Record<string, unknown> | undefined): Promise<Ha
         return { dispose: async () => {} };
       },
     },
-    session: { create: async () => ({ id: "ses_live" }) },
+    session: {
+      create: async () => {
+        if (harnessOptions.sessionCreateError !== undefined) {
+          throw harnessOptions.sessionCreateError;
+        }
+        return { id: "ses_live" };
+      },
+    },
   } as unknown as Parameters<typeof plugin.setup>[0];
 
   await plugin.setup(ctx);
@@ -166,5 +176,34 @@ test.skipIf(cowRoot === undefined)(
 
     await expect(tool.execute({ sourceDirectory: dir })).rejects.toThrow(/targetRoot/);
     expect(recorded.strategies).toEqual([]);
+  },
+);
+
+test.skipIf(nonCowRoot === undefined)(
+  "a session start failure removes the created worktree and preserves the original cause",
+  async () => {
+    // The cleanup runs through opencode2's DELETE route, which is best-effort.
+    // The failure must survive as the original Error (identity), not be replaced
+    // by whatever the cleanup did, and the binding must be exercised with the
+    // directory the create actually returned.
+    const dir = await scratchDir(nonCowRoot!);
+    const sentinel = new Error("session sentinel");
+    const { tool, recorded } = await harness(
+      { fallback: "git" },
+      { sessionCreateError: sentinel },
+    );
+
+    let rejection: unknown;
+    try {
+      await tool.execute({ sourceDirectory: dir });
+    } catch (error) {
+      rejection = error;
+    }
+    expect(rejection).toBeInstanceOf(Error);
+    const error = rejection as Error;
+
+    expect(error.message).toMatch(/session start failed in \/worktrees\/git-worktree/);
+    expect(error.cause).toBe(sentinel);
+    expect(recorded.removed).toEqual(["/worktrees/git-worktree"]);
   },
 );

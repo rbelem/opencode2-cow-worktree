@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { lstat, link, mkdir, mkdtemp, readFile, readdir, readlink, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cloneDirectory, reflinkFile } from "../src/clone";
 import { findCowRoot, findNonCowRoot, hasGit } from "./fs-roots";
@@ -313,6 +314,18 @@ test.skipIf(cowRoot === undefined || !gitOnPath)("clones into a subdirectory of 
   const sibling = join(repo, "..", "sibling-clone");
   await cloneDirectory(repo, sibling);
   expect(await readFile(join(sibling, "tracked.txt"), "utf8")).toBe("tracked contents\n");
+});
+
+test("rejects cloning a directory into itself", async () => {
+  // The guard throws before any I/O — no CoW filesystem and no git are needed,
+  // so this never skips. The directory only gives `resolve` a real absolute
+  // path; it is removed by the same `afterEach` as every other scratch dir.
+  const dir = await mkdtemp(join(tmpdir(), "cow-self-"));
+  scratchDirs.push(dir);
+
+  const error = await captureError(cloneDirectory(dir, dir));
+  expect(error).toBeDefined();
+  expect((error as Error).message).toMatch(/cannot clone .* into itself/);
 });
 
 test.skipIf(cowRoot === undefined || !gitOnPath)("rejects a target that contains the source", async () => {

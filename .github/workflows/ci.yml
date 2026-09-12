@@ -54,8 +54,12 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
-      - name: Unit tests
-        run: bun test
+      # `bun test` plus the coverage gate in scripts/check-coverage.ts: every
+      # gated module must be loaded by a test and fully covered. The gate fails
+      # on a module no test imports, which is how `src/index.ts` and `tui.tsx`
+      # sat at zero without any run noticing.
+      - name: Unit tests with coverage gate
+        run: bun run test:coverage
 
   # ---------------------------------------------------------------------------
   # macOS — EARLY WARNING ONLY. THIS IS NOT THE ACCEPTANCE CRITERION FOR #7.

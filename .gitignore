@@ -6,3 +6,6 @@ apfs-verification.txt
 
 # CPython bytecode cache from the log2phys.py extents helper
 __pycache__/
+
+# Coverage reports from `bun run test:coverage`
+coverage/

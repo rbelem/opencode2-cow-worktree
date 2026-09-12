@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { probeCowCapability } from "../src/capability";
 import type { CowCapability } from "../src/capability";
 import type { Mechanism } from "../src/mechanism";
-import { deviceOf, spawnWorkspace } from "../src/tool";
+import { deviceOf, nearestExistingDevice, spawnWorkspace } from "../src/tool";
 import type { SpawnWorkspaceDeps } from "../src/tool";
 import plugin from "../src/plugin";
 import { findCowRoot, findNonCowRoot } from "./fs-roots";
@@ -335,6 +335,25 @@ test.skipIf(cowRoot === undefined)("plugin setup registers the spawn_workspace t
   expect(result.output.mechanism).toBe("cow");
   expect(result.output.directory).toBe("/worktrees/cow-clone");
   expect(result.output.sessionID).toBe("ses_live");
+});
+
+test("nearestExistingDevice terminates at the root: its parent is itself", async () => {
+  // The walk climbs to `/`, whose parent is itself, so a probe that never
+  // reports a device returns undefined rather than looping forever.
+  expect(await nearestExistingDevice("/", async () => undefined)).toBeUndefined();
+});
+
+test("nearestExistingDevice climbs past unreadable ancestors to the first device", async () => {
+  // The leaf and its parent are unreadable; `/` answers. This drives the loop
+  // back edge, so the walk is known to climb rather than only terminate.
+  const probed: string[] = [];
+  const device = await nearestExistingDevice("/missing/leaf", async (path) => {
+    probed.push(path);
+    return path === "/" ? 42 : undefined;
+  });
+
+  expect(device).toBe(42);
+  expect(probed).toEqual(["/missing/leaf", "/missing", "/"]);
 });
 
 // Two registration defects the e2e simulation found (#9). Both are invisible to

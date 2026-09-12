@@ -2,8 +2,8 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { cloneFileOnDarwin, COPYFILE_ALL, COPYFILE_CLONE_FORCE, COPYFILE_EXCL, DARWIN_CLONE_FLAGS } from "../src/platform-darwin";
-import type { CloneOutcome, DarwinCloneSyscall } from "../src/platform-darwin";
+import { COPYFILE_ALL, COPYFILE_CLONE_FORCE, COPYFILE_EXCL, DARWIN_CLONE_FLAGS, cloneFileOnDarwin, darwinSyscall } from "../src/platform-darwin";
+import type { CloneOutcome, DarwinCloneSyscall, DarwinFfi } from "../src/platform-darwin";
 
 // These tests exercise the macOS backend's *logic* with an injected fake
 // syscall. No test here runs Darwin code natively, and none proves the real
@@ -71,6 +71,37 @@ test("passes the source and destination to the syscall and resolves on a clone",
   const { syscall, calls } = fakeSyscall();
   await cloneFileOnDarwin("/repo/a.txt", "/clone/a.txt", syscall);
   expect(calls).toEqual([["/repo/a.txt", "/clone/a.txt"]]);
+});
+
+// --- the native wiring: composing the binding into the default syscall ----
+//
+// `cloneFileOnDarwin`'s default argument is the one production path with no
+// syscall injected into it. It is unreachable on Linux (libSystem does not
+// exist), so the composition itself is asserted here through the injected
+// module surface, and the fail-closed property of using the default is asserted
+// in `platform.test.ts` by forcing the Darwin branch on Linux.
+
+test("darwinSyscall composes load then create over the injected binding", async () => {
+  const composed: string[] = [];
+  const loadedSymbols = {} as ReturnType<DarwinFfi["loadCopyfileLibrary"]>;
+  const syscall: DarwinCloneSyscall = async () => ({ cloned: true });
+  const ffi: DarwinFfi = {
+    loadCopyfileLibrary: () => {
+      composed.push("load");
+      return loadedSymbols;
+    },
+    createDarwinSyscall: (symbols) => {
+      composed.push("create");
+      // The syscall must be built over exactly what the loader returned.
+      expect(symbols).toBe(loadedSymbols);
+      return syscall;
+    },
+  };
+
+  const built = await darwinSyscall(async () => ffi);
+
+  expect(built).toBe(syscall);
+  expect(composed).toEqual(["load", "create"]);
 });
 
 // --- fail-closed: a silent fallback is rejected ---------------------------

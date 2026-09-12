@@ -1,4 +1,3 @@
-import { type Dirent } from "node:fs";
 import {
   lstat,
   mkdir,
@@ -7,6 +6,7 @@ import {
   symlink,
 } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { entryKind } from "./entry-kind";
 import { cloneFile } from "./platform";
 
 /**
@@ -63,7 +63,7 @@ async function cloneInto(source: string, target: string, skip: string): Promise<
     // target's ancestors and their other children — is copied normally.
     if (from === skip) continue;
     const to = join(target, entry.name);
-    const kind = await kindOf(entry, from);
+    const kind = await entryKind(entry, () => lstat(from));
     if (kind === "directory") {
       await mkdir(to);
       await cloneInto(from, to, skip);
@@ -84,18 +84,4 @@ async function cloneInto(source: string, target: string, skip: string): Promise<
 function isInside(child: string, parent: string): boolean {
   const rel = relative(parent, child);
   return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
-}
-
-type EntryKind = "file" | "directory" | "symlink";
-
-async function kindOf(entry: Dirent, path: string): Promise<EntryKind> {
-  if (entry.isSymbolicLink()) return "symlink";
-  if (entry.isDirectory()) return "directory";
-  if (entry.isFile()) return "file";
-  // Filesystems that do not report a type from readdir report UNKNOWN; lstat
-  // is the authoritative fallback and never follows symlinks.
-  const stats = await lstat(path);
-  if (stats.isSymbolicLink()) return "symlink";
-  if (stats.isDirectory()) return "directory";
-  return "file";
 }

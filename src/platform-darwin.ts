@@ -37,7 +37,9 @@ export const COPYFILE_CLONE_FORCE = 1 << 25;
 export const COPYFILE_EXCL = 1 << 17;
 export const DARWIN_CLONE_FLAGS = COPYFILE_ALL | COPYFILE_CLONE_FORCE;
 
-/** True when the clone genuinely shared extents with the source. */
+/**
+ * True when the clone genuinely shared extents with the source.
+ */
 export type CloneOutcome = { readonly cloned: boolean };
 
 /** A `copyfile(3)` clone of one regular file. Throws the raw failure. */
@@ -47,6 +49,30 @@ export type DarwinCloneSyscall = (
 ) => Promise<CloneOutcome>;
 
 /**
+ * The lazily-loaded binding: `loadCopyfileLibrary` and `createDarwinSyscall`
+ * from `platform-darwin-ffi.ts`, whose imports are inert so that merely
+ * referencing them costs nothing on Linux.
+ */
+export type DarwinFfi = {
+  readonly loadCopyfileLibrary: (typeof import("./platform-darwin-ffi"))["loadCopyfileLibrary"];
+  readonly createDarwinSyscall: (typeof import("./platform-darwin-ffi"))["createDarwinSyscall"];
+};
+
+/**
+ * Composes the binding into a syscall: load libSystem, then build the call over
+ * it. Exported and injectable for the same reason the syscall itself is — it is
+ * the wiring `cloneFileOnDarwin` falls back to, and it must be provable without
+ * a Mac. The default performs the lazy import, so the macOS-only module is
+ * pulled in only when a Darwin process actually selects this backend.
+ */
+export async function darwinSyscall(
+  loadFfi: () => Promise<DarwinFfi> = () => import("./platform-darwin-ffi"),
+): Promise<DarwinCloneSyscall> {
+  const ffi = await loadFfi();
+  return ffi.createDarwinSyscall(ffi.loadCopyfileLibrary());
+}
+
+/**
  * Clones one regular file, or throws.
  *
  * Fail closed: when the syscall reports success without a real clone, the
@@ -54,34 +80,22 @@ export type DarwinCloneSyscall = (
  * a full copy is the exact failure this backend exists to prevent, so it is
  * never returned as success.
  *
- * The default syscall is a native `copyfile(3)` call, loaded lazily so that
- * this module is inert on Linux; tests inject their own.
+ * The binding is resolved only inside this default, so importing this module is
+ * inert on Linux; both tests and the platform seam injection point supply their
+ * own syscall instead.
  */
 export async function cloneFileOnDarwin(
   source: string,
   destination: string,
-  attempt: DarwinCloneSyscall = cloneOnDarwinNative,
+  attempt: DarwinCloneSyscall | undefined = undefined,
 ): Promise<void> {
-  const outcome = await attempt(source, destination);
+  const syscall = attempt ?? (await darwinSyscall());
+  const outcome = await syscall(source, destination);
   if (outcome.cloned) return;
   await rm(destination);
   throw new Error(
     `copyfile(3) did not clone ${source} onto ${destination}; refusing a full copy`,
   );
-}
-
-async function cloneOnDarwinNative(
-  source: string,
-  destination: string,
-): Promise<CloneOutcome> {
-  // A dynamic import, not `require`: this module is ESM (`"type": "module"`),
-  // and the real binding must be pulled in only when a Darwin process actually
-  // selects this backend — importing it on Linux would `dlopen` a macOS-only
-  // library.
-  const module = (await import("./platform-darwin-ffi")) as {
-    darwinSyscall: DarwinCloneSyscall;
-  };
-  return module.darwinSyscall(source, destination);
 }
 
 async function rm(path: string): Promise<void> {
