@@ -23,6 +23,7 @@ import {
   assertInventory,
   fanOut,
   proveIndependence,
+  removeWorktreeMissingDirectory,
   removeWorktrees,
   runFallbackScenarios,
   runNonCowServer,
@@ -60,6 +61,8 @@ async function main(): Promise<number> {
     await assertInventory(assertions, server, runs);
     const fallback = await runFallbackScenarios(server, config, assertions);
     await removeWorktrees(assertions, server, runs);
+    // Recreates one worktree to reproduce issue #12 and prove nobody is stuck.
+    await removeWorktreeMissingDirectory(assertions, server, runs);
 
     // §6 fallback on a real non-CoW filesystem. `POST /api/worktree` invokes
     // the strategy directly, so the fallback tool is not reached here; this

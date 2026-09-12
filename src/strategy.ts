@@ -52,6 +52,17 @@ export const cowStrategy: WorktreeDefinition = {
   },
 
   async remove(input) {
+    // `input.force` is opencode2's two-phase confirm protocol, not `rm`'s
+    // "ignore a missing path" flag. The built-in git strategy maps it to
+    // `git worktree remove --force` and raises `forceRequired` when git refuses
+    // because of uncommitted work; the TUI turns that into a confirmation and
+    // retries with `force: true`. Passing it through keeps that seam available.
+    //
+    // Consequence worth knowing: `node:fs` `rm` has no equivalent refusal, so
+    // this strategy currently deletes a dirty worktree at `force: false` where
+    // git would have stopped. That is a bug in its own right (issue #13), and
+    // the fix belongs here rather than in an unconditional `force: true`, which
+    // would delete the protocol instead of implementing it.
     await rm(input.directory, { recursive: true, force: input.force });
   },
 

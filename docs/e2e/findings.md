@@ -294,3 +294,57 @@ in the terminal runtime, and the published app type is a name/version/channel
 record. Documented plugin UI is CLI-only. Naming the Strategy in the desktop
 app therefore means patching opencode2 itself or building a separate client on
 the same protocol; it is not reachable from a plugin.
+
+## 15. The desktop app *cannot select the default Strategy*, and a missing
+worktree directory is not a stuck row
+
+Two ways a registered default fails to apply, found while clearing up after the
+badge work. Both are upstream, not plugin-reachable. Issues #12 and #14.
+
+**The desktop app hardcodes its Strategy.** `packages/app/src/workspaces/create.ts:14`
+sends `strategy: "git"` as a literal, so `input.strategy ?? current.selected`
+(`core/src/worktree.ts:236`) never falls through to the selected default. Both
+desktop flows route through that one helper. The TUI omits `strategy` at both
+call sites and therefore does reach `cow`. Registering a definition with id
+`"git"` would hijack the built-in for the Location and mis-route removals of the
+project checkout (discovery records `strategy:"git"` for that path), so it is
+not a workaround worth taking.
+
+**`DELETE /api/worktree` refuses a directory that is already gone, but the row
+is not stuck.** `Worktree.remove` runs `Le` — resolve, then `isDir` — *before* it
+reads the recorded strategy:
+
+```js
+var Le = e.fnUntraced(function*(H,t){
+  let L = DH.make(yield*H.resolve(t));
+  if(!(yield*H.isDir(L))) return yield*new pL({directory:t});
+  return L;
+});
+```
+
+so a missing directory raises `DirectoryUnavailableError` and the strategy's
+`remove` is never reached. Two notes correct an earlier reading of this:
+
+- `resolve` does *not* raise on a missing path; it swallows `NotFound` and
+  returns the literal path. The `isDir` on the next line is the gate.
+- The built-in `git` strategy fails identically (`repo.discover` on a missing
+  directory), so this is not specific to `cow`. v1 returned success for exactly
+  this case (`packages/opencode/src/worktree/index.ts:407-414`), so v2 is a
+  regression.
+
+The row is not stranded: `Worktree.list` calls `refresh()`, which deletes every
+row whose directory fails `isDir`. So `GET /api/worktree` (or
+`POST /api/worktree/refresh`) is a supported recovery, and `mkdir -p <dir>` then
+re-DELETE also works. `removeWorktreeMissingDirectory` in
+`scripts/e2e/scenarios.ts` pins the prune rather than a successful DELETE.
+
+## 16. `cow`'s `remove` forwards opencode2's `force` into `rm`'s `force`
+
+They mean different things. `node:fs` `rm`'s `force` is "ignore a nonexistent
+path"; opencode2's `force` is "proceed despite uncommitted changes" — the git
+strategy maps it to `--force` and raises `forceRequired` when git refuses,
+which the TUI turns into a confirmation and retries at `force: true`.
+Forwarding it means a dirty worktree is **deleted** at `force: false` where git
+would have stopped, and `cow` can never raise `forceRequired` because `rm` never
+refuses. Issue #13. The near-miss to avoid: hardcoding `force: true` there would
+delete the protocol seam rather than implement it.

@@ -12,6 +12,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { cowStrategy } from "../src/strategy";
 import plugin from "../src/plugin";
 import { findCowRoot, findNonCowRoot, hasGit } from "./fs-roots";
@@ -152,6 +153,30 @@ test.skipIf(cowRoot === undefined || !gitOnPath)("removing a worktree through th
   await cowStrategy.remove({ directory: target, force: true }, { signal });
 
   await expect(lstat(target)).rejects.toThrow();
+});
+
+// Not gated on a CoW filesystem: `remove` never reflinks, so this runs in CI
+// where no CoW root exists. It is the strategy-level half of issue #12 — the
+// `DELETE /api/worktree` half lives in `scripts/e2e/scenarios.ts`, because the
+// server refuses before it reaches this code.
+test("remove is idempotent: a missing directory is not an error at force", async () => {
+  const signal = new AbortController().signal;
+  const gone = join(tmpdir(), `cow-remove-gone-${randomBytes(8).toString("hex")}`);
+
+  await expect(cowStrategy.remove({ directory: gone, force: true }, { signal })).resolves.toBeUndefined();
+});
+
+test("remove still fails loudly on a real error, not just a missing path", async () => {
+  const signal = new AbortController().signal;
+  // A file where a path component is expected is corruption, not absence, and
+  // must not be swallowed along with ENOENT.
+  const parent = await mkdtemp(join(tmpdir(), "cow-remove-enotdir-"));
+  scratchDirs.push(parent);
+  await writeFile(join(parent, "a-file"), "not a directory\n");
+
+  await expect(
+    cowStrategy.remove({ directory: join(parent, "a-file", "child"), force: true }, { signal }),
+  ).rejects.toThrow();
 });
 
 test("list returns no entries, leaving inventory to opencode2", async () => {

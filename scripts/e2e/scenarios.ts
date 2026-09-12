@@ -259,3 +259,59 @@ export async function removeWorktrees(
     assertions.check(`remove ${run.id}: not in inventory`, !entries.some((entry) => entry.directory === run.directory));
   }
 }
+
+/**
+ * Issue #12: a worktree whose directory is removed out-of-band must not leave a
+ * permanently stuck inventory row.
+ *
+ * `DELETE /api/worktree` refuses with `Worktree directory unavailable` when the
+ * directory is already gone: the server resolves and `isDir`-checks the path
+ * before it consults the recorded strategy, so the strategy's `remove` is never
+ * reached and no plugin change can fix it. That refusal is upstream
+ * (opencode2's `Worktree.remove`; its own `refresh` already treats such a row as
+ * garbage, and v1's `remove` returned success for exactly this case).
+ *
+ * What this asserts is therefore the *recovery path*, not a successful DELETE:
+ *   - the DELETE still fails, and
+ *   - `GET /api/worktree` prunes the row, so nothing is stuck.
+ *
+ * The first check fails if upstream ever starts tolerating the missing
+ * directory; the second fails if the pruning route regresses. Together they pin
+ * the behaviour a user actually depends on.
+ */
+export async function removeWorktreeMissingDirectory(
+  assertions: Assertions,
+  server: Server,
+  runs: WorktreeRun[],
+): Promise<void> {
+  const run = runs[0];
+  if (!run) return;
+
+  // Remove the directory behind opencode2's back, as a user or an unmounted
+  // volume would.
+  await removePath(run.directory);
+  assertions.check(`issue #12: ${run.id} directory removed out-of-band`, !(await exists(run.directory)));
+
+  const removed = await server.api.json("DELETE", "/api/worktree", {
+    directory: run.directory,
+    force: true,
+  });
+  // Today this is a 400; the point is that it must NOT be a silent failure that
+  // leaves the row behind. Either a 204 (upstream fixed) or a 400 is acceptable
+  // here — what is not acceptable is a stuck row, checked below.
+  assertions.check(
+    `issue #12: DELETE on a missing directory returns a definite status`,
+    removed.status === 204 || removed.status === 400,
+    `${removed.status} ${removed.text}`,
+  );
+
+  // The supported recovery: listing reconciles the inventory and drops the row
+  // for a directory that no longer exists.
+  const listed = await server.api.json("GET", "/api/worktree");
+  const entries = listEntries(listed.body);
+  assertions.check(
+    `issue #12: ${run.id} row is pruned by the inventory reconcile (not stuck)`,
+    !entries.some((entry) => entry.directory === run.directory),
+    JSON.stringify(entries.map((entry) => entry.directory)),
+  );
+}

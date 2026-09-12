@@ -110,7 +110,16 @@ export async function spawnWorkspace(
     const sessionID = await deps.createSession(worktree.directory, input.name);
     return { sessionID, directory: worktree.directory, mechanism };
   } catch (cause) {
-    await deps.removeWorktree(worktree.directory);
+    // The cleanup is best-effort: it must never replace the failure that
+    // triggered it. `removeWorktree` goes through opencode2's DELETE route,
+    // which refuses once the directory is already gone, so a successful
+    // session-create failure would otherwise surface as a confusing
+    // "directory unavailable" instead of the original cause.
+    try {
+      await deps.removeWorktree(worktree.directory);
+    } catch {
+      // Leave the tree for the caller to inspect; the real error follows.
+    }
     throw new Error(`session start failed in ${worktree.directory}`, { cause });
   }
 }
