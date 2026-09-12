@@ -306,9 +306,10 @@ sends `strategy: "git"` as a literal, so `input.strategy ?? current.selected`
 (`core/src/worktree.ts:236`) never falls through to the selected default. Both
 desktop flows route through that one helper. The TUI omits `strategy` at both
 call sites and therefore does reach `cow`. Registering a definition with id
-`"git"` would hijack the built-in for the Location and mis-route removals of the
-project checkout (discovery records `strategy:"git"` for that path), so it is
-not a workaround worth taking.
+`"git"` would hijack the built-in for the Location and mis-route removals
+(discovery stamps `strategy:"git"` on every non-root git worktree, while the
+checkout root is recorded with no strategy), so it is not a workaround worth
+taking.
 
 **`DELETE /api/worktree` refuses a directory that is already gone, but the row
 is not stuck.** `Worktree.remove` runs `Le` — resolve, then `isDir` — *before* it
