@@ -9,7 +9,9 @@
     "noUncheckedIndexedAccess": true,
     "noEmit": true,
     "skipLibCheck": true,
-    "verbatimModuleSyntax": true
+    "verbatimModuleSyntax": true,
+    "jsx": "preserve",
+    "jsxImportSource": "@opentui/solid"
   },
-  "include": ["src", "test", "types", "scripts"]
+  "include": ["src", "test", "types", "scripts", "strategy-badge.ts", "tui.tsx"]
 }

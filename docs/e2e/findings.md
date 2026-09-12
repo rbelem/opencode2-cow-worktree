@@ -259,3 +259,38 @@ skipping the resolved target subtree during the walk; a target that *contains*
 the source is now rejected before anything is created. This is the natural
 configuration (finding 12), not an edge case, and it was only reachable by
 running the plugin against a real config with a real relative target.
+
+## 14. The terminal UI renders no Strategy name, but a plugin can add one
+
+No stock surface names the Strategy. The CLI's worktree dialog reads `strategy`
+only to sort entries and to pick a fallback (it never displays it), and the two
+TUI worktree dialogs resolve a target through `POST /api/worktree` without
+naming the mechanism that produced it. The `.git` shape is the only
+out-of-band tell: a `.git` **directory** means the `cow` clone, a `.git`
+**file** with a `gitdir:` pointer means a git worktree.
+
+That is a UI gap, not a protocol gap: `GET /api/worktree` already returns the
+Strategy per entry. The protocol's list schema is
+`Worktree.Directory = { directory, strategy? }`
+(`packages/schema/src/worktree.ts:34-37`), so the data a badge needs is already
+on the wire. The two `worktree.*` events are not usable for this:
+`worktree.ready` carries only `name` and an optional `branch`, and
+`worktree.failed` only a `message` — neither carries the Strategy.
+
+The CLI is extensible through a documented plugin runtime, so the badge belongs
+in a plugin rather than a fork. `@opencode/plugin/tui` accepts a
+`Plugin.define({ id, setup })` module, and `Host.resolve` looks for a bare `tui`
+entrypoint beside the server one (`packages/plugin/src/host.ts:43`). `setup`
+receives `context.client` (the same generated client), and version-control data
+is already exposed through `context.data.location.vcs`. Slots include `app`,
+`home.footer`, `prompt.footer`, `prompt.footer.status`, `prompt.footer.file`,
+`session.composer.top`, `session.panel`, `sidebar.content`, and
+`sidebar.footer` (`packages/plugin/src/tui/context.ts:191-201`), each with
+`prepend`/`append`/`before`/`after`/`replace` placement.
+
+The **desktop and web app have no equivalent seam**. Nothing under
+`packages/app` or `packages/desktop` registers UI slots, `ui.slot` exists only
+in the terminal runtime, and the published app type is a name/version/channel
+record. Documented plugin UI is CLI-only. Naming the Strategy in the desktop
+app therefore means patching opencode2 itself or building a separate client on
+the same protocol; it is not reachable from a plugin.
