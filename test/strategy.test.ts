@@ -13,7 +13,8 @@ import {
 } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { cowStrategy } from "../src/strategy";
+import { cowStrategy, probeUncommitted } from "../src/strategy";
+import * as strategyModule from "../src/strategy";
 import plugin from "../src/plugin";
 import { findCowRoot, findNonCowRoot, hasGit } from "./fs-roots";
 
@@ -178,6 +179,172 @@ test("remove still fails loudly on a real error, not just a missing path", async
     cowStrategy.remove({ directory: join(parent, "a-file", "child"), force: true }, { signal }),
   ).rejects.toThrow();
 });
+
+// --- the uncommitted-work guard (issue #13) ---
+//
+// `remove` at `force: false` must refuse a worktree whose git status is not
+// positively clean, and must do so before touching the filesystem. The
+// injected `probeUncommitted` seam keeps each branch deterministic: a real
+// git repository for the two end-to-end survival cases, and a stub for the
+// branches a real repository cannot produce (unknown, probe failure).
+
+/** A directory holding one real file; returns the file path for survival checks. */
+async function makePlainDir(prefix: string): Promise<{ dir: string; file: string }> {
+  const dir = await mkdtemp(join(tmpdir(), prefix));
+  scratchDirs.push(dir);
+  const file = join(dir, "precious.txt");
+  await writeFile(file, "uncommitted work\n");
+  return { dir, file };
+}
+
+test("remove at force: false deletes a clean worktree", async () => {
+  // The probe must positively report "clean" to allow a delete, so this uses a
+  // real repository with no changes, not a directory without git metadata
+  // (which is unknown and deliberately refuses).
+  test.skipIf(!gitOnPath);
+  const signal = new AbortController().signal;
+  const dir = await mkdtemp(join(tmpdir(), "cow-remove-clean-"));
+  scratchDirs.push(dir);
+  git(dir, "init", "-q");
+  git(dir, "config", "user.email", "test@example.com");
+  git(dir, "config", "user.name", "Test");
+  await writeFile(join(dir, "tracked.txt"), "committed\n");
+  git(dir, "add", "-A");
+  git(dir, "commit", "-qm", "scratch");
+
+  expect(await probeUncommitted(dir)).toEqual([]);
+  await expect(
+    cowStrategy.remove({ directory: dir, force: false }, { signal }),
+  ).resolves.toBeUndefined();
+  await expect(lstat(dir)).rejects.toThrow();
+});
+
+test("remove at force: true deletes without probing", async () => {
+  const signal = new AbortController().signal;
+  const { dir } = await makePlainDir("cow-remove-forced-");
+  let probed = 0;
+  const spy = spyOn(strategyModule, "probeUncommitted").mockImplementation(async () => {
+    probed += 1;
+    return ["precious.txt"];
+  });
+  try {
+    // The force is authorization, not a request to ask again: even a probe
+    // that would answer "dirty" must not run, and the delete must succeed.
+    await expect(
+      cowStrategy.remove({ directory: dir, force: true }, { signal }),
+    ).resolves.toBeUndefined();
+    expect(probed).toBe(0);
+    await expect(lstat(dir)).rejects.toThrow();
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+test("remove at force: false refuses a dirty worktree and every file survives", async () => {
+  const signal = new AbortController().signal;
+  const { dir, file } = await makePlainDir("cow-remove-dirty-");
+  const spy = spyOn(strategyModule, "probeUncommitted").mockImplementation(async () => [
+    "precious.txt",
+    "src/app.ts",
+  ]);
+  try {
+    const error = await cowStrategy
+      .remove({ directory: dir, force: false }, { signal })
+      .then(() => undefined, (failure: unknown) => failure as Error);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error?.message).toBe(
+      `cow refuses to remove ${dir} without force: ` +
+        "2 uncommitted change(s) (e.g. precious.txt, src/app.ts). " +
+        "Re-run with force to delete them.",
+    );
+    // The whole point: nothing was touched. The directory and its file are
+    // still there, byte for byte.
+    expect(await readFile(file, "utf8")).toBe("uncommitted work\n");
+    expect((await lstat(dir)).isDirectory()).toBe(true);
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+test("remove at force: false refuses when the probe cannot answer", async () => {
+  const signal = new AbortController().signal;
+  const { dir, file } = await makePlainDir("cow-remove-unknown-");
+  const spy = spyOn(strategyModule, "probeUncommitted").mockImplementation(
+    async () => undefined,
+  );
+  try {
+    const error = await cowStrategy
+      .remove({ directory: dir, force: false }, { signal })
+      .then(() => undefined, (failure: unknown) => failure as Error);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error?.message).toContain(`cow refuses to remove ${dir} without force:`);
+    expect(error?.message).toContain("could not be determined");
+    expect(await readFile(file, "utf8")).toBe("uncommitted work\n");
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+test("remove at force: false refuses a directory with no git metadata", async () => {
+  // Not a stub: the real probe must report unknown for a plain directory, and
+  // that unknown must refuse rather than delete.
+  const signal = new AbortController().signal;
+  const { dir, file } = await makePlainDir("cow-remove-nogit-");
+  expect(await probeUncommitted(dir)).toBeUndefined();
+
+  const error = await cowStrategy
+    .remove({ directory: dir, force: false }, { signal })
+    .then(() => undefined, (failure: unknown) => failure as Error);
+
+  expect(error).toBeInstanceOf(Error);
+  expect(await readFile(file, "utf8")).toBe("uncommitted work\n");
+});
+
+test("remove at force: false refuses when git itself fails", async () => {
+  // `.git` exists but is not a git directory, so `git -C … status` exits
+  // non-zero. That is a failed probe — unknown — and must refuse, not delete.
+  test.skipIf(!gitOnPath);
+  const signal = new AbortController().signal;
+  const { dir, file } = await makePlainDir("cow-remove-badgit-");
+  await writeFile(join(dir, ".git"), "not a git directory\n");
+  expect(await probeUncommitted(dir)).toBeUndefined();
+
+  const error = await cowStrategy
+    .remove({ directory: dir, force: false }, { signal })
+    .then(() => undefined, (failure: unknown) => failure as Error);
+
+  expect(error).toBeInstanceOf(Error);
+  expect(error?.message).toContain("could not be determined");
+  expect(await readFile(file, "utf8")).toBe("uncommitted work\n");
+});
+
+test("remove at force: true deletes a real dirty worktree", async () => {
+  // End to end through the real probe: a real git worktree with a modified
+  // tracked file is refused at force: false and deleted at force: true.
+  test.skipIf(!gitOnPath);
+  const signal = new AbortController().signal;
+  const dir = await mkdtemp(join(tmpdir(), "cow-remove-real-dirty-"));
+  scratchDirs.push(dir);
+  git(dir, "init", "-q");
+  git(dir, "config", "user.email", "test@example.com");
+  git(dir, "config", "user.name", "Test");
+  await writeFile(join(dir, "tracked.txt"), "committed\n");
+  git(dir, "add", "-A");
+  git(dir, "commit", "-qm", "scratch");
+  await writeFile(join(dir, "tracked.txt"), "uncommitted\n");
+
+  expect(await probeUncommitted(dir)).toEqual(["tracked.txt"]);
+  await expect(
+    cowStrategy.remove({ directory: dir, force: false }, { signal }),
+  ).rejects.toThrow(/cow refuses to remove/);
+  expect(await readFile(join(dir, "tracked.txt"), "utf8")).toBe("uncommitted\n");
+
+  await cowStrategy.remove({ directory: dir, force: true }, { signal });
+  await expect(lstat(dir)).rejects.toThrow();
+});
+
 
 test("list returns no entries, leaving inventory to opencode2", async () => {
   const signal = new AbortController().signal;
