@@ -30,7 +30,7 @@ one-line skip onto the new create shape).
 
 **Status:** ready-for-agent
 
-- [ ] `OccupiedTargetError` exported from `clone.ts`; refusal throws it
-- [ ] Strategy rollback skips it and rethrows; all other failures roll back
-- [ ] Strategy-layer pin: foreign directory survives a refused create intact
-- [ ] `bun test`, `bun run typecheck`, `bun run test:coverage` all green
+- [x] `OccupiedTargetError` exported from `clone.ts`; refusal throws it
+- [x] Strategy rollback skips it and rethrows; all other failures roll back
+- [x] Strategy-layer pin: foreign directory survives a refused create intact
+- [x] `bun test`, `bun run typecheck`, `bun run test:coverage` all green

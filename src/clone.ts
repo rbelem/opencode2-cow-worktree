@@ -60,7 +60,7 @@ export async function cloneDirectory(source: string, target: string): Promise<vo
     throw new Error(`cannot clone ${from} into ${to}: the target contains the source`);
   }
   if (await entryExists(to)) {
-    throw new Error(`cannot clone into ${to}: it already exists`);
+    throw new OccupiedTargetError(`cannot clone into ${to}: it already exists`);
   }
 
   await mkdir(target, { recursive: true });
@@ -84,6 +84,14 @@ async function entryExists(path: string): Promise<boolean> {
     throw error;
   }
 }
+
+/**
+ * The target of a `cloneDirectory` call was already occupied. Its own class so
+ * a caller's leave-nothing-behind rollback can tell "refused before the first
+ * write, nothing here is ours" apart from a mid-clone failure, and leave the
+ * foreign content untouched instead of `rm`-ing it.
+ */
+export class OccupiedTargetError extends Error {}
 
 async function cloneInto(source: string, target: string, skip: string): Promise<void> {
   for (const entry of await readdir(source, { withFileTypes: true })) {

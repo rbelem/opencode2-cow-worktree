@@ -37,8 +37,8 @@ rationale.
 
 **Status:** ready-for-agent
 
-- [ ] `cloneDirectory` refuses any pre-existing target with the house error
-- [ ] Linux `cloneFile` passes `COPYFILE_EXCL`
-- [ ] Race pin: a foreign directory at the target path survives a refused
+- [x] `cloneDirectory` refuses any pre-existing target with the house error
+- [x] Linux `cloneFile` passes `COPYFILE_EXCL`
+- [x] Race pin: a foreign directory at the target path survives a refused
       create untouched
-- [ ] `bun test`, `bun run typecheck`, `bun run test:coverage` all green
+- [x] `bun test`, `bun run typecheck`, `bun run test:coverage` all green

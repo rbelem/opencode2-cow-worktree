@@ -1,9 +1,10 @@
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { ptr } from "bun:ffi";
 import { DARWIN_CLONE_FLAGS } from "../src/platform-darwin";
 import {
   createDarwinSyscall,
   loadCopyfileLibrary,
+  resetCopyfileLibrary,
 } from "../src/platform-darwin-ffi";
 import type { CopyfileLibrary, LibraryLoad } from "../src/platform-darwin-ffi";
 
@@ -13,6 +14,13 @@ import type { CopyfileLibrary, LibraryLoad } from "../src/platform-darwin-ffi";
 // `read.i32`, so the fake `__error` must return a real pointer over an int;
 // `ptr(new Int32Array([...]))` supplies one without loading any library. No
 // `bun:ffi` module is mocked.
+
+// The injected loaders must not leak into later test files: the module cache
+// is process-lifetime, so a fake left behind would make a forced-Darwin call
+// succeed on Linux somewhere else in the suite.
+afterEach(() => {
+  resetCopyfileLibrary();
+});
 
 test("loadCopyfileLibrary loads libSystem once and returns the same binding", () => {
   const symbols: CopyfileLibrary = {

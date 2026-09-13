@@ -29,7 +29,7 @@ successful probe as `error` — which today would also be cached.
 
 **Status:** ready-for-agent
 
-- [ ] `error` verdicts retry on the next call; terminal verdicts stay cached
-- [ ] Scratch-cleanup failure cannot mask a probe verdict
-- [ ] Concurrency property (shared in-flight probe) still pinned
-- [ ] `bun test`, `bun run typecheck`, `bun run test:coverage` all green
+- [x] `error` verdicts retry on the next call; terminal verdicts stay cached
+- [x] Scratch-cleanup failure cannot mask a probe verdict
+- [x] Concurrency property (shared in-flight probe) still pinned
+- [x] `bun test`, `bun run typecheck`, `bun run test:coverage` all green

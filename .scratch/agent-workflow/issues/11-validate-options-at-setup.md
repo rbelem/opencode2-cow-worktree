@@ -32,9 +32,9 @@ setup-region conflict for the orchestrator to resolve).
 
 **Status:** ready-for-agent
 
-- [ ] All three options validated once at `setup`; `liveDeps` consumes
+- [x] All three options validated once at `setup`; `liveDeps` consumes
       validated values
-- [ ] `list_worktrees` dodge comment reconciled
-- [ ] README claims match behavior for all three options
-- [ ] Per-commit: `bun test`, `bun run typecheck`, `bun run test:coverage`
+- [x] `list_worktrees` dodge comment reconciled
+- [x] README claims match behavior for all three options
+- [x] Per-commit: `bun test`, `bun run typecheck`, `bun run test:coverage`
       green

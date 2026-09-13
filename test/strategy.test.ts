@@ -15,6 +15,7 @@ import {
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { cowStrategy, createCowStrategy } from "../src/strategy";
+import { OccupiedTargetError } from "../src/clone";
 import * as cloneModule from "../src/clone";
 import * as hooksModule from "../src/hooks";
 import * as uncommittedModule from "../src/uncommitted";
@@ -150,6 +151,26 @@ test.skipIf(cowRoot === undefined || !gitOnPath)("a worktree created through the
   // The clone is genuinely independent: it still reads git with the source gone.
   await rename(repo, `${repo}.moved`);
   expect(git(target, "status", "--porcelain")).toBe(" M tracked.txt\n");
+});
+
+// The strategy-layer half of ticket 12: an occupied target is refused before
+// the first write, so the create rollback must never `rm` foreign content.
+// Runs off the CoW root — the refusal precedes any reflink.
+test("a create whose target is already occupied is refused without rolling back", async () => {
+  const source = await mkdtemp(join(tmpdir(), "cow-occupied-src-"));
+  const target = join(tmpdir(), `cow-occupied-tgt-${randomBytes(8).toString("hex")}`);
+  await mkdir(target, { recursive: true });
+  const foreign = join(target, "foreign.txt");
+  await writeFile(foreign, "not the plugin's");
+  const signal = new AbortController().signal;
+
+  await expect(
+    cowStrategy.create({ sourceDirectory: source, directory: target }, { signal }),
+  ).rejects.toBeInstanceOf(OccupiedTargetError);
+
+  expect(await readFile(foreign, "utf8")).toEqual("not the plugin's");
+  await rm(source, { recursive: true, force: true });
+  await rm(target, { recursive: true, force: true });
 });
 
 test.skipIf(cowRoot === undefined || !gitOnPath)("removing a worktree through the strategy removes its directory", async () => {

@@ -55,10 +55,15 @@ const NO_RUNTIME_CODE = new Set(["src/mechanism.ts"]);
  *
  *   - A function whose body is a single expression on the declaration line
  *     (e.g. `export function f(x) { return g(x) }`) is counted as declared but
- *     never hit, even though its line is hit. The arrow in `src/clone.ts:66`
+ *     never hit, even though its line is hit. The arrow in `src/clone.ts:105`
  *     (`() => lstat(from)`) is exactly this shape.
  *   - A nested arrow inside an outer function is counted as an additional
  *     function, so a module can report more functions than it declares.
+ *   - An empty-bodied class (`export class E extends Error {}`) reports its
+ *     implicit constructor as declared but never hit, even though the
+ *     constructor runs on every `throw new E(...)` — the refusal pins in
+ *     `test/clone.test.ts` construct `OccupiedTargetError` dozens of times
+ *     while the function hit count stays flat.
  *
  * Neither can be satisfied by a test, because no test can make Bun record a hit
  * for a function it mis-counts. The declaration here is bounded on both sides:
@@ -66,7 +71,7 @@ const NO_RUNTIME_CODE = new Set(["src/mechanism.ts"]);
  * fixed Bun — surfaces instead of being absorbed.
  */
 const FUNCTION_UNDERCOUNT: Readonly<Record<string, number>> = {
-  "src/clone.ts": 1,
+  "src/clone.ts": 2,
 };
 
 /**

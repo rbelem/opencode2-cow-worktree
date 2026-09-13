@@ -82,6 +82,16 @@ export function loadCopyfileLibrary(
 }
 
 /**
+ * Drops the cached binding so the next resolution calls `load` again. The
+ * cache itself is process-lifetime by design (see above); the reset exists so
+ * a test that injected a stand-in cannot leak it into later tests and make
+ * the suite order-dependent.
+ */
+export function resetCopyfileLibrary(): void {
+  loaded = undefined;
+}
+
+/**
  * Darwin errno numbers relevant to a clone. The header is XNU
  * `bsd/sys/errno.h`; unmapped numbers become `ERRNO_<n>` so a code is always
  * present and a real failure never looks like a missing one.

@@ -5,7 +5,7 @@ import {
   deviceOf,
   nearestExistingDevice,
 } from "./device";
-import { cloneDirectory } from "./clone";
+import { cloneDirectory, OccupiedTargetError } from "./clone";
 import { mayRemove } from "./dirty";
 import { runPostCreateHooks } from "./hooks";
 import { removeQuarantined } from "./removal";
@@ -57,6 +57,11 @@ export function createCowStrategy(
       try {
         await cloneDirectory(input.sourceDirectory, input.directory);
       } catch (cause) {
+        // An occupied target was refused before the first write, so nothing in
+        // that directory is this call's creation; the leave-nothing-behind
+        // rollback must never run over foreign content. The refusal propagates
+        // as-is.
+        if (cause instanceof OccupiedTargetError) throw cause;
         // Leave nothing behind: cloneDirectory creates the target before it can
         // fail, so a partial tree would otherwise survive a failed create.
         // In-place `rm` — not the quarantine dance of src/removal.ts — is

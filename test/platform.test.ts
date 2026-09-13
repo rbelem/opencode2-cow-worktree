@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cloneFile, cloneOnLinux, isDarwin } from "../src/platform";
 import type { PlatformCheck } from "../src/platform";
+import { resetCopyfileLibrary } from "../src/platform-darwin-ffi";
 import { cloneDirectory, reflinkFile } from "../src/clone";
 import { findCowRoot, findNonCowRoot } from "./fs-roots";
 
@@ -158,6 +159,11 @@ test.skipIf(!onLinux || cowRoot === undefined)("the Darwin branch is unreachable
   const source = join(dir, "source");
   await writeFile(source, "x\n");
   const alwaysDarwin: PlatformCheck = () => true;
+
+  // Any binding a previous test injected into the loader cache would make this
+  // call resolve; the fail-closed property under test is about the real dlopen
+  // path, so the cache starts empty.
+  resetCopyfileLibrary();
 
   // Forcing the Darwin branch on Linux must fail (bun:ffi cannot load
   // libSystem.B.dylib), never silently produce a copy. This is the seam's

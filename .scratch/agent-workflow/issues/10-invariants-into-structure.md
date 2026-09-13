@@ -47,15 +47,15 @@ merge order handles it).
 
 **Status:** ready-for-agent
 
-- [ ] Strategy imports device primitives from `src/device.ts`; tool-layer
+- [x] Strategy imports device primitives from `src/device.ts`; tool-layer
       tests no longer spy `../src/tool` for strategy behavior
-- [ ] No `setPostCreateHooks`; factory closes over validated hooks; setup
+- [x] No `setPostCreateHooks`; factory closes over validated hooks; setup
       order enforced by construction
-- [ ] Hook runner and git probe live outside `strategy.ts`; `dirty.ts`
+- [x] Hook runner and git probe live outside `strategy.ts`; `dirty.ts`
       unchanged and still pure
-- [ ] Both parent computations route through `predictedParent`; upstream
+- [x] Both parent computations route through `predictedParent`; upstream
       assembly contract recorded in the types shim
-- [ ] Schema drift pins for both tool outputs
-- [ ] Badge uses the shared directory-identity helper and the shared row type
-- [ ] Per-commit: `bun test`, `bun run typecheck`, `bun run test:coverage`
+- [x] Schema drift pins for both tool outputs
+- [x] Badge uses the shared directory-identity helper and the shared row type
+- [x] Per-commit: `bun test`, `bun run typecheck`, `bun run test:coverage`
       green
