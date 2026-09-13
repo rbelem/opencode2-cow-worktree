@@ -5,6 +5,7 @@ import { promisify } from "node:util";
 import type { WorktreeDefinition } from "../types/opencode2-worktree";
 import { cloneDirectory } from "./clone";
 import { mayRemove } from "./dirty";
+import { removeQuarantined } from "./removal";
 import {
   assertSameDevice,
   deviceOf,
@@ -69,6 +70,13 @@ export const cowStrategy: WorktreeDefinition = {
     // filesystem change, so uncommitted work is never silently destroyed
     // (issue #13). `input.force` is authorization for the decision, not a flag
     // for `rm`.
+    //
+    // Past the guard the deletion is never in-place: the directory's identity
+    // is captured, it is renamed to a quarantine sibling, the identity is
+    // re-confirmed, and only then is the copy deleted — so a swapped or
+    // recycled path can never be deleted in the audited directory's name, and
+    // an agent holding a cwd inside stops blocking the path. `removal.ts` owns
+    // those mechanics.
     const uncommitted = input.force
       ? undefined
       : await probeUncommitted(input.directory);
@@ -79,7 +87,7 @@ export const cowStrategy: WorktreeDefinition = {
           "Re-run with force to delete them.",
       );
     }
-    await rm(input.directory, { recursive: true, force: true });
+    await removeQuarantined(input.directory);
   },
 
   async list() {

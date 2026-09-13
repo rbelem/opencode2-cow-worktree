@@ -100,7 +100,8 @@ export const cowStrategy: WorktreeDefinition = {
     return { directory: input.directory };
   },
   async remove(input) {
-    await rm(input.directory, { recursive: true, force: input.force });
+    // guard first, then the quarantine removal described under **Removal** below
+    await removeQuarantined(input.directory);
   },
   list: async () => [], // inventory lives in opencode2, not in the Strategy
 };
@@ -141,6 +142,28 @@ contact beyond that stat — and per ADR 0003 it has **no sessions field**:
 server plugins cannot enumerate sessions, and an honest absence beats a stale
 one. An inventory row whose directory cannot be read fails the list rather
 than being silently skipped.
+
+**Removal.** The `cow` strategy never deletes a worktree path in place. After
+the uncommitted-work guard (which still precedes every filesystem change), the
+directory is stat'd to capture its identity (device + inode), renamed to a
+sibling `.cow-removing-<name>-<random>` in the same parent, and the quarantine
+path is stat'd again: only when the identity still matches is the copy
+deleted. A mismatch — the path was swapped or recycled between rename and
+check — aborts loudly and moves the worktree back, leaving the original
+untouched. The rename also unblocks an agent holding a cwd inside the
+worktree: the path is vacated immediately even though its former contents
+cannot be fully unlinked until that process lets go.
+
+Deletion is two-phase. Everything except dependency directories
+(`node_modules`) is deleted before the removal returns; those are deleted
+afterwards, asynchronously in the server process, together with the
+`.cow-removing-…` shell. Failures in that background tail are logged, never
+thrown. A **leftover** `.cow-removing-…` directory therefore means a deletion
+failed midway — the thrown or logged error names it — and it holds the
+remains of a removed worktree and nothing else: safe to delete by hand once
+no process is using it. Right after a removal returns, a `.cow-removing-…`
+sibling can also exist transiently while the tail finishes; it disappears on
+its own.
 
 ## Install and configure
 
