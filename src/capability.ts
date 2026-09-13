@@ -52,8 +52,12 @@ const cache = new Map<string, Promise<CowCapability>>();
 /**
  * Answers whether `directory`'s filesystem can satisfy a CoW clone, by
  * attempting one of a small temporary file inside that directory. Never throws:
- * a failure is reported as `unsupported` or `error`. Results are cached per
- * directory.
+ * a failure is reported as `unsupported` or `error`. Terminal verdicts
+ * (`supported`, `unsupported`) are cached per directory; an `error` verdict is
+ * deliberately not — it is the one class defined as transient (permissions, a
+ * missing path, an I/O hiccup), so caching it would disable this directory
+ * until the server restarted over one bad moment. Concurrent first callers
+ * share the one in-flight probe, and only its terminal verdict is kept.
  */
 export function probeCowCapability(
   directory: string,
@@ -62,7 +66,19 @@ export function probeCowCapability(
   const cached = cache.get(directory);
   if (cached !== undefined) return cached;
   const pending = probe(directory, attempt);
+  // Stored before the first await so concurrent callers share this probe
+  // instead of each starting their own. When it settles on `error`, the entry
+  // is dropped: this call and every caller sharing the probe still receive
+  // the verdict, but the next call probes again instead of replaying a
+  // transient failure forever. The identity check means the eviction can only
+  // remove this probe's own entry, never a verdict a newer probe already
+  // replaced it with.
   cache.set(directory, pending);
+  void pending.then((verdict) => {
+    if (verdict.status === "error" && cache.get(directory) === pending) {
+      cache.delete(directory);
+    }
+  });
   return pending;
 }
 
@@ -90,7 +106,16 @@ async function attemptClone(
   } catch (error) {
     return classifyCloneFailure(error);
   } finally {
-    await rm(scratch, { recursive: true, force: true });
+    // The cleanup is best-effort and runs in its own guard: the scratch is
+    // dot-prefixed, tiny, and inside the probed directory, so a failed `rm`
+    // (say, EACCES on a suddenly read-only parent) is not a capability fact
+    // and must never mask the verdict above — least of all by turning a
+    // `supported` answer into an `error`.
+    try {
+      await rm(scratch, { recursive: true, force: true });
+    } catch {
+      // A leftover scratch is harmless; the verdict stands as reported.
+    }
   }
 }
 
