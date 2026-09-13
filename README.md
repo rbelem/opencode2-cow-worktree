@@ -56,6 +56,10 @@ LLM fan-out — it proves filesystem isolation, not model behaviour.
 - [x] `spawn_workspace` tool with an opt-in `git` fallback
 - [x] Linux and macOS backends behind a platform seam
 - [x] Unit tests, and an e2e harness against a real opencode2 server
+- [x] A 31-scenario parallel-agent live swarm on
+      `opencode2 v0.0.0-next-20260912.3` — clone/isolation/extents, remove +
+      dirty guard, `spawn_workspace` options, fresh-binary install/defaults —
+      all passing (`docs/e2e/run-2026-09-12-swarm.md`)
 - [x] macOS/APFS on real hardware — CI measures shared extents on arm64 and
       x86_64 runners (issue #7)
 - [x] The fallback exercised through a real tool invocation against the server
