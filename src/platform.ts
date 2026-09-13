@@ -43,11 +43,22 @@ export async function cloneFile(
   return cloneOnLinux(source, target);
 }
 
-/** The Linux primitive: a forced reflink, which fails rather than byte-copying. */
+/**
+ * The Linux primitive: a forced, create-only reflink, which fails rather than
+ * byte-copying and refuses an existing destination instead of overwriting it.
+ * `COPYFILE_EXCL` is Darwin parity — `COPYFILE_CLONE_FORCE` implies it there
+ * (see `platform-darwin.ts`) — and correct on its own: the clone walker only
+ * ever writes fresh names, so an occupied destination is a bug to surface,
+ * not bytes to replace.
+ */
 export async function cloneOnLinux(source: string, target: string): Promise<void> {
   const { constants } = await import("node:fs");
   const { copyFile } = await import("node:fs/promises");
-  await copyFile(source, target, constants.COPYFILE_FICLONE_FORCE);
+  await copyFile(
+    source,
+    target,
+    constants.COPYFILE_FICLONE_FORCE | constants.COPYFILE_EXCL,
+  );
 }
 
 /**

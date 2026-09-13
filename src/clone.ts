@@ -38,6 +38,16 @@ export async function reflinkFile(source: string, target: string): Promise<void>
  * skipped rather than copied into itself. A target that contains the source is
  * rejected: writing the clone over the tree being walked has no coherent
  * meaning.
+ *
+ * An occupied target is refused before the first filesystem write: `cow`
+ * never writes into, or deletes, bytes it did not create. `mkdir` would
+ * happily merge into an existing directory and per-file clones would
+ * overwrite its files, and a caller's leave-nothing-behind rollback would
+ * then run its `rm` over content this call never made — so a pre-existing
+ * path (any type, a `lstat` that never follows symlinks) is always the
+ * caller's mistake to resolve, and it surfaces here as a refusal naming the
+ * path. An entry path whose occupancy cannot even be determined fails closed:
+ * it is an error, never an "absent".
  */
 export async function cloneDirectory(source: string, target: string): Promise<void> {
   const from = resolve(source);
@@ -49,9 +59,30 @@ export async function cloneDirectory(source: string, target: string): Promise<vo
   if (isInside(from, to)) {
     throw new Error(`cannot clone ${from} into ${to}: the target contains the source`);
   }
+  if (await entryExists(to)) {
+    throw new Error(`cannot clone into ${to}: it already exists`);
+  }
 
   await mkdir(target, { recursive: true });
   await cloneInto(from, to, to);
+}
+
+/**
+ * True when anything — directory, file, symbolic link — occupies `path`.
+ * `lstat` never follows a symlink, so a link at the path counts as occupied
+ * without consulting what it points to. An error that is not a plain ENOENT
+ * says the occupancy is unknowable, and is rethrown: treating it as absence
+ * would let the clone merge into a path no one could inspect.
+ */
+async function entryExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 async function cloneInto(source: string, target: string, skip: string): Promise<void> {
