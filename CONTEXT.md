@@ -58,6 +58,18 @@ Whether a given directory's filesystem can satisfy a CoW clone. Determined by
 attempting a clone, not by inspecting the filesystem type.
 _Avoid_: fs support, reflink support
 
+**Attach**:
+Creating a new session bound to an existing Worktree instead of materializing
+a new one. Offered only for Worktrees the Strategy materialized; anything else
+is a Foreign worktree and is refused.
+_Avoid_: reuse (the session is always new), resume (a session-level concept,
+not a worktree-level one)
+
+**Foreign worktree**:
+A directory that presents itself as a Worktree candidate but was not
+materialized by a registered Strategy for this Location. Refused on Attach.
+_Avoid_: orphan, stale worktree
+
 ### informal
 
 **Lane**:
