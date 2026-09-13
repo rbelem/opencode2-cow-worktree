@@ -1,5 +1,5 @@
-import { stat } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { realpath, stat } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 import type { CowCapability } from "./capability";
 import type { Mechanism } from "./mechanism";
 import type { WorktreeInventoryEntry } from "../types/opencode2-worktree";
@@ -54,9 +54,10 @@ export interface SpawnWorkspaceDeps {
   /**
    * Lists the Worktree inventory opencode2 records for the caller's location —
    * one `{ directory, strategy? }` entry per Worktree (`ctx.worktree.list()`).
-   * Attach reads it to decide whether an existing directory is ours (ADR 0003:
-   * the inventory, not a plugin-owned registry, is the source of truth).
-   * Injected so the decision is testable without opencode2.
+   * Attach reads it to decide whether an existing directory is ours, and
+   * `listCowWorktrees` lists from it (ADR 0003: the inventory, not a
+   * plugin-owned registry, is the source of truth). Injected so the decision
+   * is testable without opencode2.
    */
   readonly listWorktrees: () => Promise<readonly WorktreeInventoryEntry[]>;
   /**
@@ -124,6 +125,7 @@ export async function spawnWorkspace(
   // A present, non-empty name may hit an existing Worktree; an empty string is
   // not a name and takes the create path exactly as before.
   if (name) {
+    assertSimpleName(name);
     const attached = await tryAttach(name, input.sourceDirectory, deps);
     if (attached !== undefined) return attached;
   }
@@ -225,7 +227,7 @@ export function crossDeviceError(source: string, target: string): Error {
   return new Error(
     `cow cannot clone ${source} into ${target}: the target is on a different ` +
       "filesystem and a reflink cannot cross devices. Point opencode2's " +
-      "`worktree.directory` config (or the spawn_workspace `targetRoot` option) " +
+      "`worktree.directory` config or the `targetRoot` plugin option (opencode.json) " +
       "at a directory on the source's filesystem.",
   );
 }
@@ -306,6 +308,21 @@ export async function isDirectory(path: string): Promise<boolean> {
 }
 
 /**
+ * Rejects a `name` the prediction cannot treat as one directory name, before
+ * any existence probe or inventory read: a separator would address a nested
+ * path the attach flow never predicted, and `.`/`..` do not name a directory.
+ */
+function assertSimpleName(name: string): void {
+  if (name === "." || name === ".." || /[\\/]/.test(name)) {
+    throw new Error(
+      `invalid worktree name ${JSON.stringify(name)}: only simple directory names are ` +
+        "accepted — no \"/\" or \"\\\", never \".\" or \"..\". The worktree parent is " +
+        "chosen for you; pass the plain name.",
+    );
+  }
+}
+
+/**
  * The attach half of a named `spawnWorkspace`: when the predicted directory
  * already exists, decide whether the call may attach to it. Returns `undefined`
  * when the predicted path is free, handing control back to the create flow
@@ -325,6 +342,7 @@ async function tryAttach(
   const parent = deps.targetRoot ?? join(sourceDirectory, "..");
   const target = join(parent, name);
   if (!(await deps.isDirectory(target))) return undefined;
+  // TOCTOU by construction: the existence check, inventory read, and Deep-clone check are separate reads, and every interleaving fails closed.
   return attachToExisting(name, target, deps);
 }
 
@@ -361,13 +379,45 @@ async function attachToExisting(
   }
 }
 
-/** The inventory entry recorded for a directory, when the inventory knows it. */
+/**
+ * The inventory entry recorded for a directory, when the inventory knows it.
+ *
+ * Identity is not an exact-string comparison: the inventory may record the
+ * same directory through a different spelling (a symlinked ancestor, a `..`
+ * segment), and an exact-string miss would refuse a real cow worktree as
+ * Foreign. Rows are narrowed by basename first — cheap, and shared with the
+ * prediction — then matched exactly, and finally by resolving both paths:
+ * `realpath` when both resolve, lexical normalization when it cannot. A
+ * comparison that establishes no identity leaves the entry unfound, so an
+ * unknown path still refuses as Foreign.
+ */
 async function inventoryEntryFor(
   deps: SpawnWorkspaceDeps,
   directory: string,
 ): Promise<WorktreeInventoryEntry | undefined> {
   const entries = await deps.listWorktrees();
-  return entries.find((candidate) => candidate.directory === directory);
+  const leaf = basename(directory);
+  const candidates = entries.filter((entry) => basename(entry.directory) === leaf);
+  for (const candidate of candidates) {
+    if (candidate.directory === directory) return candidate;
+    if (await sameDirectory(candidate.directory, directory)) return candidate;
+  }
+  return undefined;
+}
+
+/**
+ * Whether two paths name the same directory. `realpath` is authoritative when
+ * both sides resolve; when either cannot be read (a row for a path that no
+ * longer exists, a unit-test fake), identity falls back to lexical
+ * normalization. A false answer is "no entry" — never a weaker match.
+ */
+async function sameDirectory(a: string, b: string): Promise<boolean> {
+  try {
+    const [realA, realB] = await Promise.all([realpath(a), realpath(b)]);
+    return realA === realB;
+  } catch {
+    return resolve(a) === resolve(b);
+  }
 }
 
 /** The refusal for a path the worktree inventory does not know at all. */
@@ -408,4 +458,94 @@ function notDeepCloneError(target: string): Error {
 /** The strategy as a refusal names it; the checkout root is listed with none. */
 function describeStrategy(strategy: string | undefined): string {
   return strategy === undefined ? "no strategy" : `"${strategy}"`;
+}
+
+// ---------------------------------------------------------------------------
+// list_worktrees (ADR 0003)
+//
+// A read-only listing of the Location's CoW worktrees, derived entirely from
+// opencode2's worktree inventory: no plugin-owned registry, no git commands,
+// and no filesystem contact beyond one stat per surviving entry.
+// ---------------------------------------------------------------------------
+
+/** One CoW worktree as the `list_worktrees` tool reports it. */
+export interface CowWorktreeEntry {
+  /** The worktree directory's basename. */
+  readonly name: string;
+  /** The worktree directory, verbatim as the inventory records it. */
+  readonly directory: string;
+  readonly strategy: "cow";
+  /** ISO 8601; derived from a directory stat. See `createdAtOf`. */
+  readonly createdAt: string;
+}
+
+/**
+ * The two stat fields `createdAt` is derived from, kept structural so tests
+ * can inject a plain object and the live binding passes node's `Stats`
+ * unchanged.
+ */
+export interface StatTimes {
+  readonly birthtimeMs: number;
+  readonly mtimeMs: number;
+}
+
+/** The seams `listCowWorktrees` reads. Injected like `SpawnWorkspaceDeps`. */
+export interface ListWorktreesDeps {
+  /**
+   * The worktree inventory (`ctx.worktree.list()`), the same seam the attach
+   * path reads. The inventory, not a plugin-owned registry, is the source of
+   * truth (ADR 0003).
+   */
+  readonly listWorktrees: () => Promise<readonly WorktreeInventoryEntry[]>;
+  /**
+   * Stats one inventory-listed directory. A failure here is not absorbed: the
+   * inventory is truth, so an unreadable row is a real anomaly and the list
+   * fails loudly instead of silently dropping the entry.
+   */
+  readonly statEntry: (path: string) => Promise<StatTimes>;
+}
+
+/**
+ * Lists the Location's CoW worktrees for the `list_worktrees` tool.
+ *
+ * Only inventory rows recorded with `strategy: "cow"` are listed — the
+ * strategy-less checkout-root row and other strategies' Worktrees are not
+ * directories this plugin materialized. Nothing here consults git or probes
+ * for CoW capability: per ADR 0003 the inventory is the source of truth, and
+ * the only filesystem contact is one stat per surviving entry, for
+ * `createdAt`.
+ */
+export async function listCowWorktrees(deps: ListWorktreesDeps): Promise<CowWorktreeEntry[]> {
+  const entries = await deps.listWorktrees();
+  const cow = entries.filter((entry) => entry.strategy === "cow");
+  return Promise.all(cow.map((entry) => cowEntryOf(entry, deps.statEntry)));
+}
+
+/** Derives one listing entry: the basename, the verbatim directory, and the stat. */
+async function cowEntryOf(
+  entry: WorktreeInventoryEntry,
+  statEntry: ListWorktreesDeps["statEntry"],
+): Promise<CowWorktreeEntry> {
+  // Fail loud, by design: the inventory is truth, and a row it lists but whose
+  // directory cannot be stat'd is a real anomaly. Skipping it would report an
+  // incomplete list as a complete one.
+  const times = await statEntry(entry.directory);
+  return {
+    name: basename(entry.directory),
+    directory: entry.directory,
+    strategy: "cow",
+    createdAt: createdAtOf(times),
+  };
+}
+
+/**
+ * Birthtime first, mtime when the filesystem reports none. btrfs and other
+ * filesystems leave birthtime at zero/epoch, where mtime is the
+ * later-explanatory time — when the directory's content was last written.
+ * Zero is unambiguous: no filesystem reports the epoch as a real creation
+ * time.
+ */
+function createdAtOf(times: StatTimes): string {
+  const ms = times.birthtimeMs > 0 ? times.birthtimeMs : times.mtimeMs;
+  return new Date(ms).toISOString();
 }

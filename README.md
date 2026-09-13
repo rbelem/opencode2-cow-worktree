@@ -24,6 +24,8 @@ The implementation is here and it runs. This plugin:
 - registers the `cow` **Strategy** through opencode2's worktree seam;
 - ships a `spawn_workspace` tool that probes **CoW capability**, asks for `cow`,
   and reports the **Mechanism** that produced the directory;
+- ships a `list_worktrees` tool that lists the Location's cow worktrees from
+  opencode2's worktree inventory (no sessions field; ADR 0003);
 - has an opt-in `git` fallback for the tool (`options.fallback`, default
   `"none"`);
 - has a Linux backend (per-file `COPYFILE_FICLONE_FORCE` reflink) and a macOS
@@ -129,6 +131,16 @@ directory). Anything else already at that name is refused loudly before any
 session starts and with no filesystem change: a `git`-strategy Worktree, a path
 the inventory does not know (a Foreign worktree), or a `cow` row that lost its
 Deep-clone shape.
+
+**List.** The `list_worktrees` tool lists the Location's CoW worktrees: each
+entry carries the directory basename as `name`, plus `directory`, `strategy`,
+and `createdAt` from a stat of the directory (birthtime, falling back to mtime
+when the filesystem reports none — btrfs does). It is derived from opencode2's
+worktree inventory alone — no plugin-owned registry, no git, and no filesystem
+contact beyond that stat — and per ADR 0003 it has **no sessions field**:
+server plugins cannot enumerate sessions, and an honest absence beats a stale
+one. An inventory row whose directory cannot be read fails the list rather
+than being silently skipped.
 
 ## Install and configure
 

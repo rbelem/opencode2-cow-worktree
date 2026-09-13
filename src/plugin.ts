@@ -1,7 +1,8 @@
 import type { Context } from "@opencode-ai/plugin";
+import { stat } from "node:fs/promises";
 import { probeCowCapability } from "./capability";
 import { fallbackPolicy, targetRoot } from "./config";
-import { deviceOf, isDirectory, spawnWorkspace } from "./tool";
+import { deviceOf, isDirectory, listCowWorktrees, spawnWorkspace } from "./tool";
 import type { SpawnWorkspaceDeps, SpawnWorkspaceInput } from "./tool";
 import { cowStrategy } from "./strategy";
 
@@ -60,6 +61,60 @@ const spawnWorkspaceOutput = {
 } as const;
 
 /**
+ * `list_worktrees` takes no input. The empty object keeps the shape the tool
+ * seam expects (a JSON Schema object) while declaring that no properties
+ * exist.
+ */
+const listWorktreesInput = {
+  type: "object",
+  properties: {},
+  additionalProperties: false,
+} as const;
+
+/**
+ * `list_worktrees`' declared output, with the same rule as
+ * `spawn_workspace`'s: a tool that returns an `output` field must declare its
+ * schema. The four entry fields are exactly what `listCowWorktrees` derives.
+ */
+const listWorktreesOutput = {
+  type: "object",
+  properties: {
+    worktrees: {
+      type: "array",
+      description: "The location's cow worktrees, in inventory order.",
+      items: {
+        type: "object",
+        properties: {
+          name: {
+            type: "string",
+            description: "The worktree directory's basename.",
+          },
+          directory: {
+            type: "string",
+            description: "The worktree directory, as the worktree inventory records it.",
+          },
+          strategy: {
+            type: "string",
+            enum: ["cow"],
+            description: "Only cow worktrees are listed.",
+          },
+          createdAt: {
+            type: "string",
+            description:
+              "ISO 8601 timestamp of the directory's birthtime, falling back to its " +
+              "mtime when the filesystem reports no birthtime.",
+          },
+        },
+        required: ["name", "directory", "strategy", "createdAt"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["worktrees"],
+  additionalProperties: false,
+} as const;
+
+/**
  * Binds `spawnWorkspace`'s seams to the live opencode2 context. The tool is
  * the layer that owns the strategy choice, so the capability probe and the
  * worktree/session APIs meet here and nowhere else.
@@ -99,10 +154,10 @@ function liveDeps(ctx: Context): SpawnWorkspaceDeps {
  * The opencode2 plugin module.
  *
  * `setup` registers the `cow` Strategy through the worktree seam, and the
- * `spawn_workspace` tool through the tool seam. Registering the Strategy also
- * selects it as the Location default; opencode2's registry still lets a caller
- * name the built-in `git` strategy explicitly, so this module does not touch
- * that behavior.
+ * `spawn_workspace` and `list_worktrees` tools through the tool seam.
+ * Registering the Strategy also selects it as the Location default; opencode2's
+ * registry still lets a caller name the built-in `git` strategy explicitly, so
+ * this module does not touch that behavior.
  */
 export default {
   id: "opencode2-cow-worktree",
@@ -137,6 +192,36 @@ export default {
           return {
             output: result,
             content,
+          };
+        },
+      });
+      editor.add({
+        name: "list_worktrees",
+        description:
+          "List this location's cow worktrees: each entry carries the directory's basename as " +
+          "name, the directory, the strategy, and createdAt from a stat of the directory " +
+          "(birthtime, falling back to mtime when the filesystem reports none). Derived from " +
+          "opencode2's worktree inventory alone — there is no sessions field, because server " +
+          "plugins cannot enumerate sessions (ADR 0003). The list fails rather than skipping " +
+          "when an inventory row's directory cannot be read: the inventory is truth.",
+        input: listWorktreesInput,
+        output: listWorktreesOutput,
+        // Same reason as spawn_workspace above: callable by name, not routed
+        // through CodeMode.
+        options: { codemode: false },
+        execute: async () => {
+          const worktrees = await listCowWorktrees({
+            // Own minimal deps, not liveDeps: building spawn_workspace's deps
+            // would validate the clone options (`fallback`, `targetRoot`) and
+            // make a misconfigured clone setting fail this read-only call.
+            listWorktrees: () => ctx.worktree.list(),
+            statEntry: stat,
+          });
+          const summary =
+            worktrees.length === 0 ? "0 cow worktree(s)" : `${worktrees.length} cow worktree(s):`;
+          return {
+            output: { worktrees },
+            content: `${summary}\n${JSON.stringify(worktrees, null, 2)}`,
           };
         },
       });

@@ -17,6 +17,6 @@ server plugins — new candidate; only the TUI context exposes a client today.
 
 **Status:** ready-for-agent
 
-- [ ] All five candidates present with evidence links and workaround status
-- [ ] Each has an explicit recommendation and filing guidance
-- [ ] Doc lives in `docs/research/` matching the existing research-doc style
+- [x] All five candidates present with evidence links and workaround status
+- [x] Each has an explicit recommendation and filing guidance
+- [x] Doc lives in `docs/research/` matching the existing research-doc style

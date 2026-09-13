@@ -29,7 +29,7 @@ import {
   runNonCowServer,
   type WorktreeRun,
 } from "./scenarios";
-import { runSimulationScenario, runAttachScenario } from "./simulation";
+import { runSimulationScenario, runAttachScenario, runListScenario } from "./simulation";
 import { writeRunLog } from "./runlog";
 import { makeConfigRoot, makeSourceProject, installPlugin, declarePlugin, removePath } from "./lib";
 
@@ -194,6 +194,36 @@ async function main(): Promise<number> {
     );
     fallback.notes.push(...attach.notes.map((note) => `attach: ${note}`));
     fallback.attach = attach;
+
+    // Ticket 02: list_worktrees, end to end. Two worktrees are created
+    // through the real API, then a real scripted session calls the tool; its
+    // text must name both with strategy cow, agreeing with the inventory.
+    const list = await runListScenario({ port: PORT + 8 });
+    assertions.check(
+      "list: both API-created worktrees returned a directory",
+      list.created["lst-one"] !== undefined && list.created["lst-two"] !== undefined,
+      JSON.stringify(list.created),
+    );
+    assertions.check(
+      "list: the real session executed list_worktrees",
+      list.listStatus === "completed",
+      `${list.listStatus} ${list.listOutput ?? ""}`,
+    );
+    assertions.check(
+      "list: the tool's answer names both worktrees with strategy cow",
+      (list.listOutput ?? "").includes("lst-one") &&
+        (list.listOutput ?? "").includes("lst-two") &&
+        (list.listOutput ?? "").includes('"strategy": "cow"'),
+      list.listOutput ?? "no output",
+    );
+    assertions.check(
+      "list: the inventory records both rows as cow (the fact the tool derives from)",
+      list.inventoryCowRows.length === 2 &&
+        list.inventoryCowRows.every((row) => row.strategy === "cow"),
+      JSON.stringify(list.inventoryCowRows),
+    );
+    fallback.notes.push(...list.notes.map((note) => `list: ${note}`));
+    fallback.list = list;
 
     await writeRunLog({ config, source, server, runtime, runs, assertions, fallback, version: serverVersion() });
 

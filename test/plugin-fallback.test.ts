@@ -76,7 +76,9 @@ async function harness(
       transform: async (callback: (editor: { add: (tool: any) => void }) => void) => {
         callback({
           add: (tool: any) => {
-            registered = tool as RegisteredTool;
+            // setup registers list_worktrees too; this harness drives
+            // spawn_workspace, so capture by name rather than by order.
+            if (tool.name === "spawn_workspace") registered = tool as RegisteredTool;
           },
         });
         return { dispose: async () => {} };

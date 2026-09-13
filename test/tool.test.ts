@@ -1,12 +1,13 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, join } from "node:path";
 
 import { probeCowCapability } from "../src/capability";
 import type { CowCapability } from "../src/capability";
 import type { Mechanism } from "../src/mechanism";
-import { deviceOf, isDirectory, nearestExistingDevice, spawnWorkspace } from "../src/tool";
-import type { SpawnWorkspaceDeps } from "../src/tool";
+import { deviceOf, isDirectory, listCowWorktrees, nearestExistingDevice, spawnWorkspace } from "../src/tool";
+import type { ListWorktreesDeps, SpawnWorkspaceDeps } from "../src/tool";
 import plugin from "../src/plugin";
 import { findCowRoot, findNonCowRoot } from "./fs-roots";
 
@@ -363,6 +364,81 @@ test("an existing path absent from the inventory is refused as a Foreign worktre
   expect(calls.createSession).toEqual([]);
 });
 
+test.skipIf(cowRoot === undefined)(
+  "attach matches an inventory row that names the same directory through a different spelling",
+  async () => {
+    // The inventory may record the worktree through a path that is not the
+    // predicted spelling — here an alternate parent whose `worker` entry is a
+    // symlink to the worktree: same basename, lexically unrelated, and only
+    // realpath equates the two. An exact-string comparison alone would refuse
+    // a real cow worktree as Foreign.
+    const root = await scratchDir();
+    const source = join(root, "source");
+    await mkdir(source);
+    const target = join(root, "worker");
+    await mkdir(join(target, ".git"), { recursive: true });
+    const alt = join(root, "alt");
+    await mkdir(alt);
+    const spelled = join(alt, "worker");
+    await symlink(target, spelled);
+
+    const { deps, calls } = fakeDeps(
+      { status: "supported" },
+      { inventory: [{ directory: spelled, strategy: "cow" }] },
+    );
+    const result = await spawnWorkspace(
+      { sourceDirectory: source, name: "worker" },
+      { ...deps, isDirectory },
+    );
+
+    expect(result).toEqual({
+      sessionID: "ses_test",
+      directory: target,
+      mechanism: "cow",
+      attached: true,
+    });
+    expect(calls.createWorktree).toEqual([]);
+  },
+);
+
+test("an inventory row equal only after lexical normalization still matches", async () => {
+  // Neither path exists on a real filesystem here, so realpath is unavailable
+  // and identity falls back to lexical normalization: the `..` segment
+  // cancels out and the row is recognized as ours.
+  const target = "/wt/worker";
+  const spelled = join("/wt", "..", "wt", "worker");
+  const { deps, calls } = fakeDeps(
+    { status: "supported" },
+    {
+      targetRoot: "/wt",
+      inventory: [{ directory: spelled, strategy: "cow" }],
+      directories: [target, join(target, ".git")],
+    },
+  );
+  const result = await spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, deps);
+
+  expect(result.attached).toBe(true);
+  expect(calls.createWorktree).toEqual([]);
+});
+
+test("a same-basename row for a different directory is still no entry: Foreign", async () => {
+  // Fail closed: the basename matches, but neither comparison equates the two
+  // paths, so the row is not the predicted directory and the attach refuses.
+  const { deps, calls } = fakeDeps(
+    { status: "supported" },
+    {
+      targetRoot: "/wt",
+      inventory: [{ directory: "/wt/nested/worker", strategy: "cow" }],
+      directories: ["/wt/worker"],
+    },
+  );
+
+  await expect(
+    spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, deps),
+  ).rejects.toThrow(/Foreign worktree/);
+  expect(calls.createSession).toEqual([]);
+});
+
 test("a cow inventory row without the Deep-clone signature is refused", async () => {
   // The inventory says cow, but `.git` is not a directory: the row is stale or
   // the directory was replaced, so the attach evidence is not there.
@@ -445,6 +521,50 @@ test("an unnamed spawn never probes for an attach", async () => {
   expect(calls.probedDirectories).toEqual([]);
   expect(calls.listed).toEqual([]);
   expect(calls.createWorktree).toHaveLength(1);
+});
+
+test("an empty-string name is not a name: create path, never probes for an attach", async () => {
+  // Pins the `if (name)` guard: "" is falsy, so the whole attach preflight —
+  // the name validation, the existence probe, the inventory read — never runs.
+  const { deps, calls } = fakeDeps(
+    { status: "supported" },
+    {
+      targetRoot: "/wt",
+      inventory: [{ directory: "/wt/worker", strategy: "cow" }],
+      directories: ["/wt/worker", join("/wt/worker", ".git")],
+    },
+  );
+  const result = await spawnWorkspace({ sourceDirectory: "/src", name: "" }, deps);
+
+  expect(result.attached).toBeUndefined();
+  expect(calls.probedDirectories).toEqual([]);
+  expect(calls.listed).toEqual([]);
+  expect(calls.createWorktree).toHaveLength(1);
+  expect(calls.createSession).toEqual([{ directory: "/worktrees/cow-clone", name: "" }]);
+});
+
+test("a name that is not a simple directory name is rejected before any probe", async () => {
+  // Separator, dot, and dot-dot names can never be the predicted single
+  // directory; the refusal must come before the existence probe or the
+  // inventory read, loudly, with nothing touched.
+  for (const name of ["a/b", "a\\b", ".", ".."]) {
+    const { deps, calls } = fakeDeps(
+      { status: "supported" },
+      {
+        targetRoot: "/wt",
+        inventory: [{ directory: "/wt/worker", strategy: "cow" }],
+        directories: ["/wt/worker", join("/wt/worker", ".git")],
+      },
+    );
+    await expect(spawnWorkspace({ sourceDirectory: "/src", name }, deps)).rejects.toThrow(
+      /only simple directory names/,
+    );
+    expect(calls.probedDirectories).toEqual([]);
+    expect(calls.listed).toEqual([]);
+    expect(calls.createWorktree).toEqual([]);
+    expect(calls.createSession).toEqual([]);
+    expect(calls.removed).toEqual([]);
+  }
 });
 
 test.skipIf(cowRoot === undefined)(
@@ -710,4 +830,236 @@ test("the registered tool attaches through ctx.worktree.list and reports it", as
   expect(result.content).toContain(`Attached to existing cow worktree at ${target}`);
   expect(result.content).toContain("no new worktree was created");
   expect(created).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// list_worktrees (ADR 0003)
+//
+// The listing is derived from the inventory alone: filter to cow, name from
+// the basename, createdAt from one stat. An unreadable row fails the list.
+// ---------------------------------------------------------------------------
+
+/** Fakes the two seams `listCowWorktrees` reads and records what was stat'd. */
+function fakeListDeps(
+  inventory: ReadonlyArray<{ directory: string; strategy?: string }>,
+  stamps: Readonly<Record<string, { birthtimeMs: number; mtimeMs: number }>> = {},
+): { deps: ListWorktreesDeps; statted: string[] } {
+  const statted: string[] = [];
+  const deps: ListWorktreesDeps = {
+    listWorktrees: async () => inventory,
+    statEntry: async (path) => {
+      statted.push(path);
+      const stamp = stamps[path];
+      if (stamp === undefined) throw new Error(`ENOENT: ${path}`);
+      return stamp;
+    },
+  };
+  return { deps, statted };
+}
+
+test("list on an empty inventory is an empty list, not an error", async () => {
+  const { deps, statted } = fakeListDeps([]);
+  expect(await listCowWorktrees(deps)).toEqual([]);
+  expect(statted).toEqual([]);
+});
+
+test("list keeps only cow rows: the checkout root and git worktrees are dropped", async () => {
+  const { deps, statted } = fakeListDeps(
+    [
+      { directory: "/repo" },
+      { directory: "/wt/shallow", strategy: "git" },
+      { directory: "/wt/worker", strategy: "cow" },
+    ],
+    { "/wt/worker": { birthtimeMs: 1_000, mtimeMs: 9_000 } },
+  );
+  expect(await listCowWorktrees(deps)).toEqual([
+    {
+      name: "worker",
+      directory: "/wt/worker",
+      strategy: "cow",
+      createdAt: new Date(1_000).toISOString(),
+    },
+  ]);
+  // Dropped rows are never stat'd: only survivors touch the filesystem.
+  expect(statted).toEqual(["/wt/worker"]);
+});
+
+test("createdAt prefers birthtime when the filesystem reports one", async () => {
+  const { deps } = fakeListDeps([{ directory: "/wt/worker", strategy: "cow" }], {
+    "/wt/worker": { birthtimeMs: 500, mtimeMs: 9_000 },
+  });
+  const [entry] = await listCowWorktrees(deps);
+  expect(entry!.createdAt).toBe(new Date(500).toISOString());
+});
+
+test("createdAt falls back to mtime when birthtime is zero/epoch (btrfs)", async () => {
+  const { deps } = fakeListDeps([{ directory: "/wt/worker", strategy: "cow" }], {
+    "/wt/worker": { birthtimeMs: 0, mtimeMs: 42 },
+  });
+  const [entry] = await listCowWorktrees(deps);
+  expect(entry!.createdAt).toBe(new Date(42).toISOString());
+});
+
+test("an inventory-listed directory that cannot be stat'd fails the whole list loudly", async () => {
+  // Fail-loud by design: the inventory is truth, so an unreadable row is a
+  // real anomaly — skipping it would report an incomplete list as complete.
+  const { deps } = fakeListDeps(
+    [
+      { directory: "/wt/ok", strategy: "cow" },
+      { directory: "/wt/ghost", strategy: "cow" },
+    ],
+    { "/wt/ok": { birthtimeMs: 1, mtimeMs: 2 } },
+  );
+  await expect(listCowWorktrees(deps)).rejects.toThrow(/\/wt\/ghost/);
+});
+
+/** The slice of the registered ToolInfo the registration-shape assertions read. */
+interface RegisteredToolShape {
+  readonly name: string;
+  readonly input?: { required?: string[] };
+  readonly output?: {
+    required?: string[];
+    properties?: { worktrees?: { items?: { required?: string[] } } };
+  };
+  readonly options?: { readonly codemode?: boolean };
+}
+
+/** Runs plugin.setup against a fake ctx that records every registered tool. */
+async function captureRegisteredTools(): Promise<Array<Record<string, unknown>>> {
+  const registered: Array<Record<string, unknown>> = [];
+  const ctx = {
+    worktree: {
+      transform: async (callback: (editor: unknown) => void) => {
+        callback({ add: () => {} });
+        return { dispose: async () => {} };
+      },
+    },
+    tool: {
+      transform: async (callback: (editor: unknown) => void) => {
+        callback({
+          add: (tool: Record<string, unknown>) => registered.push(tool),
+        });
+        return { dispose: async () => {} };
+      },
+    },
+  } as unknown as Parameters<typeof plugin.setup>[0];
+  await plugin.setup(ctx);
+  return registered;
+}
+
+test("list_worktrees is registered beside spawn_workspace, on the native tool list, with a declared output schema", async () => {
+  const registered = await captureRegisteredTools();
+  const list = registered.find((entry) => entry.name === "list_worktrees") as
+    | RegisteredToolShape
+    | undefined;
+  expect(list).toBeDefined();
+  // Same registration defects #9 found for spawn_workspace, asserted for the
+  // second tool: native tool list, and a declared output schema.
+  expect(list!.options?.codemode).toBe(false);
+  expect(list!.output).toBeDefined();
+  expect(list!.output!.required).toEqual(["worktrees"]);
+  expect(list!.output!.properties?.worktrees?.items?.required).toEqual([
+    "name",
+    "directory",
+    "strategy",
+    "createdAt",
+  ]);
+  // The tool takes no input: the schema requires nothing.
+  expect(list!.input!.required).toBeUndefined();
+});
+
+/** The list tool driven through its live ctx bindings, with a real stat. */
+async function registeredListTool(
+  listed: ReadonlyArray<{ directory: string; strategy?: string }>,
+  options?: Record<string, unknown>,
+): Promise<{
+  output: { worktrees: Array<Record<string, unknown>> };
+  content: string;
+}> {
+  const registered: Array<{
+    name: string;
+    execute: (input: unknown) => Promise<{ output: unknown; content: string }>;
+  }> = [];
+  const ctx = {
+    options,
+    worktree: {
+      transform: async (callback: (editor: unknown) => void) => {
+        callback({ add: () => {} });
+        return { dispose: async () => {} };
+      },
+      list: async () => listed,
+    },
+    tool: {
+      transform: async (callback: (editor: unknown) => void) => {
+        callback({
+          add: (tool: {
+            name: string;
+            execute: (input: unknown) => Promise<{ output: unknown; content: string }>;
+          }) => registered.push(tool),
+        });
+        return { dispose: async () => {} };
+      },
+    },
+  } as unknown as Parameters<typeof plugin.setup>[0];
+
+  await plugin.setup(ctx);
+  const tool = registered.find((entry) => entry.name === "list_worktrees");
+  expect(tool).toBeDefined();
+  return (await tool!.execute({})) as {
+    output: { worktrees: Array<Record<string, unknown>> };
+    content: string;
+  };
+}
+
+test("the registered list_worktrees tool reads the inventory and stats the real directory", async () => {
+  // Any filesystem will do: the listing only stats the directory. A plain
+  // tmpdir keeps this test independent of the CoW-root discovery.
+  const dir = await mkdtemp(join(tmpdir(), "cow-list-"));
+  scratchDirs.push(dir);
+
+  const result = await registeredListTool([{ directory: dir, strategy: "cow" }]);
+  const [entry] = result.output.worktrees;
+  expect(entry).toEqual({
+    name: basename(dir),
+    directory: dir,
+    strategy: "cow",
+    createdAt: entry!.createdAt,
+  });
+  // The wiring decides nothing about birthtime vs mtime itself; it must
+  // produce a real timestamp of that directory. The decision rule is pinned
+  // by the injected-stamp tests above. Candidate strings, not raw ms: mtime
+  // can carry sub-ms precision that toISOString rounds.
+  const times = await stat(dir);
+  expect([
+    new Date(times.birthtimeMs).toISOString(),
+    new Date(times.mtimeMs).toISOString(),
+  ]).toContain(entry!.createdAt as string);
+  // The one-line summary precedes the 2-space JSON rendering.
+  expect(result.content.startsWith("1 cow worktree(s):\n")).toBe(true);
+  expect(result.content).toContain(JSON.stringify(result.output.worktrees, null, 2));
+});
+
+test("the registered list_worktrees tool reports an empty list without an error", async () => {
+  const result = await registeredListTool([]);
+  expect(result.output).toEqual({ worktrees: [] });
+  expect(result.content).toBe("0 cow worktree(s)\n[]");
+});
+
+test("list_worktrees ignores clone options that spawn_workspace would reject", async () => {
+  // The list tool binds its own minimal deps, not spawn_workspace's: a
+  // misconfigured `fallback`/`targetRoot` — which the clone path validates —
+  // must not fail this read-only call.
+  const result = await registeredListTool([], { fallback: "bogus", targetRoot: 42 });
+  expect(result.output).toEqual({ worktrees: [] });
+  expect(result.content).toBe("0 cow worktree(s)\n[]");
+});
+
+test("the registered list_worktrees tool fails loudly on an unreadable inventory row", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "cow-list-"));
+  scratchDirs.push(dir);
+  const missing = join(dir, "missing");
+
+  await expect(registeredListTool([{ directory: missing, strategy: "cow" }])).rejects.toThrow(
+    new RegExp(missing.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+  );
 });

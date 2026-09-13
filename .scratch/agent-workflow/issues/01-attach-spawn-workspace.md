@@ -13,13 +13,13 @@ what was found; no session is created and no fs mutation happens on refusal.
 
 **Status:** ready-for-agent
 
-- [ ] Second `spawn_workspace` call with the same name succeeds, creates a
+- [x] Second `spawn_workspace` call with the same name succeeds, creates a
       new session in the existing worktree, result text says attached
-- [ ] Same-named `git`-strategy worktree → refusal naming the strategy; no
+- [x] Same-named `git`-strategy worktree → refusal naming the strategy; no
       session created
-- [ ] Unregistered/foreign path at the target name → refusal; no session, no
+- [x] Unregistered/foreign path at the target name → refusal; no session, no
       fs mutation
-- [ ] Attach and every refusal branch unit-covered to the repo gate (100%
+- [x] Attach and every refusal branch unit-covered to the repo gate (100%
       lines + functions)
-- [ ] e2e harness scenario demonstrates attach on a live server
-- [ ] README documents attach behavior
+- [x] e2e harness scenario demonstrates attach on a live server
+- [x] README documents attach behavior

@@ -370,3 +370,111 @@ async function inventoryRows(server: Server): Promise<Array<{ directory: string;
   if (Array.isArray(listed.body)) return listed.body as Array<{ directory: string; strategy?: string }>;
   return (listed.body as { data?: Array<{ directory: string; strategy?: string }> }).data ?? [];
 }
+
+// ---------------------------------------------------------------------------
+// list_worktrees (ADR 0003)
+//
+// Two worktrees are created through the real HTTP API — the cow strategy runs
+// for real and records each row with strategy "cow" — then `list_worktrees` is
+// executed through a real scripted session. The tool's answer must name both
+// directories with strategy "cow", agreeing with the inventory it derives
+// from.
+// ---------------------------------------------------------------------------
+
+export interface ListScenarioResult {
+  readonly notes: string[];
+  /** The directory each API create returned, keyed by the worktree name. */
+  created: Record<string, string | undefined>;
+  listStatus?: string;
+  listOutput?: string;
+  /** Inventory rows carrying either scenario name after the list round. */
+  inventoryCowRows: ReadonlyArray<{ directory: string; strategy?: string }>;
+}
+
+/** The names the scenario creates and expects listed. */
+const LIST_NAMES = ["lst-one", "lst-two"] as const;
+
+export async function runListScenario(options: {
+  readonly port: number;
+}): Promise<ListScenarioResult> {
+  const result: ListScenarioResult = { notes: [], created: {}, inventoryCowRows: [] };
+  const config = await makeConfigRoot();
+  config.env.OPENCODE_SIMULATE = "1";
+  config.env.OPENCODE_DRIVE = "1";
+  const pluginDir = await installPlugin(join(config.root, "plugin"));
+  await mergeSimulationConfig(config.config, [{ package: pluginDir, options: {} }]);
+
+  const source = join(config.root, "source");
+  await mkdir(source, { recursive: true });
+  await writeFile(join(source, "tracked.txt"), "list source\n");
+  git(source, "init", "-q");
+  git(source, "config", "user.email", "e2e@example.com");
+  git(source, "config", "user.name", "e2e");
+  git(source, "add", "-A");
+  git(source, "commit", "-qm", "list source");
+
+  const { startServer } = await import("./server");
+  const server = await startServer(config, { port: options.port, location: source });
+  try {
+    // Create both worktrees through the real HTTP API, the same shape fanOut
+    // uses: the parent beside the source, so the reflink crosses no device.
+    const parent = join(source, "..", "worktrees");
+    for (const name of LIST_NAMES) {
+      const created = await server.api.json("POST", "/api/worktree", {
+        strategy: "cow",
+        directory: parent,
+        name,
+      });
+      const directory = (created.body as { directory?: string }).directory;
+      result.created[name] = directory;
+      result.notes.push(`create ${name} -> ${created.status} ${directory ?? created.text.slice(0, 120)}`);
+    }
+
+    // One scripted session: the real registry decodes `list_worktrees`, the
+    // real tool execution reads the inventory and stats the directories.
+    const endpoint = driveEndpoint(server);
+    result.notes.push(`drive backend websocket: ${endpoint}`);
+    const drive = await driveModel(endpoint, [
+      // No resolveScriptedInput here: the tool takes no input, and its schema
+      // rejects unknown properties such as an injected sourceDirectory.
+      { kind: "tool-call", name: "list_worktrees", input: {} },
+      { kind: "text", text: "done" },
+    ]);
+    const session = await server.api.json("POST", "/api/session", {
+      title: "list",
+      location: { directory: source },
+      model: { providerID: "sim", id: "sim" },
+    });
+    const sessionID = (session.body as { data?: { id?: string } }).data?.id;
+    result.notes.push(`session create -> ${session.status} ${sessionID ?? session.text.slice(0, 120)}`);
+
+    const prompted = await server.api.json("POST", `/api/session/${sessionID}/prompt`, {
+      text: "List the worktrees.",
+      model: { providerID: "sim", id: "sim" },
+    });
+    result.notes.push(`prompt -> ${prompted.status}`);
+
+    await Promise.race([drive.done, Bun.sleep(20_000).then(() => undefined)]);
+    await Bun.sleep(750);
+    const messages = await server.api.json("GET", `/api/session/${sessionID}/message`);
+    const scripted = findScriptedTool(messages.body, "list_worktrees");
+    drive.close();
+    result.listStatus = scripted?.status;
+    result.listOutput = scripted?.output;
+    result.notes.push(
+      `scripted list_worktrees -> ${scripted?.status ?? "not found"}` +
+        `${scripted?.output ? `: ${scripted.output.slice(0, 200)}` : ""}`,
+    );
+
+    // The inventory facts the tool's answer must agree with.
+    const rows = await inventoryRows(server);
+    result.inventoryCowRows = rows.filter((entry) =>
+      (LIST_NAMES as readonly string[]).includes(basename(entry.directory)),
+    );
+    result.notes.push(`inventory rows for the scenario names: ${JSON.stringify(result.inventoryCowRows)}`);
+    return result;
+  } finally {
+    await server.stop();
+    await removePath(config.root);
+  }
+}

@@ -143,6 +143,7 @@ export interface FallbackResult {
   simulationFallbackGit?: unknown;
   simulationFallbackNone?: unknown;
   attach?: unknown;
+  list?: unknown;
   readonly notes: string[];
 }
 

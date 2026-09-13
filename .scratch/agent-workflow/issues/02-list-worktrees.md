@@ -12,8 +12,8 @@ files).
 
 **Status:** ready-for-agent
 
-- [ ] Tool lists only `cow`-strategy worktrees with the four fields
-- [ ] Empty inventory → empty list result, no error
-- [ ] Unit-covered to the repo gate (100% lines + functions)
-- [ ] e2e harness scenario lists created worktrees on a live server
-- [ ] README documents the tool
+- [x] Tool lists only `cow`-strategy worktrees with the four fields
+- [x] Empty inventory → empty list result, no error
+- [x] Unit-covered to the repo gate (100% lines + functions)
+- [x] e2e harness scenario lists created worktrees on a live server
+- [x] README documents the tool
