@@ -238,7 +238,7 @@ Strategy became the Location default. Note `GET /api/plugin` returns
 - `"git"` — when the source filesystem cannot do a CoW clone, `spawn_workspace`
   may request opencode2's built-in `git` strategy and report `mechanism: "git"`.
 
-Any other value throws when the tool runs, rather than silently degrading.
+Any other value fails the plugin load at setup, rather than silently degrading.
 
 `options.targetRoot` controls where the tool places the Worktree. It is the
 **parent** directory opencode2 creates the worktree under:
@@ -249,8 +249,8 @@ Any other value throws when the tool runs, rather than silently degrading.
   a `cow` call fails naming the mismatch; the `git` fallback is unaffected
   because a Shallow worktree shares no extents.
 
-Any other value throws when the tool runs, rather than silently relocating every
-clone.
+Any other value fails the plugin load at setup, rather than silently relocating
+every clone.
 
 ### Post-create hooks
 

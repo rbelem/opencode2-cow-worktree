@@ -4,7 +4,11 @@ import { probeCowCapability } from "./capability";
 import { fallbackPolicy, postCreateHooks, targetRoot } from "./config";
 import { deviceOf, isDirectory } from "./device";
 import { listCowWorktrees, spawnWorkspace } from "./tool";
-import type { SpawnWorkspaceDeps, SpawnWorkspaceInput } from "./tool";
+import type {
+  FallbackPolicy,
+  SpawnWorkspaceDeps,
+  SpawnWorkspaceInput,
+} from "./tool";
 import { createCowStrategy } from "./strategy";
 
 /**
@@ -120,14 +124,19 @@ const listWorktreesOutput = {
  * the layer that owns the strategy choice, so the capability probe and the
  * worktree/session APIs meet here and nowhere else.
  *
- * The fallback policy and the Worktree target root are read from the plugin's
- * configured options. The fallback defaults to `"none"`: a request for `cow` is
- * a statement about what the caller gets, so the tool never produces a Shallow
- * worktree unless the opt-in was set. The target root defaults to unset, which
- * makes the tool place the Worktree beside the source — the same-filesystem
- * parent a CoW clone requires.
+ * The fallback policy and the Worktree target root arrive already validated —
+ * `setup` read them from the plugin's options once and passes the values in.
+ * The fallback defaults to `"none"`: a request for `cow` is a statement about
+ * what the caller gets, so the tool never produces a Shallow worktree unless
+ * the opt-in was set. The target root defaults to unset, which makes the tool
+ * place the Worktree beside the source — the same-filesystem parent a CoW
+ * clone requires.
  */
-function liveDeps(ctx: Context): SpawnWorkspaceDeps {
+function liveDeps(
+  ctx: Context,
+  fallback: FallbackPolicy,
+  worktreeRoot: string | undefined,
+): SpawnWorkspaceDeps {
   return {
     probe: probeCowCapability,
     probeDevice: deviceOf,
@@ -146,8 +155,8 @@ function liveDeps(ctx: Context): SpawnWorkspaceDeps {
     },
     removeWorktree: (directory) =>
       ctx.worktree.remove({ directory, force: true }),
-    fallback: fallbackPolicy(ctx.options),
-    targetRoot: targetRoot(ctx.options),
+    fallback,
+    targetRoot: worktreeRoot,
   };
 }
 
@@ -163,14 +172,16 @@ function liveDeps(ctx: Context): SpawnWorkspaceDeps {
 export default {
   id: "opencode2-cow-worktree",
   async setup(ctx: Context): Promise<void> {
-    // Validated here, before anything is registered: a misconfigured hook list
-    // must fail the plugin load, not surface halfway through a create. The
-    // factory closes over the validated commands — the setup-ordering contract
-    // ("validate before register") holds by construction, with no module-level
-    // hook state to install.
-    const strategy = createCowStrategy({ postCreate: postCreateHooks(ctx.options) });
+    // Every plugin option is validated exactly once, here, before anything is
+    // registered: a misconfiguration must fail the plugin load, not surface
+    // inside the first tool call or halfway through a create. The validated
+    // values close over into the strategy and the tool bindings below, so
+    // the tool path never re-reads — or re-throws on — `ctx.options`.
+    const hooks = postCreateHooks(ctx.options);
+    const fallback = fallbackPolicy(ctx.options);
+    const worktreeRoot = targetRoot(ctx.options);
     await ctx.worktree.transform((editor) => {
-      editor.add(strategy);
+      editor.add(createCowStrategy({ postCreate: hooks }));
     });
     // `?.`: the installed plugin package is a v1 build whose Context has no
     // tool domain; the v2 binary always provides it. Optional chaining keeps
@@ -189,7 +200,7 @@ export default {
         // on the provider's native tool list.
         options: { codemode: false },
         execute: async (input: SpawnWorkspaceInput) => {
-          const result = await spawnWorkspace(input, liveDeps(ctx));
+          const result = await spawnWorkspace(input, liveDeps(ctx, fallback, worktreeRoot));
           // The text is what tells attach from create: on attach `mechanism`
           // reports the found directory's mechanism, and the caller must never
           // read that as a fresh clone having happened.
@@ -218,9 +229,10 @@ export default {
         options: { codemode: false },
         execute: async () => {
           const worktrees = await listCowWorktrees({
-            // Own minimal deps, not liveDeps: building spawn_workspace's deps
-            // would validate the clone options (`fallback`, `targetRoot`) and
-            // make a misconfigured clone setting fail this read-only call.
+            // Own minimal deps, not liveDeps: this read-only call touches only
+            // the inventory and one stat per row, none of spawn_workspace's
+            // other seams. (Option validation happens once in setup, so there
+            // is no validation side effect to dodge either way.)
             listWorktrees: () => ctx.worktree.list(),
             statEntry: stat,
           });

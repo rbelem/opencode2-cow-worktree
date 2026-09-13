@@ -1187,14 +1187,9 @@ test("the registered list_worktrees tool reports an empty list without an error"
   expect(result.content).toBe("0 cow worktree(s)\n[]");
 });
 
-test("list_worktrees ignores clone options that spawn_workspace would reject", async () => {
-  // The list tool binds its own minimal deps, not spawn_workspace's: a
-  // misconfigured `fallback`/`targetRoot` — which the clone path validates —
-  // must not fail this read-only call.
-  const result = await registeredListTool([], { fallback: "bogus", targetRoot: 42 });
-  expect(result.output).toEqual({ worktrees: [] });
-  expect(result.content).toBe("0 cow worktree(s)\n[]");
-});
+// (The old "list_worktrees ignores clone options" pin is gone with the lazy
+// validation it described: a misconfigured option now fails setup before any
+// tool exists — pinned in test/plugin-fallback.test.ts.)
 
 test("the registered list_worktrees tool fails loudly on an unreadable inventory row", async () => {
   const dir = await mkdtemp(join(tmpdir(), "cow-list-"));
