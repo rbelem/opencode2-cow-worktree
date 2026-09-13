@@ -8,6 +8,7 @@ import type { CowCapability } from "../src/capability";
 import type { Mechanism } from "../src/mechanism";
 import { deviceOf, isDirectory, listCowWorktrees, nearestExistingDevice, spawnWorkspace } from "../src/tool";
 import type { ListWorktreesDeps, SpawnWorkspaceDeps } from "../src/tool";
+import { setPostCreateHooks } from "../src/strategy";
 import plugin from "../src/plugin";
 import { findCowRoot, findNonCowRoot } from "./fs-roots";
 
@@ -298,6 +299,33 @@ test("attach is decided before the capability probe: no clone question is asked"
 
   expect(result.attached).toBe(true);
   expect(calls.createWorktree).toEqual([]);
+});
+
+test("attach never runs the post-create hooks (ticket 05)", async () => {
+  // The hooks belong to the strategy's create flow; attach binds a session to
+  // a directory that already exists and clones nothing. The configured hook
+  // would fail the call loudly if it ran, so the attach succeeding is the
+  // proof it never did.
+  setPostCreateHooks(["exit 1"]);
+  try {
+    const target = "/wt/worker";
+    const { deps, calls } = fakeDeps(
+      { status: "supported" },
+      {
+        targetRoot: "/wt",
+        inventory: [{ directory: target, strategy: "cow" }],
+        directories: [target, join(target, ".git")],
+      },
+    );
+
+    const result = await spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, deps);
+
+    expect(result.attached).toBe(true);
+    expect(calls.createWorktree).toEqual([]);
+    expect(calls.removed).toEqual([]);
+  } finally {
+    setPostCreateHooks([]);
+  }
 });
 
 test("attach predicts the same sibling parent the create flow uses when no root is set", async () => {
