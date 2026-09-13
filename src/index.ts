@@ -2,8 +2,9 @@ export { cloneDirectory, reflinkFile } from "./clone";
 export { cloneFile, isDarwin, type CloneFile, type PlatformCheck } from "./platform";
 export { cloneFileOnDarwin, type CloneOutcome, type DarwinCloneSyscall } from "./platform-darwin";
 export { probeCowCapability, type CowCapability } from "./capability";
-export { cowStrategy } from "./strategy";
-export { spawnWorkspace, deviceOf, listCowWorktrees } from "./tool";
+export { cowStrategy, createCowStrategy } from "./strategy";
+export { deviceOf } from "./device";
+export { spawnWorkspace, listCowWorktrees } from "./tool";
 export { fallbackPolicy, postCreateHooks, targetRoot } from "./config";
 export type {
   FallbackPolicy,

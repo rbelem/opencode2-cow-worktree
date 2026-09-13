@@ -45,15 +45,23 @@ interface Harness {
 }
 
 /**
- * A fake Context whose worktree.create records the requested strategy and
- * returns a directory keyed to it, and whose options carry the fallback policy.
- * This is the smallest surface the registered tool's live bindings touch.
+ * Builds a fake Context that records everything setup and the tools touch.
+ * Split from `harness` so the misconfiguration pins can run `plugin.setup`
+ * themselves and assert the plugin load — and exactly what was registered.
  */
-async function harness(
+function recordCtx(
   options: Record<string, unknown> | undefined,
   harnessOptions: { readonly sessionCreateError?: Error } = {},
-): Promise<Harness> {
+): {
+  readonly ctx: Parameters<typeof plugin.setup>[0];
+  readonly recorded: Recorded;
+  readonly registeredToolNames: string[];
+  readonly addedStrategies: string[];
+  readonly spawnWorkspaceTool: () => RegisteredTool;
+} {
   const recorded: Recorded = { strategies: [], removed: [], parents: [] };
+  const registeredToolNames: string[] = [];
+  const addedStrategies: string[] = [];
   let registered: RegisteredTool | undefined;
 
   const ctx = {
@@ -68,7 +76,11 @@ async function harness(
         recorded.removed.push(input.directory);
       },
       transform: async (callback: (editor: { add: () => void }) => void) => {
-        callback({ add: () => {} });
+        callback({
+          add: () => {
+            addedStrategies.push("cow");
+          },
+        });
         return { dispose: async () => {} };
       },
     },
@@ -76,8 +88,9 @@ async function harness(
       transform: async (callback: (editor: { add: (tool: any) => void }) => void) => {
         callback({
           add: (tool: any) => {
-            // setup registers list_worktrees too; this harness drives
+            // setup registers list_worktrees too; the harness drives
             // spawn_workspace, so capture by name rather than by order.
+            registeredToolNames.push(tool.name);
             if (tool.name === "spawn_workspace") registered = tool as RegisteredTool;
           },
         });
@@ -94,10 +107,72 @@ async function harness(
     },
   } as unknown as Parameters<typeof plugin.setup>[0];
 
-  await plugin.setup(ctx);
-  if (registered === undefined) throw new Error("spawn_workspace was not registered");
-  return { tool: registered, recorded };
+  return {
+    ctx,
+    recorded,
+    registeredToolNames,
+    addedStrategies,
+    spawnWorkspaceTool: () => {
+      if (registered === undefined) throw new Error("spawn_workspace was not registered");
+      return registered;
+    },
+  };
 }
+
+async function harness(
+  options: Record<string, unknown> | undefined,
+  harnessOptions: { readonly sessionCreateError?: Error } = {},
+): Promise<Harness> {
+  const { ctx, recorded, spawnWorkspaceTool } = recordCtx(options, harnessOptions);
+  await plugin.setup(ctx);
+  return { tool: spawnWorkspaceTool(), recorded };
+}
+
+// Validation pins (ticket 11): every plugin option is checked once at setup,
+// so a misconfiguration fails the plugin load — before any tool exists to
+// call — instead of surfacing on the first tool invocation. No filesystem is
+// involved: validation runs before anything is registered.
+
+test("a misconfigured fallback fails setup, registering nothing", async () => {
+  const { ctx, recorded, registeredToolNames, addedStrategies } = recordCtx({
+    fallback: "bogus",
+  });
+
+  await expect(plugin.setup(ctx)).rejects.toThrow(
+    /invalid plugin option "fallback"/,
+  );
+  expect(addedStrategies).toEqual([]);
+  expect(registeredToolNames).toEqual([]);
+  expect(recorded.strategies).toEqual([]);
+});
+
+test("a misconfigured targetRoot fails setup, registering nothing", async () => {
+  const { ctx, recorded, registeredToolNames, addedStrategies } = recordCtx({
+    targetRoot: 42,
+  });
+
+  await expect(plugin.setup(ctx)).rejects.toThrow(
+    /invalid plugin option "targetRoot"/,
+  );
+  expect(addedStrategies).toEqual([]);
+  expect(registeredToolNames).toEqual([]);
+  expect(recorded.strategies).toEqual([]);
+});
+
+test("a valid configuration registers both tools and the strategy", async () => {
+  const { ctx, registeredToolNames, addedStrategies } = recordCtx({
+    fallback: "git",
+    targetRoot: "/mnt/worktrees",
+  });
+
+  await plugin.setup(ctx);
+
+  expect(addedStrategies).toEqual(["cow"]);
+  expect([...registeredToolNames].sort()).toEqual([
+    "list_worktrees",
+    "spawn_workspace",
+  ]);
+});
 
 test.skipIf(nonCowRoot === undefined)("fallback disabled: an unsupported filesystem fails and requests no git worktree", async () => {
   const dir = await scratchDir(nonCowRoot!);
@@ -136,14 +211,6 @@ test.skipIf(cowRoot === undefined)("fallback enabled does not change behavior on
   expect(recorded.strategies).toEqual(["cow"]);
 });
 
-test.skipIf(cowRoot === undefined)("an invalid fallback value fails the call loudly", async () => {
-  const dir = await scratchDir(cowRoot!);
-  const { tool, recorded } = await harness({ fallback: "bogus" });
-
-  await expect(tool.execute({ sourceDirectory: dir })).rejects.toThrow(/fallback/);
-  expect(recorded.strategies).toEqual([]);
-});
-
 test.skipIf(cowRoot === undefined)(
   "by default the tool asks opencode2 to parent the worktree beside the source",
   async () => {
@@ -167,17 +234,6 @@ test.skipIf(cowRoot === undefined)(
     await tool.execute({ sourceDirectory: dir, name: "worker" });
 
     expect(recorded.parents).toEqual(["/mnt/worktrees"]);
-  },
-);
-
-test.skipIf(cowRoot === undefined)(
-  "an invalid targetRoot fails the call loudly before any worktree is requested",
-  async () => {
-    const dir = await scratchDir(cowRoot!);
-    const { tool, recorded } = await harness({ targetRoot: 42 });
-
-    await expect(tool.execute({ sourceDirectory: dir })).rejects.toThrow(/targetRoot/);
-    expect(recorded.strategies).toEqual([]);
   },
 );
 

@@ -6,9 +6,14 @@ import { basename, join } from "node:path";
 import { probeCowCapability } from "../src/capability";
 import type { CowCapability } from "../src/capability";
 import type { Mechanism } from "../src/mechanism";
-import { deviceOf, isDirectory, listCowWorktrees, nearestExistingDevice, spawnWorkspace } from "../src/tool";
-import type { ListWorktreesDeps, SpawnWorkspaceDeps } from "../src/tool";
-import { setPostCreateHooks } from "../src/strategy";
+import { deviceOf, isDirectory, nearestExistingDevice } from "../src/device";
+import { listCowWorktrees, spawnWorkspace } from "../src/tool";
+import type {
+  CowWorktreeEntry,
+  ListWorktreesDeps,
+  SpawnWorkspaceDeps,
+  SpawnWorkspaceResult,
+} from "../src/tool";
 import plugin from "../src/plugin";
 import { findCowRoot, findNonCowRoot } from "./fs-roots";
 
@@ -301,31 +306,55 @@ test("attach is decided before the capability probe: no clone question is asked"
   expect(calls.createWorktree).toEqual([]);
 });
 
-test("attach never runs the post-create hooks (ticket 05)", async () => {
+test.skipIf(cowRoot === undefined)("attach never runs the post-create hooks (ticket 05)", async () => {
   // The hooks belong to the strategy's create flow; attach binds a session to
-  // a directory that already exists and clones nothing. The configured hook
-  // would fail the call loudly if it ran, so the attach succeeding is the
-  // proof it never did.
-  setPostCreateHooks(["exit 1"]);
-  try {
-    const target = "/wt/worker";
-    const { deps, calls } = fakeDeps(
-      { status: "supported" },
-      {
-        targetRoot: "/wt",
-        inventory: [{ directory: target, strategy: "cow" }],
-        directories: [target, join(target, ".git")],
+  // a directory that already exists and clones nothing. The plugin wires a
+  // hook that would fail any create (`exit 1`), and the worktree seam is
+  // poisoned to reject any create request — attach succeeding through the
+  // registered tool is the proof the hooks never ran.
+  const registered: Array<{
+    name: string;
+    execute: (input: { sourceDirectory: string; name?: string }) => Promise<{
+      output: { attached?: boolean };
+    }>;
+  }> = [];
+  const dir = await scratchDir();
+  const target = join(dir, "..", "att-hooks");
+  scratchDirs.push(target);
+  await mkdir(join(target, ".git"), { recursive: true });
+
+  const ctx = {
+    options: { hooks: { postCreate: ["exit 1"] } },
+    worktree: {
+      transform: async (callback: (editor: unknown) => void) => {
+        callback({ add: () => {} });
+        return { dispose: async () => {} };
       },
-    );
+      list: async () => [{ directory: target, strategy: "cow" }],
+      create: async () => {
+        throw new Error("attach must never request a create");
+      },
+      remove: async () => {},
+    },
+    tool: {
+      transform: async (callback: (editor: { add: (tool: any) => void }) => void) => {
+        callback({
+          add: (tool: any) => {
+            if (tool.name === "spawn_workspace") registered.push(tool);
+          },
+        });
+        return { dispose: async () => {} };
+      },
+    },
+    session: { create: async () => ({ id: "ses_attach" }) },
+  } as unknown as Parameters<typeof plugin.setup>[0];
 
-    const result = await spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, deps);
+  await plugin.setup(ctx);
+  const tool = registered.find((entry) => entry.name === "spawn_workspace");
+  expect(tool).toBeDefined();
 
-    expect(result.attached).toBe(true);
-    expect(calls.createWorktree).toEqual([]);
-    expect(calls.removed).toEqual([]);
-  } finally {
-    setPostCreateHooks([]);
-  }
+  const result = await tool!.execute({ sourceDirectory: dir, name: "att-hooks" });
+  expect(result.output.attached).toBe(true);
 });
 
 test("attach predicts the same sibling parent the create flow uses when no root is set", async () => {
@@ -799,6 +828,91 @@ test("the registered tool declares the output schema it returns", async () => {
   ]);
 });
 
+// ---------------------------------------------------------------------------
+// Output-contract drift pins (ticket 10).
+//
+// The tool output schemas in src/plugin.ts are hand-maintained: the v1
+// package constraint forbids generating a JSON Schema from a TS type at
+// runtime. Nothing structural stops the schema and the result types from
+// drifting apart, so these pins hold each schema's `properties` and
+// `required` against a canonical value of the type it declares.
+// ---------------------------------------------------------------------------
+
+/** Reads the object-schema slice of a registered tool's declared output. */
+function schemaOf(output: unknown): {
+  properties: Record<string, unknown>;
+  required: readonly string[];
+} {
+  const schema = output as {
+    properties: Record<string, unknown>;
+    required: readonly string[];
+  };
+  expect(schema.properties).toBeInstanceOf(Object);
+  expect(Array.isArray(schema.required)).toBe(true);
+  return schema;
+}
+
+/** Registers both tools against a minimal fake ctx and returns their outputs. */
+async function registeredOutputs(): Promise<Map<string, unknown>> {
+  const registered: Array<{ name: string; output?: unknown }> = [];
+  const ctx = {
+    worktree: {
+      transform: async (callback: (editor: unknown) => void) => {
+        callback({ add: () => {} });
+        return { dispose: async () => {} };
+      },
+    },
+    tool: {
+      transform: async (callback: (editor: { add: (tool: any) => void }) => void) => {
+        callback({
+          add: (tool: any) => {
+            registered.push(tool);
+          },
+        });
+        return { dispose: async () => {} };
+      },
+    },
+  } as unknown as Parameters<typeof plugin.setup>[0];
+
+  await plugin.setup(ctx);
+  return new Map(registered.map((tool) => [tool.name, tool.output]));
+}
+
+test("spawn_workspace's output schema is pinned to SpawnWorkspaceResult's keys", async () => {
+  const outputs = await registeredOutputs();
+  const schema = schemaOf(outputs.get("spawn_workspace"));
+
+  // The create result's keys are exactly the schema's `required`, and the
+  // attach result's keys — `attached` is the optional attach marker — are
+  // exactly the schema's `properties`.
+  const created: SpawnWorkspaceResult = {
+    sessionID: "ses_x",
+    directory: "/wt/x",
+    mechanism: "cow",
+  };
+  const attached: SpawnWorkspaceResult = { ...created, attached: true };
+  expect(Object.keys(schema.properties).sort()).toEqual(Object.keys(attached).sort());
+  expect([...schema.required].sort()).toEqual(Object.keys(created).sort());
+});
+
+test("list_worktrees's entry schema is pinned to CowWorktreeEntry's keys", async () => {
+  const outputs = await registeredOutputs();
+  const entrySchema = schemaOf(
+    (schemaOf(outputs.get("list_worktrees")).properties.worktrees as {
+      items: unknown;
+    }).items,
+  );
+
+  const entry: CowWorktreeEntry = {
+    name: "worker",
+    directory: "/wt/worker",
+    strategy: "cow",
+    createdAt: new Date(0).toISOString(),
+  };
+  expect(Object.keys(entrySchema.properties).sort()).toEqual(Object.keys(entry).sort());
+  expect([...entrySchema.required].sort()).toEqual(Object.keys(entry).sort());
+});
+
 // The attach path through the live ctx bindings: the tool must read the
 // inventory through ctx.worktree.list, check the real filesystem, start the
 // session in the found directory, and say "Attached" rather than "Created".
@@ -1073,14 +1187,9 @@ test("the registered list_worktrees tool reports an empty list without an error"
   expect(result.content).toBe("0 cow worktree(s)\n[]");
 });
 
-test("list_worktrees ignores clone options that spawn_workspace would reject", async () => {
-  // The list tool binds its own minimal deps, not spawn_workspace's: a
-  // misconfigured `fallback`/`targetRoot` — which the clone path validates —
-  // must not fail this read-only call.
-  const result = await registeredListTool([], { fallback: "bogus", targetRoot: 42 });
-  expect(result.output).toEqual({ worktrees: [] });
-  expect(result.content).toBe("0 cow worktree(s)\n[]");
-});
+// (The old "list_worktrees ignores clone options" pin is gone with the lazy
+// validation it described: a misconfigured option now fails setup before any
+// tool exists — pinned in test/plugin-fallback.test.ts.)
 
 test("the registered list_worktrees tool fails loudly on an unreadable inventory row", async () => {
   const dir = await mkdtemp(join(tmpdir(), "cow-list-"));

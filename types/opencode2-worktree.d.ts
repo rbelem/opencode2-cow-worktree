@@ -150,6 +150,13 @@ export interface WorktreeDomain {
      * `Worktree.CreateInput.directory` — the **parent** directory for the new
      * worktree, not the worktree path. opencode2 appends the name. Unset
      * defaults to the server's data directory.
+     *
+     * Assembly contract (pinned upstream fact): opencode2 assembles the
+     * worktree directory as `<parent>/<name>` verbatim — no sanitization, no
+     * suffixing. Both halves of `spawn_workspace` rely on this: the create
+     * flow hands over exactly this parent (`predictedParent` in src/tool.ts),
+     * and attach predicts `<parent>/<name>` as the path an earlier create
+     * under the same input would have produced.
      */
     readonly directory?: string;
   }) => Promise<WorktreeResult>;

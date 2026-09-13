@@ -1,5 +1,6 @@
-import { realpath, stat } from "node:fs/promises";
-import { basename, dirname, join, resolve } from "node:path";
+import { realpath } from "node:fs/promises";
+import { basename, join, resolve } from "node:path";
+import { assertSameDevice } from "./device";
 import type { CowCapability } from "./capability";
 import type { Mechanism } from "./mechanism";
 import type { WorktreeInventoryEntry } from "../types/opencode2-worktree";
@@ -142,7 +143,7 @@ export async function spawnWorkspace(
       ? "cow"
       : selectFallback(deps.fallback ?? "none", input.sourceDirectory);
 
-  const parent = deps.targetRoot ?? join(input.sourceDirectory, "..");
+  const parent = predictedParent(input, deps);
   await verifySameDevice(input.sourceDirectory, parent, mechanism, deps.probeDevice);
 
   const worktree = await deps.createWorktree({
@@ -203,44 +204,9 @@ function selectFallback(policy: FallbackPolicy, sourceDirectory: string): Mechan
 }
 
 /**
- * The device a path's filesystem belongs to, or `undefined` when it cannot be
- * read (a path that does not exist yet, or a permission failure).
- */
-export async function deviceOf(path: string): Promise<number | undefined> {
-  try {
-    const stats = await stat(path);
-    return stats.dev;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * The actionable `cow` failure for a clone whose target sits on a different
- * filesystem than its source. A reflink cannot cross a device boundary, so the
- * remedy is always to move the target — never to fall back silently.
- *
- * Shared by the tool's pre-create guard and the strategy's own pre-flight so
- * the two name the same cause and the same fix.
- */
-export function crossDeviceError(source: string, target: string): Error {
-  return new Error(
-    `cow cannot clone ${source} into ${target}: the target is on a different ` +
-      "filesystem and a reflink cannot cross devices. Point opencode2's " +
-      "`worktree.directory` config or the `targetRoot` plugin option (opencode.json) " +
-      "at a directory on the source's filesystem.",
-  );
-}
-
-/**
- * Rejects a `cow` clone whose target device differs from the source's. Throws
- * before any directory is created; an unreadable device on either side is not a
- * mismatch, so an unknown device proceeds rather than fabricating a failure.
- *
- * The caller passes a path whose device decides the clone: the tool's worktree
- * **parent** (opencode2 appends the name under it) or the strategy's resolved
- * target parent. The strategy resolves a not-yet-created target to its nearest
- * existing ancestor first, then calls `assertSameDevice`.
+ * The `cow` half of the device policy: it checks both sides through the
+ * injected `probeDevice` seam and applies the shared `assertSameDevice` rule.
+ * The primitives live in `./device`; only the decision lives here.
  */
 export async function verifyCowSameDevice(input: {
   readonly source: string;
@@ -255,56 +221,18 @@ export async function verifyCowSameDevice(input: {
 }
 
 /**
- * The one cross-device rule: a `cow` clone may cross no device boundary.
- * `undefined` on either side is unknown, not a mismatch.
+ * The parent directory a worktree of this input is assembled under: the
+ * configured target root, or a sibling of the source. The create flow passes
+ * it to opencode2 as `Worktree.CreateInput.directory`, and attach predicts
+ * `<parent>/<name>` under it — one helper so both halves of the tool assemble
+ * the parent identically. See the assembly contract pinned in
+ * `types/opencode2-worktree.d.ts`.
  */
-export function assertSameDevice(
-  source: string,
-  sourceDevice: number | undefined,
-  target: string,
-  targetDevice: number | undefined,
-): void {
-  if (
-    sourceDevice === undefined ||
-    targetDevice === undefined ||
-    sourceDevice === targetDevice
-  ) {
-    return;
-  }
-  throw crossDeviceError(source, target);
-}
-
-/**
- * Resolves a target that may not exist yet to the first ancestor whose device
- * can be read, so the strategy's pre-flight checks the filesystem the target
- * will actually land on. The root's parent is itself, so the walk terminates;
- * a fully unreadable chain returns `undefined` and the pre-flight proceeds.
- */
-export async function nearestExistingDevice(
-  path: string,
-  probeDevice: (path: string) => Promise<number | undefined>,
-): Promise<number | undefined> {
-  let current = path;
-  for (;;) {
-    const device = await probeDevice(current);
-    if (device !== undefined) return device;
-    const parent = dirname(current);
-    if (parent === current) return undefined;
-    current = parent;
-  }
-}
-
-/**
- * Whether a path exists and is a directory. The live binding for the tool's
- * `isDirectory` seam, alongside `deviceOf`: a path occupied by a file and a
- * path that is not there at all are the same answer — no existing Worktree.
- */
-export async function isDirectory(path: string): Promise<boolean> {
-  try {
-    return (await stat(path)).isDirectory();
-  } catch {
-    return false;
-  }
+function predictedParent(
+  input: SpawnWorkspaceInput,
+  deps: SpawnWorkspaceDeps,
+): string {
+  return deps.targetRoot ?? join(input.sourceDirectory, "..");
 }
 
 /**
@@ -339,8 +267,7 @@ async function tryAttach(
   sourceDirectory: string,
   deps: SpawnWorkspaceDeps,
 ): Promise<SpawnWorkspaceResult | undefined> {
-  const parent = deps.targetRoot ?? join(sourceDirectory, "..");
-  const target = join(parent, name);
+  const target = join(predictedParent({ sourceDirectory }, deps), name);
   if (!(await deps.isDirectory(target))) return undefined;
   // TOCTOU by construction: the existence check, inventory read, and Deep-clone check are separate reads, and every interleaving fails closed.
   return attachToExisting(name, target, deps);
@@ -361,7 +288,7 @@ async function attachToExisting(
   target: string,
   deps: SpawnWorkspaceDeps,
 ): Promise<SpawnWorkspaceResult> {
-  const entry = await inventoryEntryFor(deps, target);
+  const entry = await inventoryEntryFor(await deps.listWorktrees(), target);
   if (entry === undefined) throw foreignWorktreeError(target);
   if (entry.strategy !== "cow") {
     throw foreignStrategyError(target, entry.strategy);
@@ -390,12 +317,16 @@ async function attachToExisting(
  * `realpath` when both resolve, lexical normalization when it cannot. A
  * comparison that establishes no identity leaves the entry unfound, so an
  * unknown path still refuses as Foreign.
+ *
+ * Exported as the one directory-identity matcher: the TUI badge
+ * (`strategy-badge.ts`) asks the same question of the same inventory rows, and
+ * a badge that matched by exact string only would go dark for a symlinked
+ * location the tool happily attaches to.
  */
-async function inventoryEntryFor(
-  deps: SpawnWorkspaceDeps,
+export async function inventoryEntryFor(
+  entries: readonly WorktreeInventoryEntry[],
   directory: string,
 ): Promise<WorktreeInventoryEntry | undefined> {
-  const entries = await deps.listWorktrees();
   const leaf = basename(directory);
   const candidates = entries.filter((entry) => basename(entry.directory) === leaf);
   for (const candidate of candidates) {
