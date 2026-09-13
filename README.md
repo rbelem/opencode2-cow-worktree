@@ -118,6 +118,18 @@ surfacing a bare `EXDEV`. If a Worktree is created but the session
 cannot start, the tool removes that Worktree before the error propagates. See
 `docs/adr/0001`.
 
+**Attach.** When a `spawn_workspace` call names a Worktree whose predicted
+directory already exists, the tool attaches instead of cloning: it starts a
+**new** session bound to the existing directory and reports
+`attached: true` with the text "Attached to existing cow worktree …". Attach is
+offered only for Worktrees this strategy materialized — opencode2's inventory
+must record the directory with `strategy: "cow"` (no plugin-owned registry; ADR
+0003) and the directory must carry the Deep-clone signature (`.git` is a
+directory). Anything else already at that name is refused loudly before any
+session starts and with no filesystem change: a `git`-strategy Worktree, a path
+the inventory does not know (a Foreign worktree), or a `cow` row that lost its
+Deep-clone shape.
+
 ## Install and configure
 
 The package is `private: true` and unpublished, so there is no `npm install`

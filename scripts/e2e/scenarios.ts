@@ -142,6 +142,7 @@ export interface FallbackResult {
   spawnSimulation?: unknown;
   simulationFallbackGit?: unknown;
   simulationFallbackNone?: unknown;
+  attach?: unknown;
   readonly notes: string[];
 }
 

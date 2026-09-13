@@ -29,7 +29,7 @@ import {
   runNonCowServer,
   type WorktreeRun,
 } from "./scenarios";
-import { runSimulationScenario } from "./simulation";
+import { runSimulationScenario, runAttachScenario } from "./simulation";
 import { writeRunLog } from "./runlog";
 import { makeConfigRoot, makeSourceProject, installPlugin, declarePlugin, removePath } from "./lib";
 
@@ -167,6 +167,33 @@ async function main(): Promise<number> {
     fallback.spawnSimulation = spawnScenario;
     fallback.simulationFallbackGit = fallbackGit;
     fallback.simulationFallbackNone = fallbackNone;
+
+    // Issue #1: attach. Two real sessions invoke spawn_workspace with the same
+    // name against one server; the second must attach to the existing worktree
+    // instead of materializing another directory.
+    const attach = await runAttachScenario({ port: PORT + 7 });
+    assertions.check(
+      "attach: first spawn_workspace created the worktree",
+      attach.firstStatus === "completed",
+      `${attach.firstStatus} ${attach.firstOutput ?? ""}`,
+    );
+    assertions.check(
+      "attach: first create left exactly one inventory row for the name",
+      attach.worktreeDirectory !== undefined,
+      String(attach.worktreeDirectory),
+    );
+    assertions.check(
+      "attach: second spawn_workspace reported an attach",
+      (attach.secondOutput ?? "").includes("Attached to existing"),
+      `${attach.secondStatus} ${attach.secondOutput ?? ""}`,
+    );
+    assertions.check(
+      "attach: the second call materialized no second directory",
+      attach.inventoryCount === 1,
+      String(attach.inventoryCount),
+    );
+    fallback.notes.push(...attach.notes.map((note) => `attach: ${note}`));
+    fallback.attach = attach;
 
     await writeRunLog({ config, source, server, runtime, runs, assertions, fallback, version: serverVersion() });
 

@@ -19,14 +19,11 @@
  * `strategy-badge.ts`), and the APFS verification tooling under
  * `scripts/verify-apfs/`.
  *
- * One line in the gated set is excluded rather than covered. No hittable line
- * is ever excluded on convenience: the only entry below is a Bun lcov artifact,
- * established by an isolated reproduction — for a `for (;;)` whose every exit
- * is a `return`, Bun reports the loop's trailing brace as a line and marks it
- * unreachable, which it is, because control can never fall out of the loop.
- * Excluding it is the only way to gate a file containing an unconditional
- * `for (;;)`; the alternative is to rewrite production code to suit the
- * measurement.
+ * Lines are checked; a per-file exclusion list (NOT_HITTABLE below) may excuse
+ * a line that provably cannot be hit. No hittable line is ever excluded on
+ * convenience: an entry there is a Bun lcov artifact, established by an
+ * isolated reproduction, and the gate itself deletes any entry that starts
+ * reporting hits.
  *
  * Functions are checked as well as lines, but Bun's per-function counting is
  * itself unreliable, so a file may declare how many of its reported functions
@@ -84,14 +81,15 @@ const NOT_GATED = new Set(["scripts/verify-apfs/verify-apfs.ts"]);
 /**
  * Gated lines Bun's lcov reports as unreachable that provably cannot be hit.
  * Keyed `relative/path.ts:line`. Keep tiny and justified.
+ *
+ * Empty since the attach work (.scratch ticket 01): it held the closing brace of
+ * `nearestExistingDevice`'s `for (;;)` (an unconditional loop whose only exits
+ * are `return`s), which Bun used to mark unreachable. The same construct now
+ * reports a hit under the current binary, so per this gate's own rule the
+ * entry was deleted instead of being re-pinned. If the artifact returns, the
+ * gate will name the line again.
  */
-const NOT_HITTABLE = new Set([
-  // The closing brace of `nearestExistingDevice`'s `for (;;)`, whose only two
-  // exits are `return`s inside the loop (src/tool.ts:244,246). Reproduced in
-  // isolation: Bun marks the brace of any unconditional `for (;;)` as a
-  // separate line that no run can reach.
-  "src/tool.ts:248",
-]);
+const NOT_HITTABLE = new Set<string>([]);
 
 const GATED_GLOBS = [
   "src/**/*.ts",

@@ -104,6 +104,18 @@ export interface WorktreeEntry {
   readonly type: "root" | "worktree";
 }
 
+/**
+ * A worktree inventory entry as `ctx.worktree.list()` returns it — upstream's
+ * `Worktree.Info` (packages/schema/src/worktree.ts): the directory and the id
+ * of the strategy that produced it. The checkout root is listed with no
+ * strategy. Verified against upstream 2.0.2 (`packages/core/src/worktree.ts`
+ * `ops.list`, served by `GET /api/worktree`).
+ */
+export interface WorktreeInventoryEntry {
+  readonly directory: string;
+  readonly strategy?: string;
+}
+
 export interface WorktreeResult {
   readonly directory: string;
 }
@@ -145,6 +157,17 @@ export interface WorktreeDomain {
     readonly directory: string;
     readonly force: boolean;
   }) => Promise<void>;
+  /**
+   * The Worktree inventory for the current location — one
+   * `WorktreeInventoryEntry` per directory opencode2 has a record of. Verified
+   * against upstream 2.0.2 (`ops.list`): a bare call is answered with the
+   * location's entries. The listing reconciles as it reads — rows whose
+   * directory no longer exists are pruned — so an entry here means the
+   * directory is really there.
+   */
+  readonly list: (input?: {
+    readonly location?: { readonly directory?: string };
+  }) => Promise<readonly WorktreeInventoryEntry[]>;
   readonly transform: (
     callback: (editor: WorktreeEditor) => void,
   ) => Promise<{ dispose(): Promise<void> }>;

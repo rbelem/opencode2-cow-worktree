@@ -17,7 +17,7 @@
  * observed facts rather than an expectation that does not hold.
  */
 import { mkdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { driveModel, type DriveController } from "./drive";
 import { installPlugin, makeConfigRoot, removePath, git } from "./lib";
 import type { Server } from "./server";
@@ -229,4 +229,144 @@ function findScriptedTool(body: unknown, name: string): ScriptedTool | undefined
     }
   }
   return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Attach (issue #1)
+//
+// Two real sessions invoke `spawn_workspace` with the same name against ONE
+// server. The first must create the worktree; the second must attach to it —
+// the tool's own text says so, and the inventory must still list exactly one
+// directory for that name. Everything below the drive controller is production
+// code: the session loop, the tool registry, the plugin's tool execution, and
+// opencode2's real worktree inventory.
+// ---------------------------------------------------------------------------
+
+export interface AttachResult {
+  readonly notes: string[];
+  /** The directory the first round produced, as the inventory records it. */
+  worktreeDirectory?: string;
+  firstStatus?: string;
+  firstOutput?: string;
+  secondStatus?: string;
+  secondOutput?: string;
+  /** How many inventory rows carry the scenario's worktree name after round 2. */
+  inventoryCount?: number;
+}
+
+/** The scripted name both rounds ask for. */
+const ATTACH_NAME = "att";
+
+/**
+ * The attach scenario: one server, two scripted `spawn_workspace` calls with
+ * the same name, one inventory.
+ *
+ * The scenario's source lives in the config root (a CoW filesystem), so the
+ * worktree lands beside it as a sibling — the tool's default parent — and the
+ * Deep-clone signature the attach check requires (`.git` as a directory) is
+ * produced by the real first create.
+ */
+export async function runAttachScenario(options: {
+  readonly port: number;
+}): Promise<AttachResult> {
+  const result: AttachResult = { notes: [] };
+  const config = await makeConfigRoot();
+  config.env.OPENCODE_SIMULATE = "1";
+  config.env.OPENCODE_DRIVE = "1";
+  const pluginDir = await installPlugin(join(config.root, "plugin"));
+  await mergeSimulationConfig(config.config, [{ package: pluginDir, options: {} }]);
+
+  const source = join(config.root, "source");
+  await mkdir(source, { recursive: true });
+  await writeFile(join(source, "tracked.txt"), "attach source\n");
+  git(source, "init", "-q");
+  git(source, "config", "user.email", "e2e@example.com");
+  git(source, "config", "user.name", "e2e");
+  git(source, "add", "-A");
+  git(source, "commit", "-qm", "attach source");
+
+  const { startServer } = await import("./server");
+  const server = await startServer(config, { port: options.port, location: source });
+  try {
+    const endpoint = driveEndpoint(server);
+    result.notes.push(`drive backend websocket: ${endpoint}`);
+
+    // Round 1: the named worktree does not exist yet, so the tool creates it.
+    const first = await runScriptedRound({ server, endpoint, source, round: 1, notes: result.notes });
+    result.firstStatus = first.status;
+    result.firstOutput = first.output;
+    const rows = await inventoryRows(server);
+    result.notes.push(`inventory after round 1: ${JSON.stringify(rows)}`);
+    result.worktreeDirectory = rows.find(
+      (entry) => basename(entry.directory) === ATTACH_NAME,
+    )?.directory;
+
+    // Round 2: the same name. The tool must attach — its text says so — and
+    // the inventory must not grow a second row for the name.
+    const second = await runScriptedRound({ server, endpoint, source, round: 2, notes: result.notes });
+    result.secondStatus = second.status;
+    result.secondOutput = second.output;
+    result.inventoryCount = (await inventoryRows(server)).filter(
+      (entry) => basename(entry.directory) === ATTACH_NAME,
+    ).length;
+    result.notes.push(`inventory after round 2: ${result.inventoryCount} row(s) named "${ATTACH_NAME}"`);
+    return result;
+  } finally {
+    await server.stop();
+    await removePath(config.root);
+  }
+}
+
+/**
+ * One scripted session against a running simulation server: attach a fresh
+ * drive controller, open a session, prompt it, and read the scripted tool call
+ * back out of the transcript. Each round gets its own controller because each
+ * answers exactly its own `llm.request` sequence.
+ */
+async function runScriptedRound(args: {
+  readonly server: Server;
+  readonly endpoint: string;
+  readonly source: string;
+  readonly round: number;
+  readonly notes: string[];
+}): Promise<{ status?: string; output?: string }> {
+  const drive = await driveModel(args.endpoint, [
+    {
+      kind: "tool-call",
+      name: "spawn_workspace",
+      input: resolveScriptedInput({ name: ATTACH_NAME }, args.source),
+    },
+    { kind: "text", text: "done" },
+  ]);
+  const session = await args.server.api.json("POST", "/api/session", {
+    title: `attach-${args.round}`,
+    location: { directory: args.source },
+    model: { providerID: "sim", id: "sim" },
+  });
+  const sessionID = (session.body as { data?: { id?: string } }).data?.id;
+  args.notes.push(`round ${args.round}: session create -> ${session.status} ${sessionID ?? session.text.slice(0, 120)}`);
+
+  const prompted = await args.server.api.json("POST", `/api/session/${sessionID}/prompt`, {
+    text: "Create a worktree.",
+    model: { providerID: "sim", id: "sim" },
+  });
+  args.notes.push(`round ${args.round}: prompt -> ${prompted.status}`);
+
+  await Promise.race([drive.done, Bun.sleep(20_000).then(() => undefined)]);
+  await Bun.sleep(750);
+  const messages = await args.server.api.json("GET", `/api/session/${sessionID}/message`);
+  const scripted = findScriptedTool(messages.body, "spawn_workspace");
+  drive.close();
+  args.notes.push(
+    `round ${args.round}: scripted spawn_workspace -> ${scripted?.status ?? "not found"}` +
+      `${scripted?.output ? `: ${scripted.output.slice(0, 200)}` : ""}`,
+  );
+  return { status: scripted?.status, output: scripted?.output };
+}
+
+/** `GET /api/worktree` returns a bare array here (observed), not `{data}`. */
+async function inventoryRows(server: Server): Promise<Array<{ directory: string; strategy?: string }>> {
+  const listed = await server.api.json("GET", "/api/worktree");
+  if (Array.isArray(listed.body)) return listed.body as Array<{ directory: string; strategy?: string }>;
+  return (listed.body as { data?: Array<{ directory: string; strategy?: string }> }).data ?? [];
 }

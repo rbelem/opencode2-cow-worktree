@@ -1,7 +1,7 @@
 import type { Context } from "@opencode-ai/plugin";
 import { probeCowCapability } from "./capability";
 import { fallbackPolicy, targetRoot } from "./config";
-import { deviceOf, spawnWorkspace } from "./tool";
+import { deviceOf, isDirectory, spawnWorkspace } from "./tool";
 import type { SpawnWorkspaceDeps, SpawnWorkspaceInput } from "./tool";
 import { cowStrategy } from "./strategy";
 
@@ -49,6 +49,11 @@ const spawnWorkspaceOutput = {
       enum: ["cow", "git"],
       description: "The mechanism that produced the directory.",
     },
+    attached: {
+      type: "boolean",
+      description:
+        "True when the session was attached to an existing worktree instead of a new clone.",
+    },
   },
   required: ["sessionID", "directory", "mechanism"],
   additionalProperties: false,
@@ -70,6 +75,8 @@ function liveDeps(ctx: Context): SpawnWorkspaceDeps {
   return {
     probe: probeCowCapability,
     probeDevice: deviceOf,
+    listWorktrees: () => ctx.worktree.list(),
+    isDirectory,
     createWorktree: (input) =>
       ctx.worktree.create({
         strategy: input.strategy,
@@ -110,7 +117,9 @@ export default {
       editor.add({
         name: "spawn_workspace",
         description:
-          "Create a worktree and start a session in it, reporting the mechanism that produced the directory.",
+          "Create a worktree and start a session in it, reporting the mechanism that produced the directory. " +
+          "When a worktree with the requested name already exists and was produced by the cow strategy, the " +
+          "session is attached to it instead of creating a new directory; anything else at that name is refused.",
         input: spawnWorkspaceInput,
         output: spawnWorkspaceOutput,
         // A tool defaults into CodeMode, which advertises it to the model only
@@ -119,9 +128,15 @@ export default {
         options: { codemode: false },
         execute: async (input: SpawnWorkspaceInput) => {
           const result = await spawnWorkspace(input, liveDeps(ctx));
+          // The text is what tells attach from create: on attach `mechanism`
+          // reports the found directory's mechanism, and the caller must never
+          // read that as a fresh clone having happened.
+          const content = result.attached
+            ? `Attached to existing cow worktree at ${result.directory} (session ${result.sessionID}); no new worktree was created.`
+            : `Created ${result.mechanism} worktree at ${result.directory} (session ${result.sessionID}).`;
           return {
             output: result,
-            content: `Created ${result.mechanism} worktree at ${result.directory} (session ${result.sessionID}).`,
+            content,
           };
         },
       });

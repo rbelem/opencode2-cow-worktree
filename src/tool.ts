@@ -2,12 +2,20 @@ import { stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { CowCapability } from "./capability";
 import type { Mechanism } from "./mechanism";
+import type { WorktreeInventoryEntry } from "../types/opencode2-worktree";
 
 /** What a successful `spawnWorkspace` produced. */
 export interface SpawnWorkspaceResult {
   readonly sessionID: string;
   readonly directory: string;
   readonly mechanism: Mechanism;
+  /**
+   * True when the session was attached to an already-existing Worktree instead
+   * of a fresh clone. Absent for a created Worktree: the field's presence is
+   * the attach marker, and `mechanism` then reports the mechanism of the
+   * directory that was found, not of a clone this call performed.
+   */
+  readonly attached?: boolean;
 }
 
 /** Whether a caller who asked for a CoW clone may be given a Shallow worktree. */
@@ -43,6 +51,22 @@ export interface SpawnWorkspaceDeps {
   readonly createSession: (directory: string, name?: string) => Promise<string>;
   /** Removes a Worktree this call created. Used only to clean up a failure. */
   readonly removeWorktree: (directory: string) => Promise<void>;
+  /**
+   * Lists the Worktree inventory opencode2 records for the caller's location —
+   * one `{ directory, strategy? }` entry per Worktree (`ctx.worktree.list()`).
+   * Attach reads it to decide whether an existing directory is ours (ADR 0003:
+   * the inventory, not a plugin-owned registry, is the source of truth).
+   * Injected so the decision is testable without opencode2.
+   */
+  readonly listWorktrees: () => Promise<readonly WorktreeInventoryEntry[]>;
+  /**
+   * Whether a path exists and is a directory. Attach consults it twice: the
+   * predicted target must already exist before any attach question is asked,
+   * and the Deep-clone signature is `<target>/.git` being a *directory*. Used
+   * for no other purpose. Injected like `deviceOf` so both checks are testable
+   * without a filesystem.
+   */
+  readonly isDirectory: (path: string) => Promise<boolean>;
   /** Defaults to `"none"`: a request for `cow` is a statement about what you get. */
   readonly fallback?: FallbackPolicy;
   /** Worktree parent. Defaults to a same-filesystem sibling of the source. */
@@ -78,11 +102,31 @@ export interface SpawnWorkspaceInput {
  * If the Worktree is created but the session cannot be started, the Worktree is
  * removed before the error propagates, so no directory is orphaned. If creating
  * the Worktree itself fails there is nothing to clean up.
+ *
+ * Attach: when the call names a Worktree (`name`) whose predicted directory
+ * already exists, the call attaches instead of cloning. The prediction is
+ * assembled exactly as the create flow assembles it — the same parent, the
+ * same name — and the existing directory is attached to only when the
+ * inventory records it with `strategy: "cow"` (ADR 0003) **and** it carries the
+ * Deep-clone signature (`.git` is a directory). Every other occupant of the
+ * predicted path — a `git`-strategy Worktree, a path the inventory does not
+ * know (a Foreign worktree), a `cow` row that lost its Deep-clone shape — is
+ * refused loudly before any session is started and without touching the
+ * filesystem. Attach never consults the capability probe (no clone is
+ * attempted) and never removes the existing directory when its own session
+ * start fails, because the directory predates the call.
  */
 export async function spawnWorkspace(
   input: SpawnWorkspaceInput,
   deps: SpawnWorkspaceDeps,
 ): Promise<SpawnWorkspaceResult> {
+  const name = input.name;
+  // A present, non-empty name may hit an existing Worktree; an empty string is
+  // not a name and takes the create path exactly as before.
+  if (name) {
+    const attached = await tryAttach(name, input.sourceDirectory, deps);
+    if (attached !== undefined) return attached;
+  }
   const capability = await deps.probe(input.sourceDirectory);
   if (capability.status === "error") {
     throw new Error(
@@ -246,4 +290,122 @@ export async function nearestExistingDevice(
     if (parent === current) return undefined;
     current = parent;
   }
+}
+
+/**
+ * Whether a path exists and is a directory. The live binding for the tool's
+ * `isDirectory` seam, alongside `deviceOf`: a path occupied by a file and a
+ * path that is not there at all are the same answer — no existing Worktree.
+ */
+export async function isDirectory(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The attach half of a named `spawnWorkspace`: when the predicted directory
+ * already exists, decide whether the call may attach to it. Returns `undefined`
+ * when the predicted path is free, handing control back to the create flow
+ * unchanged.
+ *
+ * The prediction reuses the create flow's parent — the configured target root,
+ * or a sibling of the source — so a path that exists here is exactly a path
+ * `createWorktree` would collide with. The check runs before the capability
+ * probe on purpose: attach attempts no clone, so the source's CoW capability
+ * is not its question to ask.
+ */
+async function tryAttach(
+  name: string,
+  sourceDirectory: string,
+  deps: SpawnWorkspaceDeps,
+): Promise<SpawnWorkspaceResult | undefined> {
+  const parent = deps.targetRoot ?? join(sourceDirectory, "..");
+  const target = join(parent, name);
+  if (!(await deps.isDirectory(target))) return undefined;
+  return attachToExisting(name, target, deps);
+}
+
+/**
+ * The attach decision for a path that already exists. The inventory is the
+ * source of truth for "ours" (ADR 0003): an entry recorded with `cow` plus the
+ * Deep-clone signature (`.git` is a directory) means the `cow` strategy
+ * materialized this directory, so a new session may bind to it. Every other
+ * answer is refused loudly — before any session is created and with no
+ * filesystem change — because a Foreign worktree, another strategy's Worktree,
+ * or a `cow` row that lost its Deep-clone shape is not this tool's to attach
+ * to.
+ */
+async function attachToExisting(
+  name: string,
+  target: string,
+  deps: SpawnWorkspaceDeps,
+): Promise<SpawnWorkspaceResult> {
+  const entry = await inventoryEntryFor(deps, target);
+  if (entry === undefined) throw foreignWorktreeError(target);
+  if (entry.strategy !== "cow") {
+    throw foreignStrategyError(target, entry.strategy);
+  }
+  if (!(await deps.isDirectory(join(target, ".git")))) {
+    throw notDeepCloneError(target);
+  }
+  try {
+    const sessionID = await deps.createSession(target, name);
+    return { sessionID, directory: target, mechanism: "cow", attached: true };
+  } catch (cause) {
+    // No removeWorktree here, unlike the create flow: the directory existed
+    // before this call, so a failed session start must leave it untouched.
+    throw new Error(`session start failed in existing worktree ${target}`, { cause });
+  }
+}
+
+/** The inventory entry recorded for a directory, when the inventory knows it. */
+async function inventoryEntryFor(
+  deps: SpawnWorkspaceDeps,
+  directory: string,
+): Promise<WorktreeInventoryEntry | undefined> {
+  const entries = await deps.listWorktrees();
+  return entries.find((candidate) => candidate.directory === directory);
+}
+
+/** The refusal for a path the worktree inventory does not know at all. */
+function foreignWorktreeError(target: string): Error {
+  return new Error(
+    `refusing to attach to ${target}: the path exists but opencode2's worktree ` +
+      "inventory has no entry for it, so it is not a worktree this strategy " +
+      "materialized (a Foreign worktree). spawn_workspace attaches only to " +
+      "worktrees its cow strategy created; pick another name or remove the " +
+      "directory.",
+  );
+}
+
+/** The refusal for an inventory entry naming a strategy other than `cow`. */
+function foreignStrategyError(target: string, strategy: string | undefined): Error {
+  return new Error(
+    `refusing to attach to ${target}: the worktree inventory records it with ` +
+      `${describeStrategy(strategy)}, not "cow" — spawn_workspace will not attach ` +
+      "to a Worktree another strategy materialized. Remove it through opencode2 " +
+      "or pick another name.",
+  );
+}
+
+/**
+ * The refusal for a `cow` inventory row whose `.git` is not a directory: whatever
+ * sits at the path now, it is not the Deep clone this strategy's create leaves
+ * behind, so the row is stale or the directory was replaced.
+ */
+function notDeepCloneError(target: string): Error {
+  return new Error(
+    `refusing to attach to ${target}: the worktree inventory records strategy ` +
+      `"cow", but ${join(target, ".git")} is not a directory, so the directory does ` +
+      "not have the Deep-clone signature a cow worktree is created with. Refresh " +
+      "the inventory or remove the directory.",
+  );
+}
+
+/** The strategy as a refusal names it; the checkout root is listed with none. */
+function describeStrategy(strategy: string | undefined): string {
+  return strategy === undefined ? "no strategy" : `"${strategy}"`;
 }

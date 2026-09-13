@@ -1,11 +1,11 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { probeCowCapability } from "../src/capability";
 import type { CowCapability } from "../src/capability";
 import type { Mechanism } from "../src/mechanism";
-import { deviceOf, nearestExistingDevice, spawnWorkspace } from "../src/tool";
+import { deviceOf, isDirectory, nearestExistingDevice, spawnWorkspace } from "../src/tool";
 import type { SpawnWorkspaceDeps } from "../src/tool";
 import plugin from "../src/plugin";
 import { findCowRoot, findNonCowRoot } from "./fs-roots";
@@ -39,6 +39,10 @@ interface Calls {
   }>;
   readonly createSession: Array<{ directory: string; name?: string }>;
   readonly removed: string[];
+  /** How many times the inventory seam was read. */
+  readonly listed: number[];
+  /** Every path the isDirectory seam was asked about. */
+  readonly probedDirectories: string[];
 }
 
 function fakeDeps(
@@ -49,12 +53,30 @@ function fakeDeps(
     readonly targetRoot?: string;
     /** Devices keyed by the exact path the tool probes; absent means "unknown". */
     readonly devices?: Readonly<Record<string, number>>;
+    /** Inventory rows `listWorktrees` reports; absent means an empty inventory. */
+    readonly inventory?: ReadonlyArray<{ directory: string; strategy?: string }>;
+    /** Paths `isDirectory` answers true for; every other path is "no". */
+    readonly directories?: readonly string[];
   } = {},
 ): { deps: SpawnWorkspaceDeps; calls: Calls } {
-  const calls: Calls = { createWorktree: [], createSession: [], removed: [] };
+  const calls: Calls = {
+    createWorktree: [],
+    createSession: [],
+    removed: [],
+    listed: [],
+    probedDirectories: [],
+  };
   const deps: SpawnWorkspaceDeps = {
     probe: async () => capability,
     probeDevice: async (path) => options.devices?.[path],
+    listWorktrees: async () => {
+      calls.listed.push(1);
+      return options.inventory ?? [];
+    },
+    isDirectory: async (path) => {
+      calls.probedDirectories.push(path);
+      return options.directories?.includes(path) ?? false;
+    },
     createWorktree: async (input) => {
       calls.createWorktree.push(input);
       return { directory: `/worktrees/${input.strategy}-clone` };
@@ -228,6 +250,214 @@ test("session creation failure removes the worktree and propagates the error", a
   );
   expect(calls.removed).toEqual(["/worktrees/cow-clone"]);
 });
+
+// Attach (issue #1): a named Worktree that already exists is attached to, not
+// recreated — and only when the inventory says it is ours and the directory
+// carries the Deep-clone signature. Every other occupant of the predicted path
+// is refused before any session or filesystem change.
+test("an existing cow Deep clone under the predicted name is attached to, not recreated", async () => {
+  const target = "/wt/worker";
+  const { deps, calls } = fakeDeps(
+    { status: "supported" },
+    {
+      targetRoot: "/wt",
+      inventory: [{ directory: target, strategy: "cow" }],
+      directories: [target, join(target, ".git")],
+    },
+  );
+  const result = await spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, deps);
+
+  expect(result).toEqual({
+    sessionID: "ses_test",
+    directory: target,
+    mechanism: "cow",
+    attached: true,
+  });
+  expect(calls.createWorktree).toEqual([]);
+  expect(calls.createSession).toEqual([{ directory: target, name: "worker" }]);
+  expect(calls.removed).toEqual([]);
+  // The Deep-clone signature was checked on the found directory, not assumed.
+  expect(calls.probedDirectories).toContain(join(target, ".git"));
+});
+
+test("attach is decided before the capability probe: no clone question is asked", async () => {
+  // An `error` capability throws in the create flow; reaching attach proves
+  // the attach branch short-circuits the probe, because attach attempts no
+  // clone and the source's capability is not its question to ask.
+  const target = "/wt/worker";
+  const { deps, calls } = fakeDeps(
+    { status: "error", error: new Error("EACCES") },
+    {
+      targetRoot: "/wt",
+      inventory: [{ directory: target, strategy: "cow" }],
+      directories: [target, join(target, ".git")],
+    },
+  );
+  const result = await spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, deps);
+
+  expect(result.attached).toBe(true);
+  expect(calls.createWorktree).toEqual([]);
+});
+
+test("attach predicts the same sibling parent the create flow uses when no root is set", async () => {
+  const target = join("/src", "..", "worker");
+  const { deps, calls } = fakeDeps({ status: "supported" }, {
+    inventory: [{ directory: target, strategy: "cow" }],
+    directories: [target, join(target, ".git")],
+  });
+  const result = await spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, deps);
+
+  expect(result.directory).toBe(target);
+  expect(calls.createWorktree).toEqual([]);
+});
+
+test("a same-named worktree of another strategy is refused, naming the strategy and directory", async () => {
+  const target = "/wt/worker";
+  const { deps, calls } = fakeDeps(
+    { status: "supported" },
+    {
+      targetRoot: "/wt",
+      inventory: [{ directory: target, strategy: "git" }],
+      directories: [target, join(target, ".git")],
+    },
+  );
+
+  await expect(
+    spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, deps),
+  ).rejects.toThrow(/refusing to attach to \/wt\/worker.*records it with "git", not "cow"/);
+  expect(calls.createWorktree).toEqual([]);
+  expect(calls.createSession).toEqual([]);
+  expect(calls.removed).toEqual([]);
+});
+
+test("a strategy-less inventory row (the checkout root) is also refused", async () => {
+  const target = "/wt/worker";
+  const { deps, calls } = fakeDeps(
+    { status: "supported" },
+    {
+      targetRoot: "/wt",
+      inventory: [{ directory: target }],
+      directories: [target, join(target, ".git")],
+    },
+  );
+
+  await expect(
+    spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, deps),
+  ).rejects.toThrow(/records it with no strategy, not "cow"/);
+  expect(calls.createSession).toEqual([]);
+});
+
+test("an existing path absent from the inventory is refused as a Foreign worktree", async () => {
+  const target = "/wt/stranger";
+  const { deps, calls } = fakeDeps(
+    { status: "supported" },
+    { targetRoot: "/wt", inventory: [], directories: [target] },
+  );
+
+  await expect(
+    spawnWorkspace({ sourceDirectory: "/src", name: "stranger" }, deps),
+  ).rejects.toThrow(
+    /refusing to attach to \/wt\/stranger: the path exists but.*Foreign worktree/,
+  );
+  expect(calls.createWorktree).toEqual([]);
+  expect(calls.createSession).toEqual([]);
+});
+
+test("a cow inventory row without the Deep-clone signature is refused", async () => {
+  // The inventory says cow, but `.git` is not a directory: the row is stale or
+  // the directory was replaced, so the attach evidence is not there.
+  const target = "/wt/worker";
+  const { deps, calls } = fakeDeps(
+    { status: "supported" },
+    {
+      targetRoot: "/wt",
+      inventory: [{ directory: target, strategy: "cow" }],
+      directories: [target],
+    },
+  );
+
+  await expect(
+    spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, deps),
+  ).rejects.toThrow(/records strategy "cow", but .*\.git is not a directory/);
+  expect(calls.createSession).toEqual([]);
+});
+
+test("attach refuses before the session even when the existing worktree would be removable", async () => {
+  // The refusal path must not run removeWorktree "to make room": the directory
+  // is not ours to delete.
+  const target = "/wt/worker";
+  const { deps, calls } = fakeDeps(
+    { status: "supported" },
+    { targetRoot: "/wt", inventory: [{ directory: target, strategy: "git" }], directories: [target] },
+  );
+
+  await expect(spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, deps)).rejects.toThrow(
+    /refusing to attach/,
+  );
+  expect(calls.removed).toEqual([]);
+});
+
+test("a failed session start on attach does not remove the existing worktree", async () => {
+  const target = "/wt/worker";
+  const { deps, calls } = fakeDeps(
+    { status: "supported" },
+    {
+      targetRoot: "/wt",
+      failSession: true,
+      inventory: [{ directory: target, strategy: "cow" }],
+      directories: [target, join(target, ".git")],
+    },
+  );
+
+  await expect(
+    spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, deps),
+  ).rejects.toThrow(/session start failed in existing worktree \/wt\/worker/);
+  expect(calls.removed).toEqual([]);
+});
+
+test("a named worktree whose predicted path is free takes the create flow unchanged", async () => {
+  const { deps, calls } = fakeDeps(
+    { status: "supported" },
+    { targetRoot: "/wt", inventory: [{ directory: "/wt/other", strategy: "cow" }] },
+  );
+  const result = await spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, deps);
+
+  expect(result.attached).toBeUndefined();
+  expect(calls.createWorktree).toHaveLength(1);
+  expect(calls.createSession).toHaveLength(1);
+  // The target was probed, found absent, and the inventory never read.
+  expect(calls.probedDirectories).toEqual(["/wt/worker"]);
+  expect(calls.listed).toEqual([]);
+});
+
+test("an unnamed spawn never probes for an attach", async () => {
+  const { deps, calls } = fakeDeps(
+    { status: "supported" },
+    {
+      targetRoot: "/wt",
+      inventory: [{ directory: "/wt/generated-1", strategy: "cow" }],
+      directories: ["/wt/generated-1"],
+    },
+  );
+  const result = await spawnWorkspace({ sourceDirectory: "/src" }, deps);
+
+  expect(result.attached).toBeUndefined();
+  expect(calls.probedDirectories).toEqual([]);
+  expect(calls.listed).toEqual([]);
+  expect(calls.createWorktree).toHaveLength(1);
+});
+
+test.skipIf(cowRoot === undefined)(
+  "isDirectory distinguishes a directory, a file, and a missing path",
+  async () => {
+    const dir = await scratchDir();
+    const file = join(dir, "a-file");
+    await writeFile(file, "x");
+    expect(await isDirectory(dir)).toBe(true);
+    expect(await isDirectory(file)).toBe(false);
+    expect(await isDirectory(join(dir, "missing"))).toBe(false);
+  },
+);
 
 test("the reported mechanism always equals the strategy that produced the directory", async () => {
   for (const capability of [
@@ -419,4 +649,65 @@ test("the registered tool declares the output schema it returns", async () => {
     "directory",
     "mechanism",
   ]);
+});
+
+// The attach path through the live ctx bindings: the tool must read the
+// inventory through ctx.worktree.list, check the real filesystem, start the
+// session in the found directory, and say "Attached" rather than "Created".
+test("the registered tool attaches through ctx.worktree.list and reports it", async () => {
+  const registered: Array<{
+    name: string;
+    execute: (input: unknown) => Promise<{ output: unknown; content: string }>;
+  }> = [];
+  const dir = await scratchDir();
+  // A real existing cow worktree beside the source: the Deep-clone check is
+  // wired to the real filesystem, so the directory and its `.git` must exist.
+  const target = join(dir, "..", "att");
+  scratchDirs.push(target);
+  await mkdir(join(target, ".git"), { recursive: true });
+
+  let created = 0;
+  const ctx = {
+    worktree: {
+      transform: async (callback: (editor: unknown) => void) => {
+        callback({ add: () => {} });
+        return { dispose: async () => {} };
+      },
+      list: async () => [{ directory: target, strategy: "cow" }],
+      create: async () => {
+        created += 1;
+        return { directory: target };
+      },
+      remove: async () => {},
+    },
+    tool: {
+      transform: async (callback: (editor: unknown) => void) => {
+        callback({
+          add: (tool: {
+            name: string;
+            execute: (input: unknown) => Promise<{ output: unknown; content: string }>;
+          }) => {
+            registered.push(tool);
+          },
+        });
+        return { dispose: async () => {} };
+      },
+    },
+    session: { create: async () => ({ id: "ses_attach" }) },
+  } as unknown as Parameters<typeof plugin.setup>[0];
+
+  await plugin.setup(ctx);
+  const tool = registered.find((entry) => entry.name === "spawn_workspace");
+  expect(tool).toBeDefined();
+
+  const result = await tool!.execute({ sourceDirectory: dir, name: "att" });
+  expect(result.output).toEqual({
+    sessionID: "ses_attach",
+    directory: target,
+    mechanism: "cow",
+    attached: true,
+  });
+  expect(result.content).toContain(`Attached to existing cow worktree at ${target}`);
+  expect(result.content).toContain("no new worktree was created");
+  expect(created).toBe(0);
 });
