@@ -33,3 +33,19 @@ rather than inventing one).
 - [ ] Every factual claim traces to a repo doc (no invented numbers)
 - [ ] `TODO(owner)` markers for publish path and post timing
 - [ ] Posting does NOT happen; draft only
+
+## Publish-time checklist (added 2026-09-13, from the triple-critic review)
+
+Decisions the announcement/publish step must carry; no code change now:
+
+- [ ] Global default blast radius: installing the plugin makes `cow` the
+      Location default strategy with no capability gate on the default
+      (TUI/API) path — a non-CoW machine that never asked for the plugin
+      gets failing default worktree creates. Decide: install-requirement
+      docs, or ask upstream for a non-default registration option. Note the
+      Desktop hardcode currently masks this on Desktop; filing that fix
+      un-masks it.
+- [ ] Public API: the barrel exports 16 symbols; the only external consumer
+      (the install shim) uses `default`. Decide the real API at publish
+      (likely `export { default }` plus the `./tui` entry) instead of
+      freezing an accidental surface.
