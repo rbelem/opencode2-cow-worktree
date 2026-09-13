@@ -351,6 +351,14 @@ What remains unproven, and is not papered over here:
 - A real **multi-agent LLM fan-out**. The harness asserts filesystem facts, not
   model reasoning.
 
+## Parallel lanes
+
+This repository is developed with parallel CoW lane clones: `bun
+scripts/lane.ts spawn|absorb` spawns them and absorbs them back. The
+conventions are in [`docs/lane-workflow.md`](docs/lane-workflow.md); the
+verified merge mechanics are in
+[`docs/research/lane-merge-mechanics.md`](docs/research/lane-merge-mechanics.md).
+
 ## Vocabulary
 
 See [CONTEXT.md](CONTEXT.md). In short: a **Workspace** is a logical handle, a

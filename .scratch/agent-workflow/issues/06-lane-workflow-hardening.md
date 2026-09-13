@@ -23,11 +23,11 @@ parallel lanes needs no archaeology.
 
 **Status:** ready-for-agent
 
-- [ ] `spawn` produces a runnable clone (tests run in-lane) with no origin
+- [x] `spawn` produces a runnable clone (tests run in-lane) with no origin
       remote and the branch created
-- [ ] `absorb` performs the read-only pre-checks before any merge and
+- [x] `absorb` performs the read-only pre-checks before any merge and
       refuses when the lane has uncommitted work or is not terminal
-- [ ] Script covered per the repo's testing conventions for `scripts/`
-- [ ] `docs/lane-workflow.md` matches the research doc and the actual script
+- [x] Script covered per the repo's testing conventions for `scripts/`
+- [x] `docs/lane-workflow.md` matches the research doc and the actual script
       behavior
-- [ ] README (or the docs index, wherever the repo surfaces docs) links it
+- [x] README (or the docs index, wherever the repo surfaces docs) links it
