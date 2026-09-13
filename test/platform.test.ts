@@ -114,6 +114,31 @@ test.skipIf(!onLinux || cowRoot === undefined)("cloneDirectory over the platform
   expect(await readFile(join(dir, "clone", "nested", "b.txt"), "utf8")).toBe("b\n");
 });
 
+test.skipIf(!onLinux || cowRoot === undefined)("cloneOnLinux refuses an existing destination file instead of overwriting it", async () => {
+  // Darwin parity: `COPYFILE_CLONE_FORCE` implies `COPYFILE_EXCL` there (see
+  // `platform-darwin.ts`), so the Linux `copyFile` must carry the flag
+  // explicitly — belt and suspenders under `cloneDirectory`'s entry guard,
+  // and correct on its own: the walker only ever writes fresh names, so an
+  // occupied destination is a bug to surface, not bytes to replace.
+  const dir = await scratch(cowRoot!);
+  const source = join(dir, "source");
+  const target = join(dir, "target");
+  await writeFile(source, "clone bytes\n");
+  await writeFile(target, "destination bytes\n");
+
+  const error = await cloneOnLinux(source, target).then(
+    () => undefined,
+    (failure: unknown) => failure as { code?: string },
+  );
+
+  expect(error?.code).toBe("EEXIST");
+  // The refusal is not an overwrite in disguise.
+  expect(await readFile(target, "utf8")).toBe("destination bytes\n");
+  // The operation is unchanged where it belongs: a fresh target still clones.
+  await cloneOnLinux(source, join(dir, "fresh"));
+  expect(await readFile(join(dir, "fresh"), "utf8")).toBe("clone bytes\n");
+});
+
 // --- Darwin dispatch is inert on Linux ------------------------------------
 
 test.skipIf(!onLinux || cowRoot === undefined)("cloneFile with no override takes the Linux branch on this machine", async () => {

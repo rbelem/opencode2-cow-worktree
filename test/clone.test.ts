@@ -339,3 +339,123 @@ test.skipIf(cowRoot === undefined || !gitOnPath)("rejects a target that contains
   // Nothing was produced by the rejected call.
   await expect(lstat(join(repo, "src", "src"))).rejects.toThrow();
 });
+
+// --- the occupancy guard (ticket 08) ---
+//
+// `cow` never writes into, or deletes, bytes it did not create, so any
+// pre-existing target is refused before the first filesystem write. That
+// happens before the walker or the platform backend run, so these pins need
+// no CoW filesystem and no git — they run anywhere, like the self-clone
+// rejection above.
+
+/** The refusal every occupied target must produce, naming the resolved path. */
+async function expectOccupancyRefusal(run: Promise<unknown>): Promise<Error> {
+  const error = await run.then(
+    () => undefined,
+    (failure: unknown) => failure as Error,
+  );
+  expect(error).toBeInstanceOf(Error);
+  expect(error?.message).toMatch(/cannot clone into .*: it already exists/);
+  return error!;
+}
+
+test("refuses to clone into a pre-existing directory and leaves its content untouched", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "cow-occupied-"));
+  scratchDirs.push(dir);
+  const source = join(dir, "source");
+  await mkdir(source);
+  const foreign = join(dir, "occupied");
+  await mkdir(foreign);
+  await writeFile(join(foreign, "theirs.txt"), "not ours\n");
+
+  await expectOccupancyRefusal(cloneDirectory(source, foreign));
+
+  // No merge happened: the directory holds exactly what it held before.
+  expect(await readdir(foreign)).toEqual(["theirs.txt"]);
+  expect(await readFile(join(foreign, "theirs.txt"), "utf8")).toBe("not ours\n");
+});
+
+test("refuses to clone into a pre-existing file", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "cow-occupied-file-"));
+  scratchDirs.push(dir);
+  const source = join(dir, "source");
+  await mkdir(source);
+  const target = join(dir, "occupied");
+  await writeFile(target, "a file, not a directory\n");
+
+  await expectOccupancyRefusal(cloneDirectory(source, target));
+
+  expect(await readFile(target, "utf8")).toBe("a file, not a directory\n");
+});
+
+test("refuses to clone into a pre-existing symlink without following it", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "cow-occupied-link-"));
+  scratchDirs.push(dir);
+  const source = join(dir, "source");
+  await mkdir(source);
+  const pointee = join(dir, "pointee.txt");
+  await writeFile(pointee, "the link's target\n");
+  const target = join(dir, "occupied");
+  await symlink(pointee, target);
+
+  // `lstat` must see the link itself, not resolve through to the pointee —
+  // otherwise the clone would write into whatever the link names.
+  await expectOccupancyRefusal(cloneDirectory(source, target));
+
+  expect((await lstat(target)).isSymbolicLink()).toBe(true);
+  expect(await readlink(target)).toBe(pointee);
+  expect(await readFile(pointee, "utf8")).toBe("the link's target\n");
+});
+
+test("a directory appearing between the caller's check and the clone survives the refusal untouched", async () => {
+  // The race this pin exists for: a caller (the tool's attach check, the
+  // strategy's caller) established that the predicted path was free, and a
+  // foreign directory appeared before `cloneDirectory` ran. The old behavior
+  // merged into it and left it to the caller's rollback `rm`; the guard must
+  // refuse instead — no write, no merge, no cleanup — so the foreign
+  // directory outlives the failed create byte for byte.
+  const dir = await mkdtemp(join(tmpdir(), "cow-race-"));
+  scratchDirs.push(dir);
+  const source = join(dir, "source");
+  await mkdir(source);
+  await writeFile(join(source, "tracked.txt"), "clone content\n");
+  const target = join(dir, "predicted");
+
+  // The caller's existence check: the path is free.
+  await expect(lstat(target)).rejects.toThrow();
+  // The interleaving: something else occupies the path before the clone.
+  await mkdir(target);
+  await writeFile(join(target, "appeared.txt"), "foreign\n");
+
+  await expectOccupancyRefusal(cloneDirectory(source, target));
+
+  // The refused create left no rollback behind: the directory and its bytes
+  // are exactly as the race left them, and no clone content was merged in.
+  expect(await readdir(target)).toEqual(["appeared.txt"]);
+  expect(await readFile(join(target, "appeared.txt"), "utf8")).toBe("foreign\n");
+  await expect(lstat(join(target, "tracked.txt"))).rejects.toThrow();
+});
+
+test("an unknowable target path fails closed instead of reading as absence", async () => {
+  // An occupancy probe that errors without ENOENT — here a path component
+  // that is a file — must surface as a failure, never be swallowed into
+  // "the path is free": merging into a path no one could inspect is exactly
+  // what the guard exists to prevent.
+  const dir = await mkdtemp(join(tmpdir(), "cow-uninspectable-"));
+  scratchDirs.push(dir);
+  const source = join(dir, "source");
+  await mkdir(source);
+  const blocker = join(dir, "a-file");
+  await writeFile(blocker, "not a directory\n");
+  const target = join(blocker, "child");
+
+  const error = await cloneDirectory(source, target).then(
+    () => undefined,
+    (failure: unknown) => failure as NodeJS.ErrnoException,
+  );
+
+  expect(error).toBeDefined();
+  expect(error?.code).toBe("ENOTDIR");
+  expect(error?.message).not.toMatch(/already exists/);
+  expect(await readFile(blocker, "utf8")).toBe("not a directory\n");
+});
