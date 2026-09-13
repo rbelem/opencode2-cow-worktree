@@ -11,10 +11,11 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { cowStrategy, probeUncommitted } from "../src/strategy";
+import { cowStrategy, probeUncommitted, runHookCommand, setPostCreateHooks } from "../src/strategy";
 import * as strategyModule from "../src/strategy";
+import * as cloneModule from "../src/clone";
 import plugin from "../src/plugin";
 import { findCowRoot, findNonCowRoot, hasGit } from "./fs-roots";
 
@@ -32,6 +33,12 @@ afterEach(async () => {
   await Promise.all(
     scratchDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })),
   );
+});
+
+// The hooks are module state installed by the plugin's setup; every hook test
+// configures its own list, and this keeps a leaked list out of later tests.
+afterEach(() => {
+  setPostCreateHooks([]);
 });
 
 function git(repo: string, ...args: string[]): string {
@@ -76,13 +83,14 @@ interface Added {
 }
 
 /** A fake Context that records what the plugin registers through the seam. */
-function fakeContext(added: Added[]) {
+function fakeContext(added: Added[], options?: Record<string, unknown>) {
   const editor = {
     add: (definition: typeof cowStrategy) => {
       added.push({ id: definition.id, definition });
     },
   };
   const ctx = {
+    options,
     worktree: {
       transform: async (callback: (editor: unknown) => void) => {
         callback(editor);
@@ -466,4 +474,193 @@ test("create proceeds when a device is unreadable, leaving the failure to the cl
   expect(error?.message).not.toContain("different filesystem");
   // It fails as the strategy's clone wrapper, not as a device rejection.
   expect(error?.message).toContain("cow strategy failed to clone into");
+});
+
+// --- post-create hooks (ticket 05) ---
+//
+// The hook tail runs after a successful clone, so these tests replace
+// `cloneDirectory` with a stand-in that creates the target, exactly as the
+// real one does before it can fail. That keeps every hook branch runnable —
+// and the coverage gate satisfiable — on any filesystem, including CI where
+// no CoW root exists. The commands themselves are real `sh -c` executions.
+
+/** A plain scratch directory; no git and no CoW filesystem required. */
+async function makeHookScratch(prefix: string): Promise<{ dir: string; source: string; target: string }> {
+  const dir = await mkdtemp(join(tmpdir(), prefix));
+  scratchDirs.push(dir);
+  const source = join(dir, "source");
+  await mkdir(source);
+  return { dir, source, target: join(dir, "clone") };
+}
+
+/** A cloneDirectory stand-in that creates the target, like the real one. */
+function cloneCreatingTarget(): typeof cloneModule.cloneDirectory {
+  return async (_source, target) => {
+    await mkdir(target, { recursive: true });
+  };
+}
+
+/** Runs the registered strategy's create with the real clone replaced. */
+async function createWithFakeClone(
+  source: string,
+  target: string,
+): Promise<{ directory: string } | undefined> {
+  const spy = spyOn(cloneModule, "cloneDirectory").mockImplementation(cloneCreatingTarget());
+  try {
+    const signal = new AbortController().signal;
+    return await cowStrategy.create({ sourceDirectory: source, directory: target }, { signal });
+  } finally {
+    spy.mockRestore();
+  }
+}
+
+test("with no hooks configured, create behaves exactly as before", async () => {
+  const { source, target } = await makeHookScratch("cow-hooks-none-");
+  setPostCreateHooks([]);
+
+  const spy = spyOn(cloneModule, "cloneDirectory").mockImplementation(cloneCreatingTarget());
+  try {
+    const signal = new AbortController().signal;
+    const result = await cowStrategy.create(
+      { sourceDirectory: source, directory: target },
+      { signal },
+    );
+
+    // The unhooked result, and nothing but the clone itself.
+    expect(result).toEqual({ directory: target });
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledWith(source, target);
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+test("hooks run sequentially in the worktree, with both paths in the environment", async () => {
+  const { source, target } = await makeHookScratch("cow-hooks-run-");
+  setPostCreateHooks([
+    "printf one >> hook-order.txt",
+    "printf two >> hook-order.txt",
+    // Relative writes land in the worktree only if it is the command's cwd.
+    'printf "%s" "$COW_WORKTREE_PATH" > hook-worktree.txt',
+    'printf "%s" "$COW_SOURCE_DIRECTORY" > hook-source.txt',
+  ]);
+
+  await createWithFakeClone(source, target);
+
+  expect(await readFile(join(target, "hook-order.txt"), "utf8")).toBe("onetwo");
+  expect(await readFile(join(target, "hook-worktree.txt"), "utf8")).toBe(resolve(target));
+  expect(await readFile(join(target, "hook-source.txt"), "utf8")).toBe(resolve(source));
+});
+
+test("the first hook failure names the command and step, removes the worktree, and stops", async () => {
+  const { source, target } = await makeHookScratch("cow-hooks-fail-");
+  setPostCreateHooks(["true", "echo boom; exit 3", "printf nope > hook-after.txt"]);
+
+  const error = await createWithFakeClone(source, target).then(
+    () => undefined,
+    (failure: unknown) => failure as Error,
+  );
+
+  expect(error).toBeInstanceOf(Error);
+  expect(error?.message).toBe(
+    "post-create hook failed (step 2 of 3): echo boom; exit 3 (exit code 3)\n" +
+      "--- output ---\n" +
+      "boom",
+  );
+  // No orphan clone: the just-created directory is gone, third hook never ran.
+  await expect(lstat(target)).rejects.toThrow();
+});
+
+test("a hook's stderr is captured alongside its stdout", async () => {
+  const { source, target } = await makeHookScratch("cow-hooks-err-");
+  setPostCreateHooks(["printf out; printf err >&2; false"]);
+
+  const error = await createWithFakeClone(source, target).then(
+    () => undefined,
+    (failure: unknown) => failure as Error,
+  );
+
+  expect(error?.message).toContain("post-create hook failed (step 1 of 1): printf out; printf err >&2; false (exit code 1)");
+  expect(error?.message).toContain("--- output ---\nout\nerr");
+});
+
+test("a timed-out hook counts as a failure, with cleanup", async () => {
+  // The real mechanism: execFile's timeout kills the command and rejects.
+  const { target } = await makeHookScratch("cow-hooks-timeout-cmd-");
+  await expect(runHookCommand("sleep 5", target, target, 50)).rejects.toThrow();
+});
+
+test("a timed-out hook aborts creation, names the timeout, and removes the worktree", async () => {
+  const { source, target } = await makeHookScratch("cow-hooks-timeout-");
+  setPostCreateHooks(["sleep 30", "printf nope > hook-after.txt"]);
+  // `runHookCommand` is the seam the timeout flows through; the killed shape
+  // is what execFile's own timeout produces (pinned by the test above).
+  const spy = spyOn(strategyModule, "runHookCommand").mockImplementation(
+    async () => {
+      throw Object.assign(new Error("sleep 30 killed by SIGTERM"), { killed: true });
+    },
+  );
+  try {
+    const error = await createWithFakeClone(source, target).then(
+      () => undefined,
+      (failure: unknown) => failure as Error,
+    );
+
+    expect(error?.message).toBe(
+      "post-create hook failed (step 1 of 2): sleep 30 (timed out)",
+    );
+    await expect(lstat(target)).rejects.toThrow();
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+test("a hook killed by a signal names the signal", async () => {
+  const { source, target } = await makeHookScratch("cow-hooks-signal-");
+  setPostCreateHooks(["kill -TERM $$"]);
+  const spy = spyOn(strategyModule, "runHookCommand").mockImplementation(async () => {
+    throw Object.assign(new Error("terminated"), { code: "SIGTERM" });
+  });
+  try {
+    const error = await createWithFakeClone(source, target).then(
+      () => undefined,
+      (failure: unknown) => failure as Error,
+    );
+
+    expect(error?.message).toBe(
+      "post-create hook failed (step 1 of 1): kill -TERM $$ (terminated by SIGTERM)",
+    );
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+test("plugin setup installs the post-create hooks from the options", async () => {
+  const added: Added[] = [];
+  await plugin.setup(
+    fakeContext(added, { hooks: { postCreate: ["printf hooked > hook-marker.txt"] } }),
+  );
+  const { source, target } = await makeHookScratch("cow-hooks-wired-");
+
+  // Drive the strategy the plugin actually registered, not the module import.
+  const spy = spyOn(cloneModule, "cloneDirectory").mockImplementation(cloneCreatingTarget());
+  try {
+    const signal = new AbortController().signal;
+    await added[0]!.definition.create(
+      { sourceDirectory: source, directory: target },
+      { signal },
+    );
+  } finally {
+    spy.mockRestore();
+  }
+  expect(await readFile(join(target, "hook-marker.txt"), "utf8")).toBe("hooked");
+});
+
+test("plugin setup fails loudly on an invalid hooks option, registering nothing", async () => {
+  const added: Added[] = [];
+
+  await expect(plugin.setup(fakeContext(added, { hooks: "bogus" }))).rejects.toThrow(
+    /invalid plugin option "hooks"/,
+  );
+  expect(added).toEqual([]);
 });

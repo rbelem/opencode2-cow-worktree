@@ -29,7 +29,7 @@ import {
   runNonCowServer,
   type WorktreeRun,
 } from "./scenarios";
-import { runSimulationScenario, runAttachScenario, runListScenario } from "./simulation";
+import { runSimulationScenario, runAttachScenario, runListScenario, runHooksScenario } from "./simulation";
 import { writeRunLog } from "./runlog";
 import { makeConfigRoot, makeSourceProject, installPlugin, declarePlugin, removePath } from "./lib";
 
@@ -224,6 +224,49 @@ async function main(): Promise<number> {
     );
     fallback.notes.push(...list.notes.map((note) => `list: ${note}`));
     fallback.list = list;
+
+    // Ticket 05: post-create hooks, end to end. One server whose hooks write a
+    // marker into the fresh clone; one whose hook fails and must abort the
+    // create with no orphan directory.
+    const hooks = await runHooksScenario({ port: PORT + 9 });
+    assertions.check(
+      "hooks: the API create returned a directory",
+      hooks.createdDirectory !== undefined,
+      String(hooks.createdDirectory),
+    );
+    assertions.check(
+      "hooks: the hook wrote its marker into the new worktree",
+      hooks.marker === "hook-marker",
+      String(hooks.marker),
+    );
+    assertions.check(
+      "hooks: the hook saw the absolute source directory in COW_SOURCE_DIRECTORY",
+      hooks.sourceEnv === hooks.source,
+      `${hooks.sourceEnv} vs ${hooks.source}`,
+    );
+    assertions.check(
+      "hooks: the inventory records the hooked worktree as cow",
+      hooks.inventoryCowRows === 1,
+      String(hooks.inventoryCowRows),
+    );
+    assertions.check(
+      "hooks: a failing hook makes the API create fail",
+      (hooks.failStatus ?? 0) >= 400,
+      `${hooks.failStatus} ${hooks.failText?.slice(0, 120) ?? ""}`,
+    );
+    assertions.check(
+      "hooks: the failure names the hook, its step, and the exit code",
+      /post-create hook failed \(step 1 of 1\)/.test(hooks.failText ?? "") &&
+        /exit code 3/.test(hooks.failText ?? ""),
+      hooks.failText?.slice(0, 240) ?? "no text",
+    );
+    assertions.check(
+      "hooks: the failed create left no orphan directory",
+      hooks.orphanGone === true,
+      String(hooks.orphanGone),
+    );
+    fallback.notes.push(...hooks.notes.map((note) => `hooks: ${note}`));
+    fallback.hooks = hooks;
 
     await writeRunLog({ config, source, server, runtime, runs, assertions, fallback, version: serverVersion() });
 

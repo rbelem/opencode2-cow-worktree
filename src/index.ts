@@ -4,7 +4,7 @@ export { cloneFileOnDarwin, type CloneOutcome, type DarwinCloneSyscall } from ".
 export { probeCowCapability, type CowCapability } from "./capability";
 export { cowStrategy } from "./strategy";
 export { spawnWorkspace, deviceOf, listCowWorktrees } from "./tool";
-export { fallbackPolicy, targetRoot } from "./config";
+export { fallbackPolicy, postCreateHooks, targetRoot } from "./config";
 export type {
   FallbackPolicy,
   SpawnWorkspaceDeps,

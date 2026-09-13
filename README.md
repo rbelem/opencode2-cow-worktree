@@ -28,6 +28,9 @@ The implementation is here and it runs. This plugin:
   opencode2's worktree inventory (no sessions field; ADR 0003);
 - has an opt-in `git` fallback for the tool (`options.fallback`, default
   `"none"`);
+- runs configured post-create commands (`options.hooks.postCreate`) at the end
+  of every create, in the new worktree, and aborts the create — removing the
+  clone — when one fails;
 - has a Linux backend (per-file `COPYFILE_FICLONE_FORCE` reflink) and a macOS
   backend (`copyfile(3)` with `COPYFILE_CLONE_FORCE` through `bun:ffi`) behind a
   platform seam;
@@ -225,6 +228,48 @@ Any other value throws when the tool runs, rather than silently degrading.
 
 Any other value throws when the tool runs, rather than silently relocating every
 clone.
+
+### Post-create hooks
+
+`options.hooks.postCreate` runs commands at the end of the `cow` strategy's
+create flow, against every worktree the plugin materializes — whatever the
+entry path (the HTTP API, the TUI, or `spawn_workspace`):
+
+```json
+{
+  "plugins": [
+    {
+      "package": "~/.config/opencode/plugins/opencode2-cow-worktree",
+      "options": {
+        "hooks": {
+          "postCreate": [
+            "corepack use pnpm@latest",
+            "cp $COW_SOURCE_DIRECTORY/.env.local ."
+          ]
+        }
+      }
+    }
+  ]
+}
+```
+
+The commands run sequentially via `sh -c`, each with the new worktree as its
+working directory and two absolute paths in its environment:
+`COW_WORKTREE_PATH` and `COW_SOURCE_DIRECTORY`. A command that needs a
+per-project value reads it from those. A failed or timed-out command (30
+seconds per command) aborts the creation: the just-created clone is removed —
+no orphan directory — and the error names the failed command, its 1-based step,
+and its captured output. Hooks that succeed pass silently. Attach never runs
+hooks: it binds a session to an existing worktree and clones nothing.
+
+Absent or empty, the option changes nothing. A malformed value — anything that
+is not an array of non-empty command strings — fails the plugin load loudly,
+like `fallback` and `targetRoot` do.
+
+Per-project values need no new mechanism: opencode2 merges plugin `options`
+from a project-level `opencode.json` the same way it merges this file's, so a
+project can declare its own `hooks.postCreate` (or `fallback`/`targetRoot`)
+list and every other project keeps the global default.
 
 The fallback is **tool-only**. `POST /api/worktree {strategy: "cow"}` invokes the
 `cow` Strategy directly, and that Strategy always fails loudly on a non-CoW

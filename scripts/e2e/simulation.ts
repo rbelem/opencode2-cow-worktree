@@ -16,10 +16,11 @@
  * so `spawn_workspace` cannot be invoked this way. The scenario asserts the
  * observed facts rather than an expectation that does not hold.
  */
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { driveModel, type DriveController } from "./drive";
-import { installPlugin, makeConfigRoot, removePath, git } from "./lib";
+import { installPlugin, makeConfigRoot, removePath, declarePlugin, exists, git } from "./lib";
+import type { ConfigRoot } from "./lib";
 import type { Server } from "./server";
 
 export interface SimulationResult {
@@ -477,4 +478,141 @@ export async function runListScenario(options: {
     await server.stop();
     await removePath(config.root);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Post-create hooks (ticket 05)
+//
+// Two servers, each configured through its own plugin `options`: one whose
+// hooks write a marker and the source path into the fresh clone, one whose
+// only hook fails. The worktrees are created through the real HTTP API, so
+// what runs is the strategy's create tail exactly as the API, TUI, and
+// spawn_workspace entry paths all reach it.
+// ---------------------------------------------------------------------------
+
+export interface HooksScenarioResult {
+  readonly notes: string[];
+  /** The success server's source directory, for comparing the env injection. */
+  source: string;
+  /** The directory the hooked create returned. */
+  createdDirectory?: string;
+  /** The marker file a hook wrote inside the new worktree. */
+  marker?: string;
+  /** The source path a hook read from COW_SOURCE_DIRECTORY. */
+  sourceEnv?: string;
+  /** Inventory rows recorded for the hooked worktree after the create. */
+  inventoryCowRows: number;
+  failStatus?: number;
+  failText?: string;
+  /** True when the failed create left no directory behind. */
+  orphanGone?: boolean;
+}
+
+const HOOKS_SOURCE_NAME = "hook-ok";
+
+/**
+ * Boots one throwaway server whose plugin options configure the given hooks,
+ * with a committed source project beside the config root.
+ */
+async function bootHooksServer(options: {
+  readonly port: number;
+  readonly pluginOptions: Record<string, unknown>;
+}): Promise<{
+  config: Awaited<ReturnType<typeof makeConfigRoot>>;
+  server: Server;
+  source: string;
+  parent: string;
+}> {
+  const config = await makeConfigRoot();
+  const pluginDir = await installPlugin(join(config.root, "plugin"));
+  await declarePlugin(config, pluginDir, options.pluginOptions);
+
+  const source = join(config.root, "source");
+  await mkdir(source, { recursive: true });
+  await writeFile(join(source, "tracked.txt"), "hooks source\n");
+  git(source, "init", "-q");
+  git(source, "config", "user.email", "e2e@example.com");
+  git(source, "config", "user.name", "e2e");
+  git(source, "add", "-A");
+  git(source, "commit", "-qm", "hooks source");
+
+  const { startServer } = await import("./server");
+  const server = await startServer(config, { port: options.port, location: source });
+  return { config, server, source, parent: join(source, "..", "worktrees") };
+}
+
+export async function runHooksScenario(scenario: {
+  readonly port: number;
+}): Promise<HooksScenarioResult> {
+  const result: HooksScenarioResult = { notes: [], source: "", inventoryCowRows: 0 };
+
+  // Round 1: hooks that succeed — a marker proves they ran, the env read
+  // proves what they saw, and the inventory proves the create completed.
+  const ok = await bootHooksServer({
+    port: scenario.port,
+    pluginOptions: {
+      hooks: {
+        postCreate: [
+          'printf "hook-marker" > "$COW_WORKTREE_PATH/hooks-marker.txt"',
+          'printf "%s" "$COW_SOURCE_DIRECTORY" > "$COW_WORKTREE_PATH/hooks-source.txt"',
+        ],
+      },
+    },
+  });
+  try {
+    const created = await ok.server.api.json("POST", "/api/worktree", {
+      strategy: "cow",
+      directory: ok.parent,
+      name: HOOKS_SOURCE_NAME,
+    });
+    const directory = (created.body as { directory?: string }).directory;
+    result.createdDirectory = directory;
+    result.source = ok.source;
+    result.notes.push(
+      `hooks ok: POST /api/worktree -> ${created.status} ${directory ?? created.text.slice(0, 120)}`,
+    );
+    if (directory !== undefined) {
+      result.marker = await readFile(join(directory, "hooks-marker.txt"), "utf8").catch(
+        () => undefined,
+      );
+      result.sourceEnv = await readFile(join(directory, "hooks-source.txt"), "utf8").catch(
+        () => undefined,
+      );
+    }
+    result.inventoryCowRows = (await inventoryRows(ok.server)).filter(
+      (entry) => basename(entry.directory) === HOOKS_SOURCE_NAME,
+    ).length;
+    result.notes.push(
+      `hooks ok: marker=${JSON.stringify(result.marker)} ` +
+        `sourceEnv matches source=${result.sourceEnv === ok.source} ` +
+        `inventory rows=${result.inventoryCowRows}`,
+    );
+  } finally {
+    await ok.server.stop();
+    await removePath(ok.config.root);
+  }
+
+  // Round 2: a hook that fails must abort the create with no orphan clone.
+  const bad = await bootHooksServer({
+    port: scenario.port + 1,
+    pluginOptions: { hooks: { postCreate: ['printf "about to fail"; exit 3'] } },
+  });
+  try {
+    const failed = await bad.server.api.json("POST", "/api/worktree", {
+      strategy: "cow",
+      directory: bad.parent,
+      name: "hook-bad",
+    });
+    result.failStatus = failed.status;
+    result.failText = failed.text;
+    result.orphanGone = !(await exists(join(bad.parent, "hook-bad")));
+    result.notes.push(
+      `hooks fail: POST /api/worktree -> ${failed.status} ${failed.text.slice(0, 240)}; ` +
+        `orphan gone=${result.orphanGone}`,
+    );
+  } finally {
+    await bad.server.stop();
+    await removePath(bad.config.root);
+  }
+  return result;
 }

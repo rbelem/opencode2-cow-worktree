@@ -1,10 +1,10 @@
 import type { Context } from "@opencode-ai/plugin";
 import { stat } from "node:fs/promises";
 import { probeCowCapability } from "./capability";
-import { fallbackPolicy, targetRoot } from "./config";
+import { fallbackPolicy, postCreateHooks, targetRoot } from "./config";
 import { deviceOf, isDirectory, listCowWorktrees, spawnWorkspace } from "./tool";
 import type { SpawnWorkspaceDeps, SpawnWorkspaceInput } from "./tool";
-import { cowStrategy } from "./strategy";
+import { cowStrategy, setPostCreateHooks } from "./strategy";
 
 /**
  * The tool's input schema, as the v2 plugin API expects a JSON Schema. Kept a
@@ -162,6 +162,12 @@ function liveDeps(ctx: Context): SpawnWorkspaceDeps {
 export default {
   id: "opencode2-cow-worktree",
   async setup(ctx: Context): Promise<void> {
+    // Validated here, before anything is registered: a misconfigured hook list
+    // must fail the plugin load, not surface halfway through a create. The
+    // strategy has no access to `ctx`, so the validated commands are installed
+    // on it — the module-level object opencode2 registers, which every create
+    // entry path (API, TUI, `spawn_workspace`) runs through.
+    setPostCreateHooks(postCreateHooks(ctx.options));
     await ctx.worktree.transform((editor) => {
       editor.add(cowStrategy);
     });
