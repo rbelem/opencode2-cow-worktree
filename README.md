@@ -279,11 +279,14 @@ entry path (the HTTP API, the TUI, or `spawn_workspace`):
 The commands run sequentially via `sh -c`, each with the new worktree as its
 working directory and two absolute paths in its environment:
 `COW_WORKTREE_PATH` and `COW_SOURCE_DIRECTORY`. A command that needs a
-per-project value reads it from those. A failed or timed-out command (30
-seconds per command) aborts the creation: the just-created clone is removed —
+per-project value reads it from those. A failed or timed-out command (five
+minutes per command) aborts the creation: the just-created clone is removed —
 no orphan directory — and the error names the failed command, its 1-based step,
 and its captured output. Hooks that succeed pass silently. Attach never runs
 hooks: it binds a session to an existing worktree and clones nothing.
+
+Hooks are your own configuration, and they run with full shell rights inside
+the new worktree: treat the list like a shell script you wrote.
 
 Absent or empty, the option changes nothing. A malformed value — anything that
 is not an array of non-empty command strings — fails the plugin load loudly,

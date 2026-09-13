@@ -26,18 +26,18 @@ upstream of you.
 
 **Status:** ready-for-agent
 
-- [ ] Option validation fail-loud (non-array, non-string entries, empty
+- [x] Option validation fail-loud (non-array, non-string entries, empty
       strings), matching the existing option-error wording style
-- [ ] Hooks run sequentially, cwd=worktree, env injected, output captured;
+- [x] Hooks run sequentially, cwd=worktree, env injected, output captured;
       success passes silently
-- [ ] First failure: names command + step, removes the created worktree,
+- [x] First failure: names command + step, removes the created worktree,
       error propagates; no orphan directory
-- [ ] No hooks configured → byte-identical create behavior (pinned)
-- [ ] Attach never runs hooks (pinned)
-- [ ] Timeout constant documented; timeout counts as failure with cleanup
-- [ ] Unit-covered to the repo gate (100% lines + functions); typecheck clean
-- [ ] e2e harness scenario: hook writes a marker → present after create;
+- [x] No hooks configured → byte-identical create behavior (pinned)
+- [x] Attach never runs hooks (pinned)
+- [x] Timeout constant documented; timeout counts as failure with cleanup
+- [x] Unit-covered to the repo gate (100% lines + functions); typecheck clean
+- [x] e2e harness scenario: hook writes a marker → present after create;
       failing hook → create errors, directory gone (written and run locally
       against your own clone's server if feasible)
-- [ ] README: hooks section + per-project-options note
-- [ ] Committed on `lane-c` in the provided clone
+- [x] README: hooks section + per-project-options note
+- [x] Committed on `lane-c` in the provided clone

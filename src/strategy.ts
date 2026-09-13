@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
+import type { ExecFileOptionsWithStringEncoding } from "node:child_process";
 import { rm, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { WorktreeDefinition } from "../types/opencode2-worktree";
 import { cloneDirectory } from "./clone";
@@ -55,6 +56,9 @@ export const cowStrategy: WorktreeDefinition = {
     } catch (cause) {
       // Leave nothing behind: cloneDirectory creates the target before it can
       // fail, so a partial tree would otherwise survive a failed create.
+      // In-place `rm` — not the quarantine dance of src/removal.ts — is
+      // acceptable here: the directory is a seconds-old clone this call itself
+      // just created, so the provenance is known and there is no audit gap.
       await rm(input.directory, { recursive: true, force: true });
       throw new Error(`cow strategy failed to clone into ${input.directory}`, {
         cause,
@@ -147,23 +151,69 @@ export async function runPostCreateHooks(
     try {
       await runHookCommand(command, worktree, sourceDirectory);
     } catch (cause) {
-      await rm(worktree, { recursive: true, force: true });
-      throw hookFailure(command, index + 1, postCreate.length, cause);
+      throw await failedCreate(worktree, command, index + 1, postCreate.length, cause);
     }
   }
 }
 
 /**
- * How long one post-create command may run before it is killed and counts as a
- * failure, with the same cleanup as any other failure. A hook is setup, not a
- * service: a command that hangs that long is a misconfiguration.
+ * Turns a hook failure into the create flow's error, after the same
+ * leave-nothing-behind cleanup as the clone's own failure path above. The
+ * in-place `rm` — not the quarantine of src/removal.ts — is acceptable here:
+ * the directory is a seconds-old clone this strategy itself just created, so
+ * the provenance is known and there is no audit gap to protect. When the
+ * cleanup itself fails, the hook error still wins: the message keeps the
+ * command, step, and output, notes the failed cleanup, and names where the
+ * remains are.
  */
-const HOOK_TIMEOUT_MS = 30_000;
+async function failedCreate(
+  worktree: string,
+  command: string,
+  step: number,
+  total: number,
+  cause: unknown,
+): Promise<Error> {
+  const failure = hookFailure(command, step, total, cause);
+  try {
+    await rm(worktree, { recursive: true, force: true });
+  } catch (cleanup) {
+    const detail = cleanup instanceof Error ? cleanup.message : String(cleanup);
+    return new Error(
+      `${failure.message} Removing the worktree also failed (${detail}), so ` +
+        `the remains are left at ${worktree}.`,
+      { cause },
+    );
+  }
+  return failure;
+}
+
+/**
+ * How long one post-create command may run before it is killed and counts as a
+ * failure, with the same cleanup as any other failure. The primary use case is
+ * dependency installation — a cold `corepack use pnpm@latest` or
+ * `bun install` can legitimately run for minutes — so the budget is generous;
+ * a command that still hangs after five minutes is stuck, not slow.
+ */
+const HOOK_TIMEOUT_MS = 300_000;
+
+/**
+ * How much of a hook's combined output `execFile` may buffer before the
+ * command is rejected as an output-limit failure. Node's default, made
+ * explicit so the failure message can name the number.
+ */
+const HOOK_MAX_BUFFER = 1024 * 1024;
 
 /**
  * Runs one hook command. Exported as the seam the timeout test drives with a
  * short explicit timeout — the production path always uses `HOOK_TIMEOUT_MS`
  * through the default parameter, like `probeUncommitted`'s injected seam.
+ *
+ * The command gets no stdin: the script opens with `exec 0</dev/null`, and
+ * `stdio[0] = "ignore"` backs it up on runtimes that honor it (Bun 1.4.2 does
+ * not — without the redirect, a hook that reads stdin hangs to the timeout).
+ * `worktree` and `sourceDirectory` are resolved to absolute before they reach
+ * the cwd or the environment, so the absolute-path contract holds by
+ * construction whatever the caller handed over.
  */
 export async function runHookCommand(
   command: string,
@@ -171,28 +221,68 @@ export async function runHookCommand(
   sourceDirectory: string,
   timeoutMs: number = HOOK_TIMEOUT_MS,
 ): Promise<void> {
-  await run("sh", ["-c", command], {
-    cwd: worktree,
+  const worktreePath = resolve(worktree);
+  const sourcePath = resolve(sourceDirectory);
+  // `execFile`'s types omit `stdio` (its promise overloads assume piped
+  // streams), but the runtime accepts it; stdin "ignore" backs up the
+  // in-script redirect on runtimes that honor it — Bun 1.4.2 does not.
+  const options = {
+    cwd: worktreePath,
     encoding: "utf8",
     timeout: timeoutMs,
+    maxBuffer: HOOK_MAX_BUFFER,
+    stdio: ["ignore", "pipe", "pipe"],
     env: {
       ...process.env,
-      COW_WORKTREE_PATH: worktree,
-      COW_SOURCE_DIRECTORY: sourceDirectory,
+      COW_WORKTREE_PATH: worktreePath,
+      COW_SOURCE_DIRECTORY: sourcePath,
     },
-  });
+  } as unknown as ExecFileOptionsWithStringEncoding;
+  await run("sh", ["-c", `exec 0</dev/null; ${command}`], options);
 }
 
 /**
  * What `execFile`'s rejection carries about a failed, signalled, or killed
- * command. `code` is the numeric exit status, or the signal name when the
- * process died to a signal it did not handle.
+ * command — the shapes Bun 1.4.2 actually produces (probed at runtime):
+ *
+ * - exit failure: `code` is the numeric exit status, `signal` absent or null.
+ * - signal death: `signal` is the signal name, `code` null, `killed` false.
+ * - timeout kill: `killed` true, `signal` "SIGTERM", `code` null.
+ * - output past `maxBuffer`: `code` names the limit (Bun:
+ *   "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"; Node: "ENOBUFS").
  */
 interface CommandFailure {
   readonly killed?: boolean;
+  readonly signal?: unknown;
   readonly code?: unknown;
   readonly stdout?: unknown;
   readonly stderr?: unknown;
+}
+
+/**
+ * The codes `execFile` rejects with when a stream exceeds `maxBuffer`, across
+ * the runtimes this plugin runs on.
+ */
+const MAXBUFFER_CODES = new Set(["ERR_CHILD_PROCESS_STDIO_MAXBUFFER", "ENOBUFS"]);
+
+/**
+ * Why a hook command failed, ordered by what the real rejection shapes decide
+ * it: an output-limit rejection names itself in `code` before anything else;
+ * `killed` separates the timeout kill (which also carries a signal) from a
+ * signal death; a numeric `code` is an exit status. The "300s" wording is
+ * truthful everywhere this can be produced: `hookFailure` is only reached
+ * through `runPostCreateHooks`, which always runs hooks with the
+ * `HOOK_TIMEOUT_MS` default — the injected-timeout seam bypasses it.
+ */
+function failureReason(failure: CommandFailure): string {
+  const code = failure.code;
+  if (typeof code === "string" && MAXBUFFER_CODES.has(code)) {
+    return "output limit exceeded (1 MiB)";
+  }
+  if (failure.killed) return "timed out after 300s";
+  if (failure.signal != null) return `terminated by ${String(failure.signal)}`;
+  if (typeof code === "number") return `exit code ${code}`;
+  return `terminated by ${String(code)}`;
 }
 
 /**
@@ -207,25 +297,33 @@ function hookFailure(
   cause: unknown,
 ): Error {
   const failure = cause as CommandFailure;
-  const reason = failure.killed
-    ? "timed out"
-    : typeof failure.code === "number"
-      ? `exit code ${failure.code}`
-      : `terminated by ${String(failure.code)}`;
   return new Error(
-    `post-create hook failed (step ${step} of ${total}): ${command} (${reason})` +
+    `post-create hook failed (step ${step} of ${total}): ${command} ` +
+      `(${failureReason(failure)})` +
       capturedOutput(failure),
     { cause },
   );
 }
 
-/** The captured stdout and stderr of a failed hook; absent when both are empty. */
+/** How much of a failed hook's combined output an error message carries. */
+const CAPTURE_LIMIT = 2048;
+
+/**
+ * The captured stdout and stderr of a failed hook; absent when both are empty.
+ * A hook's output is the only record of what a failed setup tried to say, but
+ * a megabyte of it does not belong inside an error message, so past
+ * `CAPTURE_LIMIT` only the last chunk is kept, behind a truncation marker.
+ */
 function capturedOutput(failure: CommandFailure): string {
   const streams = [failure.stdout, failure.stderr]
     .map((stream) => (typeof stream === "string" ? stream.trim() : ""))
     .filter((stream) => stream !== "");
   if (streams.length === 0) return "";
-  return `\n--- output ---\n${streams.join("\n")}`;
+  const capture = streams.join("\n");
+  if (capture.length > CAPTURE_LIMIT) {
+    return `\n--- output ---\n…output truncated…\n${capture.slice(-CAPTURE_LIMIT)}`;
+  }
+  return `\n--- output ---\n${capture}`;
 }
 
 /** How long `git status` may take before the probe gives up and reports unknown. */

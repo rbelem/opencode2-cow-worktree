@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { readdir, rename, rm, stat } from "node:fs/promises";
-import type { Stats } from "node:fs";
+import type { Dirent, Stats } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 /**
@@ -145,13 +145,26 @@ async function identityMatches(
  * The in-band deletion: everything in the quarantine copy except dependency
  * directories, which are handed to the background tail. With no tail work the
  * quarantine directory is removed here too, so an ordinary removal leaves no
- * trace behind. A child that cannot be deleted fails the removal with the
- * quarantine path in the message — the original path is already vacated, so
- * the remains and their meaning are the one thing the caller must learn.
+ * trace behind. A child — or the listing, or the quarantine copy itself —
+ * that cannot be deleted fails the removal with the quarantine path in the
+ * message: the original path is already vacated, so the remains and their
+ * meaning are the one thing the caller must learn.
  */
 async function deleteInBand(quarantine: string): Promise<void> {
   const heavy: string[] = [];
-  for (const entry of await readdir(quarantine, { withFileTypes: true })) {
+  let entries: Dirent[];
+  try {
+    entries = await readDirectory(quarantine);
+  } catch (cause) {
+    throw new Error(
+      `cow could not finish removing the worktree: reading the quarantine ` +
+        `copy ${quarantine} failed, so remains are left at ${quarantine}. ` +
+        "The original worktree path is gone; the remains hold nothing else " +
+        "and are safe to delete by hand.",
+      { cause },
+    );
+  }
+  for (const entry of entries) {
     const child = join(quarantine, entry.name);
     if (entry.name === HEAVY_DIRECTORY && entry.isDirectory()) {
       heavy.push(child);
@@ -163,7 +176,17 @@ async function deleteInBand(quarantine: string): Promise<void> {
     void deleteHeavyTail(quarantine, heavy);
     return;
   }
-  await removeTree(quarantine);
+  try {
+    await removeTree(quarantine);
+  } catch (cause) {
+    throw new Error(
+      `cow could not finish removing the worktree: deleting the quarantine ` +
+        `copy ${quarantine} failed, so remains are left at ${quarantine}. ` +
+        "The original worktree path is gone; the remains hold nothing else " +
+        "and are safe to delete by hand.",
+      { cause },
+    );
+  }
 }
 
 /**
@@ -262,6 +285,11 @@ function isMissing(cause: unknown): boolean {
 /** `stat`, following symlinks: a symlinked worktree still owns its contents. */
 export async function statDirectory(path: string): Promise<Stats> {
   return stat(path);
+}
+
+/** `readdir`, listing the quarantine copy for the in-band deletion pass. */
+export async function readDirectory(path: string): Promise<Dirent[]> {
+  return readdir(path, { withFileTypes: true });
 }
 
 /** `rename`, the quarantine step and, on a mismatch, the way back. */

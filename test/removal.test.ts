@@ -10,15 +10,16 @@ import {
 } from "node:fs/promises";
 import type { Stats } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import * as removal from "../src/removal";
 
 // The quarantine removal's pins: the original path is never deleted in place,
 // a swapped identity aborts and restores, and every background failure is
 // logged rather than thrown. The filesystem seams (`statDirectory`,
-// `renamePath`, `removeTree`) are spied the way `probeUncommitted` is — the
-// real function is captured before `spyOn` replaces the export, and the mock
-// calls the captured original, never the replaced export.
+// `readDirectory`, `renamePath`, `removeTree`) are spied the way
+// `probeUncommitted` is — the real function is captured before `spyOn`
+// replaces the export, and the mock calls the captured original, never the
+// replaced export.
 
 const scratchDirs: string[] = [];
 
@@ -269,6 +270,94 @@ test("a deletion failure leaves the quarantine dir and is logged as well as thro
     );
     expect(logs.length).toBe(1);
     expect(logs[0]).toContain("remains are left at");
+  } finally {
+    spy.mockRestore();
+    logSpy.mockRestore();
+  }
+});
+
+test("a quarantine listing failure names the quarantine and strands the remains", async () => {
+  const { root, dir, file } = await makePlainDir("cow-removal-noread-");
+  const spy = spyOn(removal, "readDirectory").mockImplementation(() =>
+    Promise.reject(new Error("readdir boom")),
+  );
+  const logs: string[] = [];
+  const logSpy = spyOn(console, "error").mockImplementation((...parts: unknown[]) => {
+    logs.push(parts.join(" "));
+  });
+  try {
+    const error = await removal
+      .removeQuarantined(dir)
+      .then(() => undefined, (failure: unknown) => failure as Error);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error?.message).toContain("remains are left at");
+    expect((error?.cause as Error).message).toBe("readdir boom");
+    // The original path is gone; the whole quarantine copy is the remains.
+    await expect(lstat(dir)).rejects.toThrow();
+    const leftover = await findQuarantine(root);
+    expect(leftover).toBeDefined();
+    expect(await readFile(join(leftover!, basename(file)), "utf8")).toBe(
+      "uncommitted work\n",
+    );
+    expect(error?.message).toContain(leftover!);
+    expect(logs.length).toBe(0);
+  } finally {
+    spy.mockRestore();
+    logSpy.mockRestore();
+  }
+});
+
+test("a failed quarantine-shell delete leaves the remains and says so", async () => {
+  const { root, dir, file } = await makePlainDir("cow-removal-shelldel-");
+  // Fail the quarantine directory itself, after its children went: the path
+  // directly under the scratch root is the shell, anything deeper a child.
+  const realRemoveTree = removal.removeTree;
+  const spy = spyOn(removal, "removeTree").mockImplementation((path: string) => {
+    if (path.includes(".cow-removing-") && dirname(path) === root) {
+      return Promise.reject(new Error("rm boom"));
+    }
+    return realRemoveTree(path);
+  });
+  try {
+    const error = await removal
+      .removeQuarantined(dir)
+      .then(() => undefined, (failure: unknown) => failure as Error);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error?.message).toContain("remains are left at");
+    expect((error?.cause as Error).message).toBe("rm boom");
+    await expect(lstat(dir)).rejects.toThrow();
+    const leftover = await findQuarantine(root);
+    expect(leftover).toBeDefined();
+    // The in-band children went first; the shell delete failing is what
+    // strands the (now empty) quarantine copy.
+    expect(await readdir(leftover!)).toEqual([]);
+    expect(error?.message).toContain(leftover!);
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+test("a tail failure whose cause is not an Error is stringified into the log", async () => {
+  const { root, dir } = await makePlainDir("cow-removal-causestr-");
+  const heavy = await addNodeModules(dir);
+  const quarantine = join(dir, ".quarantine");
+  await mkdir(quarantine);
+  const realRemoveTree = removal.removeTree;
+  const spy = spyOn(removal, "removeTree").mockImplementation((path: string) => {
+    if (path === heavy) return Promise.reject("rm boom string");
+    return realRemoveTree(path);
+  });
+  const logs: string[] = [];
+  const logSpy = spyOn(console, "error").mockImplementation((...parts: unknown[]) => {
+    logs.push(parts.join(" "));
+  });
+  try {
+    await expect(removal.deleteHeavyTail(quarantine, [heavy])).resolves.toBeUndefined();
+    expect(logs.length).toBe(1);
+    expect(logs[0]).toContain(heavy);
+    expect(logs[0]).toContain("rm boom string");
   } finally {
     spy.mockRestore();
     logSpy.mockRestore();

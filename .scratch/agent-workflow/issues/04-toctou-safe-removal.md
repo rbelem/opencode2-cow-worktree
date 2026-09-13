@@ -22,16 +22,16 @@ push, fetch, or touch the origin remote.**
 
 **Status:** ready-for-agent
 
-- [ ] Guard still precedes every mutation; all existing refusal tests pass
+- [x] Guard still precedes every mutation; all existing refusal tests pass
       unchanged in meaning
-- [ ] Identity capture + quarantine rename + re-validation implemented;
+- [x] Identity capture + quarantine rename + re-validation implemented;
       mismatch aborts, attempts rename-back, original intact
-- [ ] Deletion of the renamed directory cannot delete a different directory
+- [x] Deletion of the renamed directory cannot delete a different directory
       than the one whose identity was captured (pinned by test)
-- [ ] `node_modules`-class directories are removed asynchronously after the
+- [x] `node_modules`-class directories are removed asynchronously after the
       removal returns; errors logged, never thrown into the remove path
-- [ ] Removal still registers as removed upstream (prune/verify semantics
+- [x] Removal still registers as removed upstream (prune/verify semantics
       preserved); existing harness remove scenarios still pass
-- [ ] Unit-covered to the repo gate (100% lines + functions); typecheck clean
-- [ ] README removal section documents quarantine + async tail
-- [ ] Committed on `lane-b` in the provided clone
+- [x] Unit-covered to the repo gate (100% lines + functions); typecheck clean
+- [x] README removal section documents quarantine + async tail
+- [x] Committed on `lane-b` in the provided clone

@@ -2,6 +2,7 @@ import { afterEach, expect, spyOn, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
+  chmod,
   lstat,
   mkdir,
   mkdtemp,
@@ -11,7 +12,7 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { cowStrategy, probeUncommitted, runHookCommand, setPostCreateHooks } from "../src/strategy";
 import * as strategyModule from "../src/strategy";
@@ -552,6 +553,34 @@ test("hooks run sequentially in the worktree, with both paths in the environment
   expect(await readFile(join(target, "hook-source.txt"), "utf8")).toBe(resolve(source));
 });
 
+test("relative worktree and source paths reach the hook env as absolute", async () => {
+  // The env contract is absolute by construction, not by the caller's care:
+  // whatever paths the strategy is handed are resolved before they are
+  // installed, so a relative input still yields the absolute value.
+  const { source, target } = await makeHookScratch("cow-hooks-rel-");
+  await cloneCreatingTarget()(source, target);
+
+  await runHookCommand(
+    'printf "%s" "$COW_WORKTREE_PATH" > hook-worktree.txt; ' +
+      'printf "%s" "$COW_SOURCE_DIRECTORY" > hook-source.txt',
+    relative(process.cwd(), target),
+    relative(process.cwd(), source),
+  );
+
+  expect(await readFile(join(target, "hook-worktree.txt"), "utf8")).toBe(resolve(target));
+  expect(await readFile(join(target, "hook-source.txt"), "utf8")).toBe(resolve(source));
+});
+
+test("a hook that reads stdin does not hang until the timeout", async () => {
+  // `cat` blocks on an open stdin pipe; with the hook's stdin at EOF it exits
+  // immediately. The 500ms budget keeps a regression (stdin left open) a fast
+  // timeout rejection instead of a hang.
+  const { source, target } = await makeHookScratch("cow-hooks-stdin-");
+  await cloneCreatingTarget()(source, target);
+
+  await expect(runHookCommand("cat", target, source, 500)).resolves.toBeUndefined();
+});
+
 test("the first hook failure names the command and step, removes the worktree, and stops", async () => {
   const { source, target } = await makeHookScratch("cow-hooks-fail-");
   setPostCreateHooks(["true", "echo boom; exit 3", "printf nope > hook-after.txt"]);
@@ -584,10 +613,22 @@ test("a hook's stderr is captured alongside its stdout", async () => {
   expect(error?.message).toContain("--- output ---\nout\nerr");
 });
 
-test("a timed-out hook counts as a failure, with cleanup", async () => {
-  // The real mechanism: execFile's timeout kills the command and rejects.
-  const { target } = await makeHookScratch("cow-hooks-timeout-cmd-");
-  await expect(runHookCommand("sleep 5", target, target, 50)).rejects.toThrow();
+test("a timed-out hook counts as a failure, with the real rejection shape", async () => {
+  // The real mechanism, with the real shape pinned (probed on Bun 1.4.2):
+  // execFile's timeout kills the command — killed true, signal SIGTERM, code
+  // null — and rejects. The target must exist for the timeout, not a spawn
+  // error, to be what rejects.
+  const { source, target } = await makeHookScratch("cow-hooks-timeout-cmd-");
+  await cloneCreatingTarget()(source, target);
+  const error = await runHookCommand("sleep 5", target, source, 50).then(
+    () => undefined,
+    (failure: unknown) =>
+      failure as Error & { killed?: boolean; signal?: unknown; code?: unknown },
+  );
+
+  expect(error?.killed).toBe(true);
+  expect(error?.signal).toBe("SIGTERM");
+  expect(error?.code).toBeNull();
 });
 
 test("a timed-out hook aborts creation, names the timeout, and removes the worktree", async () => {
@@ -597,7 +638,11 @@ test("a timed-out hook aborts creation, names the timeout, and removes the workt
   // is what execFile's own timeout produces (pinned by the test above).
   const spy = spyOn(strategyModule, "runHookCommand").mockImplementation(
     async () => {
-      throw Object.assign(new Error("sleep 30 killed by SIGTERM"), { killed: true });
+      throw Object.assign(new Error("sleep 30 killed by SIGTERM"), {
+        killed: true,
+        signal: "SIGTERM",
+        code: null,
+      });
     },
   );
   try {
@@ -606,8 +651,11 @@ test("a timed-out hook aborts creation, names the timeout, and removes the workt
       (failure: unknown) => failure as Error,
     );
 
+    // The spy must actually have been driven: a silent mock failure would
+    // otherwise run the real 300s sleep.
+    expect(spy).toHaveBeenCalledTimes(1);
     expect(error?.message).toBe(
-      "post-create hook failed (step 1 of 2): sleep 30 (timed out)",
+      "post-create hook failed (step 1 of 2): sleep 30 (timed out after 300s)",
     );
     await expect(lstat(target)).rejects.toThrow();
   } finally {
@@ -618,8 +666,14 @@ test("a timed-out hook aborts creation, names the timeout, and removes the workt
 test("a hook killed by a signal names the signal", async () => {
   const { source, target } = await makeHookScratch("cow-hooks-signal-");
   setPostCreateHooks(["kill -TERM $$"]);
+  // The shape execFile actually rejects with on a signal death (probed on
+  // Bun 1.4.2): signal set, code null, killed false.
   const spy = spyOn(strategyModule, "runHookCommand").mockImplementation(async () => {
-    throw Object.assign(new Error("terminated"), { code: "SIGTERM" });
+    throw Object.assign(new Error("terminated"), {
+      signal: "SIGTERM",
+      code: null,
+      killed: false,
+    });
   });
   try {
     const error = await createWithFakeClone(source, target).then(
@@ -631,6 +685,108 @@ test("a hook killed by a signal names the signal", async () => {
       "post-create hook failed (step 1 of 1): kill -TERM $$ (terminated by SIGTERM)",
     );
   } finally {
+    spy.mockRestore();
+  }
+});
+
+test("a hook over the output limit is reported as an output limit", async () => {
+  // Real mechanism: execFile's maxBuffer rejects with Bun's
+  // ERR_CHILD_PROCESS_STDIO_MAXBUFFER (Node names it ENOBUFS) instead of the
+  // kill shape, so the message says the output limit, not a signal or a
+  // timeout.
+  const { source, target } = await makeHookScratch("cow-hooks-maxbuf-");
+  setPostCreateHooks(["head -c 2000000 /dev/zero"]);
+
+  const error = await createWithFakeClone(source, target).then(
+    () => undefined,
+    (failure: unknown) => failure as Error,
+  );
+
+  expect(error?.message).toContain(
+    "post-create hook failed (step 1 of 1): " +
+      "head -c 2000000 /dev/zero (output limit exceeded (1 MiB))",
+  );
+  // Same leave-nothing-behind cleanup as any other hook failure.
+  await expect(lstat(target)).rejects.toThrow();
+});
+
+test("a hook's oversized output is capped in the error message", async () => {
+  // Half a megabyte of stdout, with the command still failing on its own exit
+  // status: the message keeps the diagnosis, not the megabyte.
+  const { source, target } = await makeHookScratch("cow-hooks-cap-");
+  setPostCreateHooks(["head -c 512000 /dev/zero | tr '\\0' y; false"]);
+
+  const error = await createWithFakeClone(source, target).then(
+    () => undefined,
+    (failure: unknown) => failure as Error,
+  );
+
+  expect(
+    error?.message.startsWith(
+      "post-create hook failed (step 1 of 1): " +
+        "head -c 512000 /dev/zero | tr '\\0' y; false (exit code 1)",
+    ),
+  ).toBe(true);
+  expect(error?.message).toContain("…output truncated…");
+  expect(error?.message.length).toBeLessThan(3000);
+});
+
+test("an unrecognized failure shape still names its code", async () => {
+  // The defensive tail: a rejection carrying only a non-numeric code — no
+  // real Bun 1.4.2 shape looks like this today — still says something usable
+  // instead of "terminated by null".
+  const { source, target } = await makeHookScratch("cow-hooks-odd-");
+  setPostCreateHooks(["never runs"]);
+  const spy = spyOn(strategyModule, "runHookCommand").mockImplementation(async () => {
+    throw Object.assign(new Error("odd"), { code: "SIGUSR1" });
+  });
+  try {
+    const error = await createWithFakeClone(source, target).then(
+      () => undefined,
+      (failure: unknown) => failure as Error,
+    );
+
+    expect(error?.message).toBe(
+      "post-create hook failed (step 1 of 1): never runs (terminated by SIGUSR1)",
+    );
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+test("a hook failure whose cleanup also fails still reports the hook error", async () => {
+  const { source, target } = await makeHookScratch("cow-hooks-rmfail-");
+  setPostCreateHooks(["echo boom; exit 3"]);
+  // The stand-in clone leaves the target read-only after creating it, so the
+  // failure path's `rm` cannot unlink the file inside and the cleanup itself
+  // fails (as with an immutable or permission-blocked file).
+  const spy = spyOn(cloneModule, "cloneDirectory").mockImplementation(
+    async (_source, targetPath) => {
+      await mkdir(targetPath, { recursive: true });
+      await writeFile(join(targetPath, "stuck.txt"), "unremovable\n");
+      await chmod(targetPath, 0o555);
+    },
+  );
+  try {
+    const signal = new AbortController().signal;
+    const error = await cowStrategy
+      .create({ sourceDirectory: source, directory: target }, { signal })
+      .then(() => undefined, (failure: unknown) => failure as Error);
+
+    // The hook failure keeps first billing: command, step, exit code, output.
+    expect(
+      error?.message.startsWith(
+        "post-create hook failed (step 1 of 1): echo boom; exit 3 (exit code 3)",
+      ),
+    ).toBe(true);
+    expect(error?.message).toContain("Removing the worktree also failed");
+    expect(error?.message).toContain(`the remains are left at ${target}`);
+    // The primary hook cause stays chained.
+    expect((error?.cause as { code?: number }).code).toBe(3);
+    // The cleanup failed, so the remains genuinely are at the path.
+    expect((await lstat(target)).isDirectory()).toBe(true);
+  } finally {
+    await chmod(target, 0o755);
     spy.mockRestore();
   }
 });
