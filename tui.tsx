@@ -35,7 +35,7 @@ async function resolveIsCow(context: PluginContext): Promise<boolean> {
   const directory = context.location?.directory;
   if (!directory) return false;
   const entries = await context.client.worktree.list({ location: { directory } });
-  return strategyBadge(entries, directory) === "cow";
+  return (await strategyBadge(entries, directory)) === "cow";
 }
 
 function Badge(props: { readonly context: PluginContext }) {

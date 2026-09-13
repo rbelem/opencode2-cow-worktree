@@ -12,11 +12,12 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { join, relative, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { cowStrategy, probeUncommitted, runHookCommand, setPostCreateHooks } from "../src/strategy";
-import * as strategyModule from "../src/strategy";
+import { cowStrategy, createCowStrategy } from "../src/strategy";
 import * as cloneModule from "../src/clone";
+import * as hooksModule from "../src/hooks";
+import * as uncommittedModule from "../src/uncommitted";
 import plugin from "../src/plugin";
 import { findCowRoot, findNonCowRoot, hasGit } from "./fs-roots";
 
@@ -34,12 +35,6 @@ afterEach(async () => {
   await Promise.all(
     scratchDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })),
   );
-});
-
-// The hooks are module state installed by the plugin's setup; every hook test
-// configures its own list, and this keeps a leaked list out of later tests.
-afterEach(() => {
-  setPostCreateHooks([]);
 });
 
 function git(repo: string, ...args: string[]): string {
@@ -109,7 +104,10 @@ test("plugin setup registers exactly one strategy, with id cow", async () => {
   expect(plugin.id).toBe("opencode2-cow-worktree");
   expect(added).toHaveLength(1);
   expect(added[0]?.id).toBe("cow");
-  expect(added[0]?.definition).toBe(cowStrategy);
+  // The factory instance the setup builds, not the module-level hookless
+  // default: the registered strategy closes over the validated options.
+  expect(added[0]?.definition).toMatchObject({ id: "cow" });
+  expect(typeof added[0]?.definition.create).toBe("function");
 });
 
 test.skipIf(cowRoot === undefined || !gitOnPath)("a worktree created through the registered strategy is a Deep clone", async () => {
@@ -209,7 +207,8 @@ async function makePlainDir(prefix: string): Promise<{ dir: string; file: string
 test("remove at force: false deletes a clean worktree", async () => {
   // The probe must positively report "clean" to allow a delete, so this uses a
   // real repository with no changes, not a directory without git metadata
-  // (which is unknown and deliberately refuses).
+  // (which is unknown and deliberately refuses). The probe itself is pinned in
+  // test/uncommitted.test.ts.
   test.skipIf(!gitOnPath);
   const signal = new AbortController().signal;
   const dir = await mkdtemp(join(tmpdir(), "cow-remove-clean-"));
@@ -221,7 +220,6 @@ test("remove at force: false deletes a clean worktree", async () => {
   git(dir, "add", "-A");
   git(dir, "commit", "-qm", "scratch");
 
-  expect(await probeUncommitted(dir)).toEqual([]);
   await expect(
     cowStrategy.remove({ directory: dir, force: false }, { signal }),
   ).resolves.toBeUndefined();
@@ -232,7 +230,7 @@ test("remove at force: true deletes without probing", async () => {
   const signal = new AbortController().signal;
   const { dir } = await makePlainDir("cow-remove-forced-");
   let probed = 0;
-  const spy = spyOn(strategyModule, "probeUncommitted").mockImplementation(async () => {
+  const spy = spyOn(uncommittedModule, "probeUncommitted").mockImplementation(async () => {
     probed += 1;
     return ["precious.txt"];
   });
@@ -252,7 +250,7 @@ test("remove at force: true deletes without probing", async () => {
 test("remove at force: false refuses a dirty worktree and every file survives", async () => {
   const signal = new AbortController().signal;
   const { dir, file } = await makePlainDir("cow-remove-dirty-");
-  const spy = spyOn(strategyModule, "probeUncommitted").mockImplementation(async () => [
+  const spy = spyOn(uncommittedModule, "probeUncommitted").mockImplementation(async () => [
     "precious.txt",
     "src/app.ts",
   ]);
@@ -279,7 +277,7 @@ test("remove at force: false refuses a dirty worktree and every file survives", 
 test("remove at force: false refuses when the probe cannot answer", async () => {
   const signal = new AbortController().signal;
   const { dir, file } = await makePlainDir("cow-remove-unknown-");
-  const spy = spyOn(strategyModule, "probeUncommitted").mockImplementation(
+  const spy = spyOn(uncommittedModule, "probeUncommitted").mockImplementation(
     async () => undefined,
   );
   try {
@@ -301,7 +299,6 @@ test("remove at force: false refuses a directory with no git metadata", async ()
   // that unknown must refuse rather than delete.
   const signal = new AbortController().signal;
   const { dir, file } = await makePlainDir("cow-remove-nogit-");
-  expect(await probeUncommitted(dir)).toBeUndefined();
 
   const error = await cowStrategy
     .remove({ directory: dir, force: false }, { signal })
@@ -318,7 +315,6 @@ test("remove at force: false refuses when git itself fails", async () => {
   const signal = new AbortController().signal;
   const { dir, file } = await makePlainDir("cow-remove-badgit-");
   await writeFile(join(dir, ".git"), "not a git directory\n");
-  expect(await probeUncommitted(dir)).toBeUndefined();
 
   const error = await cowStrategy
     .remove({ directory: dir, force: false }, { signal })
@@ -344,7 +340,6 @@ test("remove at force: true deletes a real dirty worktree", async () => {
   git(dir, "commit", "-qm", "scratch");
   await writeFile(join(dir, "tracked.txt"), "uncommitted\n");
 
-  expect(await probeUncommitted(dir)).toEqual(["tracked.txt"]);
   await expect(
     cowStrategy.remove({ directory: dir, force: false }, { signal }),
   ).rejects.toThrow(/cow refuses to remove/);
@@ -399,7 +394,7 @@ test("create rejects a cross-device target before cloning anything", async () =>
   scratchDirs.push(otherDevice);
   const target = join(otherDevice, "clone");
   const signal = new AbortController().signal;
-  const realDeviceOf = await import("../src/tool").then((m) => m.deviceOf);
+  const realDeviceOf = await import("../src/device").then((m) => m.deviceOf);
   const sourceDevice = await realDeviceOf(repo);
   const otherDeviceNumber = (sourceDevice ?? 0) + 1;
   // Report the target parent on a different device than the real source; all
@@ -407,7 +402,7 @@ test("create rejects a cross-device target before cloning anything", async () =>
   const probeDevice = async (path: string) =>
     path === otherDevice ? otherDeviceNumber : realDeviceOf(path);
 
-  const spy = spyOn(await import("../src/tool"), "deviceOf").mockImplementation(probeDevice);
+  const spy = spyOn(await import("../src/device"), "deviceOf").mockImplementation(probeDevice);
   try {
     const error = await cowStrategy
       .create({ sourceDirectory: repo, directory: target }, { signal })
@@ -432,7 +427,7 @@ test("create proceeds when source and target share a device", async () => {
   const { repo } = await makeScratchRepo(cowRoot ?? "/tmp");
   const target = join(repo, "..", "clone");
   const signal = new AbortController().signal;
-  const realDeviceOf = await import("../src/tool").then((m) => m.deviceOf);
+  const realDeviceOf = await import("../src/device").then((m) => m.deviceOf);
   const sourceDevice = await realDeviceOf(repo);
   const probeDevice = async (path: string) => {
     const device = await realDeviceOf(path);
@@ -440,7 +435,7 @@ test("create proceeds when source and target share a device", async () => {
     return path === join(repo, "..") ? sourceDevice : device;
   };
 
-  const spy = spyOn(await import("../src/tool"), "deviceOf").mockImplementation(probeDevice);
+  const spy = spyOn(await import("../src/device"), "deviceOf").mockImplementation(probeDevice);
   try {
     // Same devices: the pre-flight never rejects, so on a CoW root the clone
     // runs to completion. Off a CoW root the clone's own wrapper is the only
@@ -501,15 +496,16 @@ function cloneCreatingTarget(): typeof cloneModule.cloneDirectory {
   };
 }
 
-/** Runs the registered strategy's create with the real clone replaced. */
+/** Runs a strategy's create with the real clone replaced. */
 async function createWithFakeClone(
+  strategy: typeof cowStrategy,
   source: string,
   target: string,
 ): Promise<{ directory: string } | undefined> {
   const spy = spyOn(cloneModule, "cloneDirectory").mockImplementation(cloneCreatingTarget());
   try {
     const signal = new AbortController().signal;
-    return await cowStrategy.create({ sourceDirectory: source, directory: target }, { signal });
+    return await strategy.create({ sourceDirectory: source, directory: target }, { signal });
   } finally {
     spy.mockRestore();
   }
@@ -517,7 +513,6 @@ async function createWithFakeClone(
 
 test("with no hooks configured, create behaves exactly as before", async () => {
   const { source, target } = await makeHookScratch("cow-hooks-none-");
-  setPostCreateHooks([]);
 
   const spy = spyOn(cloneModule, "cloneDirectory").mockImplementation(cloneCreatingTarget());
   try {
@@ -538,54 +533,30 @@ test("with no hooks configured, create behaves exactly as before", async () => {
 
 test("hooks run sequentially in the worktree, with both paths in the environment", async () => {
   const { source, target } = await makeHookScratch("cow-hooks-run-");
-  setPostCreateHooks([
-    "printf one >> hook-order.txt",
-    "printf two >> hook-order.txt",
-    // Relative writes land in the worktree only if it is the command's cwd.
-    'printf "%s" "$COW_WORKTREE_PATH" > hook-worktree.txt',
-    'printf "%s" "$COW_SOURCE_DIRECTORY" > hook-source.txt',
-  ]);
+  const strategy = createCowStrategy({
+    postCreate: [
+      "printf one >> hook-order.txt",
+      "printf two >> hook-order.txt",
+      // Relative writes land in the worktree only if it is the command's cwd.
+      'printf "%s" "$COW_WORKTREE_PATH" > hook-worktree.txt',
+      'printf "%s" "$COW_SOURCE_DIRECTORY" > hook-source.txt',
+    ],
+  });
 
-  await createWithFakeClone(source, target);
+  await createWithFakeClone(strategy, source, target);
 
   expect(await readFile(join(target, "hook-order.txt"), "utf8")).toBe("onetwo");
   expect(await readFile(join(target, "hook-worktree.txt"), "utf8")).toBe(resolve(target));
   expect(await readFile(join(target, "hook-source.txt"), "utf8")).toBe(resolve(source));
 });
 
-test("relative worktree and source paths reach the hook env as absolute", async () => {
-  // The env contract is absolute by construction, not by the caller's care:
-  // whatever paths the strategy is handed are resolved before they are
-  // installed, so a relative input still yields the absolute value.
-  const { source, target } = await makeHookScratch("cow-hooks-rel-");
-  await cloneCreatingTarget()(source, target);
-
-  await runHookCommand(
-    'printf "%s" "$COW_WORKTREE_PATH" > hook-worktree.txt; ' +
-      'printf "%s" "$COW_SOURCE_DIRECTORY" > hook-source.txt',
-    relative(process.cwd(), target),
-    relative(process.cwd(), source),
-  );
-
-  expect(await readFile(join(target, "hook-worktree.txt"), "utf8")).toBe(resolve(target));
-  expect(await readFile(join(target, "hook-source.txt"), "utf8")).toBe(resolve(source));
-});
-
-test("a hook that reads stdin does not hang until the timeout", async () => {
-  // `cat` blocks on an open stdin pipe; with the hook's stdin at EOF it exits
-  // immediately. The 500ms budget keeps a regression (stdin left open) a fast
-  // timeout rejection instead of a hang.
-  const { source, target } = await makeHookScratch("cow-hooks-stdin-");
-  await cloneCreatingTarget()(source, target);
-
-  await expect(runHookCommand("cat", target, source, 500)).resolves.toBeUndefined();
-});
-
 test("the first hook failure names the command and step, removes the worktree, and stops", async () => {
   const { source, target } = await makeHookScratch("cow-hooks-fail-");
-  setPostCreateHooks(["true", "echo boom; exit 3", "printf nope > hook-after.txt"]);
+  const strategy = createCowStrategy({
+    postCreate: ["true", "echo boom; exit 3", "printf nope > hook-after.txt"],
+  });
 
-  const error = await createWithFakeClone(source, target).then(
+  const error = await createWithFakeClone(strategy, source, target).then(
     () => undefined,
     (failure: unknown) => failure as Error,
   );
@@ -602,9 +573,9 @@ test("the first hook failure names the command and step, removes the worktree, a
 
 test("a hook's stderr is captured alongside its stdout", async () => {
   const { source, target } = await makeHookScratch("cow-hooks-err-");
-  setPostCreateHooks(["printf out; printf err >&2; false"]);
+  const strategy = createCowStrategy({ postCreate: ["printf out; printf err >&2; false"] });
 
-  const error = await createWithFakeClone(source, target).then(
+  const error = await createWithFakeClone(strategy, source, target).then(
     () => undefined,
     (failure: unknown) => failure as Error,
   );
@@ -613,30 +584,15 @@ test("a hook's stderr is captured alongside its stdout", async () => {
   expect(error?.message).toContain("--- output ---\nout\nerr");
 });
 
-test("a timed-out hook counts as a failure, with the real rejection shape", async () => {
-  // The real mechanism, with the real shape pinned (probed on Bun 1.4.2):
-  // execFile's timeout kills the command — killed true, signal SIGTERM, code
-  // null — and rejects. The target must exist for the timeout, not a spawn
-  // error, to be what rejects.
-  const { source, target } = await makeHookScratch("cow-hooks-timeout-cmd-");
-  await cloneCreatingTarget()(source, target);
-  const error = await runHookCommand("sleep 5", target, source, 50).then(
-    () => undefined,
-    (failure: unknown) =>
-      failure as Error & { killed?: boolean; signal?: unknown; code?: unknown },
-  );
-
-  expect(error?.killed).toBe(true);
-  expect(error?.signal).toBe("SIGTERM");
-  expect(error?.code).toBeNull();
-});
+// The hook runner's own mechanics — env absoluteness, stdin, the timeout
+// kill shape — are pinned where the code lives, in test/hooks.test.ts.
 
 test("a timed-out hook aborts creation, names the timeout, and removes the worktree", async () => {
   const { source, target } = await makeHookScratch("cow-hooks-timeout-");
-  setPostCreateHooks(["sleep 30", "printf nope > hook-after.txt"]);
+  const strategy = createCowStrategy({ postCreate: ["sleep 30", "printf nope > hook-after.txt"] });
   // `runHookCommand` is the seam the timeout flows through; the killed shape
   // is what execFile's own timeout produces (pinned by the test above).
-  const spy = spyOn(strategyModule, "runHookCommand").mockImplementation(
+  const spy = spyOn(hooksModule, "runHookCommand").mockImplementation(
     async () => {
       throw Object.assign(new Error("sleep 30 killed by SIGTERM"), {
         killed: true,
@@ -646,7 +602,7 @@ test("a timed-out hook aborts creation, names the timeout, and removes the workt
     },
   );
   try {
-    const error = await createWithFakeClone(source, target).then(
+    const error = await createWithFakeClone(strategy, source, target).then(
       () => undefined,
       (failure: unknown) => failure as Error,
     );
@@ -665,10 +621,10 @@ test("a timed-out hook aborts creation, names the timeout, and removes the workt
 
 test("a hook killed by a signal names the signal", async () => {
   const { source, target } = await makeHookScratch("cow-hooks-signal-");
-  setPostCreateHooks(["kill -TERM $$"]);
+  const strategy = createCowStrategy({ postCreate: ["kill -TERM $$"] });
   // The shape execFile actually rejects with on a signal death (probed on
   // Bun 1.4.2): signal set, code null, killed false.
-  const spy = spyOn(strategyModule, "runHookCommand").mockImplementation(async () => {
+  const spy = spyOn(hooksModule, "runHookCommand").mockImplementation(async () => {
     throw Object.assign(new Error("terminated"), {
       signal: "SIGTERM",
       code: null,
@@ -676,7 +632,7 @@ test("a hook killed by a signal names the signal", async () => {
     });
   });
   try {
-    const error = await createWithFakeClone(source, target).then(
+    const error = await createWithFakeClone(strategy, source, target).then(
       () => undefined,
       (failure: unknown) => failure as Error,
     );
@@ -695,9 +651,9 @@ test("a hook over the output limit is reported as an output limit", async () => 
   // kill shape, so the message says the output limit, not a signal or a
   // timeout.
   const { source, target } = await makeHookScratch("cow-hooks-maxbuf-");
-  setPostCreateHooks(["head -c 2000000 /dev/zero"]);
+  const strategy = createCowStrategy({ postCreate: ["head -c 2000000 /dev/zero"] });
 
-  const error = await createWithFakeClone(source, target).then(
+  const error = await createWithFakeClone(strategy, source, target).then(
     () => undefined,
     (failure: unknown) => failure as Error,
   );
@@ -714,9 +670,11 @@ test("a hook's oversized output is capped in the error message", async () => {
   // Half a megabyte of stdout, with the command still failing on its own exit
   // status: the message keeps the diagnosis, not the megabyte.
   const { source, target } = await makeHookScratch("cow-hooks-cap-");
-  setPostCreateHooks(["head -c 512000 /dev/zero | tr '\\0' y; false"]);
+  const strategy = createCowStrategy({
+    postCreate: ["head -c 512000 /dev/zero | tr '\\0' y; false"],
+  });
 
-  const error = await createWithFakeClone(source, target).then(
+  const error = await createWithFakeClone(strategy, source, target).then(
     () => undefined,
     (failure: unknown) => failure as Error,
   );
@@ -736,12 +694,12 @@ test("an unrecognized failure shape still names its code", async () => {
   // real Bun 1.4.2 shape looks like this today — still says something usable
   // instead of "terminated by null".
   const { source, target } = await makeHookScratch("cow-hooks-odd-");
-  setPostCreateHooks(["never runs"]);
-  const spy = spyOn(strategyModule, "runHookCommand").mockImplementation(async () => {
+  const strategy = createCowStrategy({ postCreate: ["never runs"] });
+  const spy = spyOn(hooksModule, "runHookCommand").mockImplementation(async () => {
     throw Object.assign(new Error("odd"), { code: "SIGUSR1" });
   });
   try {
-    const error = await createWithFakeClone(source, target).then(
+    const error = await createWithFakeClone(strategy, source, target).then(
       () => undefined,
       (failure: unknown) => failure as Error,
     );
@@ -756,7 +714,7 @@ test("an unrecognized failure shape still names its code", async () => {
 
 test("a hook failure whose cleanup also fails still reports the hook error", async () => {
   const { source, target } = await makeHookScratch("cow-hooks-rmfail-");
-  setPostCreateHooks(["echo boom; exit 3"]);
+  const strategy = createCowStrategy({ postCreate: ["echo boom; exit 3"] });
   // The stand-in clone leaves the target read-only after creating it, so the
   // failure path's `rm` cannot unlink the file inside and the cleanup itself
   // fails (as with an immutable or permission-blocked file).
@@ -769,7 +727,7 @@ test("a hook failure whose cleanup also fails still reports the hook error", asy
   );
   try {
     const signal = new AbortController().signal;
-    const error = await cowStrategy
+    const error = await strategy
       .create({ sourceDirectory: source, directory: target }, { signal })
       .then(() => undefined, (failure: unknown) => failure as Error);
 

@@ -2,9 +2,10 @@ import type { Context } from "@opencode-ai/plugin";
 import { stat } from "node:fs/promises";
 import { probeCowCapability } from "./capability";
 import { fallbackPolicy, postCreateHooks, targetRoot } from "./config";
-import { deviceOf, isDirectory, listCowWorktrees, spawnWorkspace } from "./tool";
+import { deviceOf, isDirectory } from "./device";
+import { listCowWorktrees, spawnWorkspace } from "./tool";
 import type { SpawnWorkspaceDeps, SpawnWorkspaceInput } from "./tool";
-import { cowStrategy, setPostCreateHooks } from "./strategy";
+import { createCowStrategy } from "./strategy";
 
 /**
  * The tool's input schema, as the v2 plugin API expects a JSON Schema. Kept a
@@ -164,12 +165,12 @@ export default {
   async setup(ctx: Context): Promise<void> {
     // Validated here, before anything is registered: a misconfigured hook list
     // must fail the plugin load, not surface halfway through a create. The
-    // strategy has no access to `ctx`, so the validated commands are installed
-    // on it — the module-level object opencode2 registers, which every create
-    // entry path (API, TUI, `spawn_workspace`) runs through.
-    setPostCreateHooks(postCreateHooks(ctx.options));
+    // factory closes over the validated commands — the setup-ordering contract
+    // ("validate before register") holds by construction, with no module-level
+    // hook state to install.
+    const strategy = createCowStrategy({ postCreate: postCreateHooks(ctx.options) });
     await ctx.worktree.transform((editor) => {
-      editor.add(cowStrategy);
+      editor.add(strategy);
     });
     // `?.`: the installed plugin package is a v1 build whose Context has no
     // tool domain; the v2 binary always provides it. Optional chaining keeps
