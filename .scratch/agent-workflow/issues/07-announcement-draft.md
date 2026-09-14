@@ -26,7 +26,7 @@ rather than inventing one).
 
 **Blocked by:** None (can start immediately).
 
-**Status:** ready-for-agent
+**Status:** draft delivered (docs/announcement-draft.md); posting stays owner
 
 - [ ] Draft covers what/why, verification receipts, honest limits, and
       install pointer
