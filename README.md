@@ -7,8 +7,8 @@ milliseconds at almost no disk cost. Where a `git worktree` carries tracked
 files only, a **Deep clone** here carries everything, so the agent can run the
 test suite immediately.
 
-In daily use. Not yet published to npm; you install it as a local plugin
-directory (below).
+In daily use, and published to npm. Install from a local checkout (form A
+below) or from the npm registry.
 
 ## Requirements
 

@@ -2,8 +2,7 @@
 
 ## 0.1.0
 
-The first prepared release cut. The package is still `private: true`; this
-entry marks what a publish would ship.
+The first release: tagged `v0.1.0` and published to npm.
 
 - **`cow` Strategy**: Deep clones via forced reflink (Linux
   `COPYFILE_FICLONE_FORCE`, macOS `copyfile(3)` through `bun:ffi`), a fail-loud
