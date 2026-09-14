@@ -2,7 +2,7 @@
  * The impure half of `cow`'s remove guard: the `git status --porcelain` probe
  * that reports a worktree's uncommitted changes, or the deliberate "unknown".
  *
- * Split out of `strategy.ts` (ticket 10) so it sits beside the pure decision
+ * Split out of `strategy.ts` so it sits beside the pure decision
  * it feeds — `dirty.ts`'s `mayRemove`, which stays free of I/O. This module
  * owns the subprocess: `execFile` runs `git` directly, no shell, and every
  * failure mode (no metadata, non-zero exit, timeout, no git on the machine)

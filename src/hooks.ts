@@ -7,7 +7,7 @@
  * registers the same strategy object) gets them. Attach never reaches this
  * code: it binds a session to an existing directory and clones nothing.
  *
- * Split out of `strategy.ts` (ticket 10) so the strategy is the thin
+ * Split out of `strategy.ts` so the strategy is the thin
  * composition layer: it closes over the validated hook list and calls
  * `runPostCreateHooks` after a successful clone; this module owns the
  * mechanics of running the commands and turning a failure into the

@@ -4,7 +4,10 @@ A copy-on-write worktree strategy for [opencode2](https://opencode.ai). Gives
 each parallel agent a complete, independent working directory — ignored files
 included — at the cost of shared extents rather than a real copy.
 
-Work in progress. Not published, not battle tested. Announced only when it is.
+In daily use, and hardened accordingly: a 31-scenario live swarm
+(`docs/e2e/run-2026-09-12-swarm.md`), a four-scenario e2e harness, and a 100%
+lines-and-functions coverage gate. Not yet published to npm; the install is a
+local plugin directory (below).
 
 ## Why
 
@@ -34,20 +37,25 @@ The implementation is here and it runs. This plugin:
 - has a Linux backend (per-file `COPYFILE_FICLONE_FORCE` reflink) and a macOS
   backend (`copyfile(3)` with `COPYFILE_CLONE_FORCE` through `bun:ffi`) behind a
   platform seam;
-- passes the unit suite (`bun test`);
-- passes an e2e harness run against a real
-  `opencode2 v0.0.0-next-20260910` server;
+- passes the unit suite (`bun test`) with a 100% lines-and-functions coverage
+  gate on `src/`;
+- passes a four-scenario e2e harness (105 checks) against a real opencode2
+  server;
 - is installed and activated in a real opencode2 config, with CI measuring the
   macOS backend's shared extents on both an arm64 and an x86_64 runner.
 
-What the e2e run proved: plugin installation through the real loader, a fan-out
-of three parallel **Worktrees** each with a session of its own, genuine
-independence (each saw only its own marker and log line; the source was
-untouched), a real **Deep clone** per worktree (ignored files present, symlinks
-are links, a standalone `.git` with no alternates, matching `git status`), shared
-extents measured on btrfs against a `cp --reflink=never` control,
-`GET /api/worktree` listing each directory as `strategy: "cow"`, fail-loud on a
-tmpfs source, and clean removal.
+What the e2e harness proves (105 checks over four scenarios): plugin
+installation through the real loader; `cow` creates driven through the real
+API, each with a session of its own; attach, where a second call binds a new
+session to the existing directory instead of cloning; `list_worktrees`
+reporting the inventory; post-create hooks running, and rolling the create
+back when one fails; genuine independence (each worktree saw only its own
+marker and log line; the source was untouched); a real **Deep clone** per
+worktree (ignored files present, symlinks are links, a standalone `.git` with
+no alternates, matching `git status`); shared extents measured on btrfs
+against a `cp --reflink=never` control; `GET /api/worktree` listing each
+directory as `strategy: "cow"`; fail-loud on a tmpfs source; and clean
+removal.
 
 What it did **not** prove: the run drove `POST /api/worktree` and
 `POST /api/session` directly and performed the per-worktree edits itself. The
@@ -83,11 +91,14 @@ is materialized, registering the `cow` Strategy and the `spawn_workspace` tool:
 export default {
   id: "opencode2-cow-worktree",
   async setup(ctx: Context): Promise<void> {
+    // Every option is validated here, once: a bad value fails the plugin load.
+    const hooks = postCreateHooks(ctx.options);
     await ctx.worktree.transform((editor) => {
-      editor.add(cowStrategy); // registers `cow`, and makes it the Location default
+      editor.add(createCowStrategy({ postCreate: hooks })); // registers `cow`, and makes it the Location default
     });
     await ctx.tool?.transform((editor) => {
       editor.add({ name: "spawn_workspace" /* input, execute */ });
+      editor.add({ name: "list_worktrees" });
     });
   },
 };
@@ -95,19 +106,25 @@ export default {
 
 ```ts
 // src/strategy.ts (condensed)
-export const cowStrategy: WorktreeDefinition = {
-  id: "cow",
-  async create(input, { signal }) {
-    signal.throwIfAborted();
-    await cloneDirectory(input.sourceDirectory, input.directory); // Deep clone
-    return { directory: input.directory };
-  },
-  async remove(input) {
-    // guard first, then the quarantine removal described under **Removal** below
-    await removeQuarantined(input.directory);
-  },
-  list: async () => [], // inventory lives in opencode2, not in the Strategy
-};
+export function createCowStrategy(
+  { postCreate }: { readonly postCreate: readonly string[] },
+): WorktreeDefinition {
+  return {
+    id: "cow",
+    async create(input, { signal }) {
+      signal.throwIfAborted();
+      // Deep clone; refuses an occupied target before the first write.
+      await cloneDirectory(input.sourceDirectory, input.directory);
+      await runPostCreateHooks(postCreate, input.directory, input.sourceDirectory);
+      return { directory: input.directory };
+    },
+    async remove(input) {
+      // guard first, then the quarantine removal described under **Removal** below
+      await removeQuarantined(input.directory);
+    },
+    list: async () => [], // inventory lives in opencode2, not in the Strategy
+  };
+}
 ```
 
 Everything else is inherited from the worktree subsystem: create, remove, list,
@@ -136,6 +153,12 @@ session starts and with no filesystem change: a `git`-strategy Worktree, a path
 the inventory does not know (a Foreign worktree), or a `cow` row that lost its
 Deep-clone shape.
 
+**Occupied targets.** A create whose target path already exists is refused
+before the first write: `cow` never merges into, or later deletes, a directory
+it did not create. If a directory appears at the predicted path after the
+tool's checks and before the clone, the create fails naming the path and
+whatever is there is left untouched. Resolve the path and re-run.
+
 **List.** The `list_worktrees` tool lists the Location's CoW worktrees: each
 entry carries the directory basename as `name`, plus `directory`, `strategy`,
 and `createdAt` from a stat of the directory (birthtime, falling back to mtime
@@ -146,8 +169,9 @@ server plugins cannot enumerate sessions, and an honest absence beats a stale
 one. An inventory row whose directory cannot be read fails the list rather
 than being silently skipped.
 
-**Removal.** The `cow` strategy never deletes a worktree path in place. After
-the uncommitted-work guard (which still precedes every filesystem change), the
+**Removal.** The strategy's `remove` never deletes a worktree path in place.
+After the uncommitted-work guard (which still precedes every filesystem
+change), the
 directory is stat'd to capture its identity (device + inode), renamed to a
 sibling `.cow-removing-<name>-<random>` in the same parent, and the quarantine
 path is stat'd again: only when the identity still matches is the copy
@@ -299,8 +323,8 @@ list and every other project keeps the global default.
 
 The fallback is **tool-only**. `POST /api/worktree {strategy: "cow"}` invokes the
 `cow` Strategy directly, and that Strategy always fails loudly on a non-CoW
-source regardless of `options.fallback` (findings #5). Only a `spawn_workspace`
-call consults the policy.
+source regardless of `options.fallback`. Only a `spawn_workspace` call
+consults the policy.
 
 Runtime requirements:
 
@@ -321,8 +345,8 @@ Runtime requirements:
 
 If you are checking an install, note that `GET /api/plugin` does not await
 activation; the configured plugin appears only after
-`POST /api/plugin/await-activation` resolves (findings #3). A list taken
-immediately after boot can wrongly look empty.
+`POST /api/plugin/await-activation` resolves. A list taken immediately after
+boot can wrongly look empty.
 
 ## Testing
 
@@ -333,16 +357,19 @@ bun scripts/e2e/harness.ts        # end-to-end; needs opencode2 on PATH, git, cp
 bun scripts/dogfood-install-check.ts  # proves a real config install; needs opencode2 on PATH, git
 ```
 
-The unit tests cover capability classification, the recursive Deep clone,
-platform dispatch and the Darwin decision logic (with an injected syscall), the
-Strategy, the tool's decision table including the fallback, and plugin
-registration/fallback wiring.
+The unit tests cover capability classification (including the cache contract),
+the Deep clone and its occupancy refusal, platform dispatch and the Darwin
+decision logic (with an injected syscall), the post-create hooks, the
+dirty-worktree guard and its git probe, the quarantine removal, the device
+seam, the tool's decision table including attach and the fallback, and plugin
+registration wiring.
 
 The e2e harness starts a real `opencode2 serve` against a throwaway config root
 that never touches your real config, installs the plugin by directory, activates
-it, and runs the fan-out, independence, Deep-clone, inventory, non-CoW
-fail-loud, and removal checks. The recorded run is
-[`docs/e2e/run-2026-09-11.md`](docs/e2e/run-2026-09-11.md).
+it, and runs the create, attach, list, hooks, independence, Deep-clone,
+inventory, non-CoW fail-loud, and removal checks. Each run is recorded under
+[`docs/e2e/`](docs/e2e); the 31-scenario parallel-agent swarm is
+[`docs/e2e/run-2026-09-12-swarm.md`](docs/e2e/run-2026-09-12-swarm.md).
 
 What remains unproven, and is not papered over here:
 
