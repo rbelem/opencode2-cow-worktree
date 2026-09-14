@@ -128,7 +128,10 @@ mechanics are in
    is not usable with this account.
 3. Verify before celebrating: `npm view <name> version` resolves, and
    `npm install <name>` into a scratch plugin directory imports the entry
-   under Bun with the expected `default.id`.
+   under Bun with the expected `default.id`. npm's success notice
+   (`+ name@version`) precedes registry visibility by minutes — poll the
+   registry doc (`curl -H "cache-control: no-cache"
+   https://registry.npmjs.org/<name>`) instead of re-publishing.
 4. Tag and release: `git tag -a vX.Y.Z`, push the tag, then
    `gh release create vX.Y.Z --title "vX.Y.Z" --notes "$(sed -n '/^## X.Y.Z/,$p' CHANGELOG.md)"`.
 5. Land any README changes the publish exposed as a follow-up commit. The
