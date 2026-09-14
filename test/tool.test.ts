@@ -624,17 +624,18 @@ test("a name that is not a simple directory name is rejected before any probe", 
   }
 });
 
-test.skipIf(cowRoot === undefined)(
-  "isDirectory distinguishes a directory, a file, and a missing path",
-  async () => {
-    const dir = await scratchDir();
-    const file = join(dir, "a-file");
-    await writeFile(file, "x");
-    expect(await isDirectory(dir)).toBe(true);
-    expect(await isDirectory(file)).toBe(false);
-    expect(await isDirectory(join(dir, "missing"))).toBe(false);
-  },
-);
+test("isDirectory distinguishes a directory, a file, and a missing path", async () => {
+  // The live binding is plain `stat` (src/device.ts): a real directory, file,
+  // and missing path are all it asks for, so no CoW filesystem is needed and
+  // this never skips.
+  const dir = await mkdtemp(join(tmpdir(), "cow-tool-isdir-"));
+  scratchDirs.push(dir);
+  const file = join(dir, "a-file");
+  await writeFile(file, "x");
+  expect(await isDirectory(dir)).toBe(true);
+  expect(await isDirectory(file)).toBe(false);
+  expect(await isDirectory(join(dir, "missing"))).toBe(false);
+});
 
 test("the reported mechanism always equals the strategy that produced the directory", async () => {
   for (const capability of [
@@ -921,9 +922,15 @@ test("the registered tool attaches through ctx.worktree.list and reports it", as
     name: string;
     execute: (input: unknown) => Promise<{ output: unknown; content: string }>;
   }> = [];
-  const dir = await scratchDir();
-  // A real existing cow worktree beside the source: the Deep-clone check is
-  // wired to the real filesystem, so the directory and its `.git` must exist.
+  // The attach path consults the real filesystem only for the Deep-clone
+  // signature (`<target>` and `<target>/.git` being directories) — attach
+  // attempts no clone, so it never probes CoW capability (src/tool.ts). A
+  // plain writable directory is a faithful fixture, and the test runs — rather
+  // than skips — on non-CoW machines too.
+  const dir = await mkdtemp(join(tmpdir(), "cow-tool-att-"));
+  scratchDirs.push(dir);
+  // A real directory carrying the Deep-clone signature, beside the source; the
+  // inventory row below is what says "cow".
   const target = join(dir, "..", "att");
   scratchDirs.push(target);
   await mkdir(join(target, ".git"), { recursive: true });

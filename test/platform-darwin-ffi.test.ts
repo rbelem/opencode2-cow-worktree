@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "bun:test";
 import { ptr } from "bun:ffi";
 import { DARWIN_CLONE_FLAGS } from "../src/platform-darwin";
 import {
@@ -19,6 +19,16 @@ import type { CopyfileLibrary, LibraryLoad } from "../src/platform-darwin-ffi";
 // is process-lifetime, so a fake left behind would make a forced-Darwin call
 // succeed on Linux somewhere else in the suite.
 afterEach(() => {
+  resetCopyfileLibrary();
+});
+
+// The leak-guard is not enough on its own: bun test's file order is not
+// alphabetical, and on macOS an earlier file can exercise the real darwin
+// backend, populating the process-lifetime cache through the real dlopen.
+// Starting every test here from an empty cache is what makes the injected
+// loader observable and the "loads once" pin honest regardless of what ran
+// before this file.
+beforeEach(() => {
   resetCopyfileLibrary();
 });
 

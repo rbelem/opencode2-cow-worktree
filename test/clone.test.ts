@@ -340,6 +340,20 @@ test.skipIf(cowRoot === undefined || !gitOnPath)("rejects a target that contains
   await expect(lstat(join(repo, "src", "src"))).rejects.toThrow();
 });
 
+test("the contains-source guard throws before any I/O", async () => {
+  // The same refusal as the real-repo pin above, one layer earlier: the guard
+  // fires before the walker or the backend run, so no CoW filesystem and no
+  // git are needed and this never skips. The directory only gives `resolve` a
+  // real absolute path; it is removed by the same `afterEach` as every other
+  // scratch dir.
+  const dir = await mkdtemp(join(tmpdir(), "cow-inside-"));
+  scratchDirs.push(dir);
+
+  const error = await captureError(cloneDirectory(join(dir, "src"), dir));
+  expect(error).toBeDefined();
+  expect((error as Error).message).toMatch(/target contains the source/i);
+});
+
 // --- the occupancy guard (ticket 08) ---
 //
 // `cow` never writes into, or deletes, bytes it did not create, so any
