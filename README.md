@@ -22,6 +22,14 @@ directory (below).
 
 ## Install
 
+**What installing changes.** Registering the plugin makes `cow` opencode2's
+default worktree strategy everywhere — TUI, API, and tool calls. There is no
+capability gate on that default: on a filesystem that cannot reflink (ext4,
+tmpfs), worktree creation fails loudly until you remove the plugin. Install
+it only on machines whose projects meet the Requirements above. opencode2
+Desktop cannot select plugin strategies today, so it ignores the plugin
+entirely (`docs/research/desktop-strategy-hardcode.md`).
+
 Two forms. Pick one. Having both makes opencode2 load the tree twice, and the
 duplicate load fails.
 
