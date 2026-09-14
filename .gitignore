@@ -1,6 +1,9 @@
 node_modules
 *.log
 
+# Local agent-workflow scratch (ticket board, specs); never committed
+.scratch/
+
 # Local output of scripts/verify-apfs (CI uploads it as an artifact)
 apfs-verification.txt
 

@@ -140,5 +140,4 @@ mechanics are in
 
 Design history: ADRs 0001 (rollback on failed create), 0002 (Darwin backend),
 and 0003 (derive listing/attach from the upstream inventory, no plugin-owned
-registry) live in `docs/adr/`, with research notes in `docs/research/` and
-the development ticket board in `.scratch/agent-workflow/issues/`.
+registry) live in `docs/adr/`, with research notes in `docs/research/`.
