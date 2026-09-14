@@ -154,8 +154,8 @@ test.skipIf(!onLinux || cowRoot === undefined)("cloneFile with no override takes
   expect(await readFile(join(dir, "target"), "utf8")).toBe("linux only\n");
 });
 
-test.skipIf(!onLinux || cowRoot === undefined)("the Darwin branch is unreachable on Linux even when forced", async () => {
-  const dir = await scratch(cowRoot!);
+test.skipIf(!onLinux)("the Darwin branch is unreachable on Linux even when forced", async () => {
+  const dir = await scratch();
   const source = join(dir, "source");
   await writeFile(source, "x\n");
   const alwaysDarwin: PlatformCheck = () => true;
@@ -166,8 +166,9 @@ test.skipIf(!onLinux || cowRoot === undefined)("the Darwin branch is unreachable
   resetCopyfileLibrary();
 
   // Forcing the Darwin branch on Linux must fail (bun:ffi cannot load
-  // libSystem.B.dylib), never silently produce a copy. This is the seam's
-  // fail-closed property, asserted where it can actually run.
+  // libSystem.B.dylib), never silently produce a copy. The failure happens in
+  // the loader, before the paths are touched, so no CoW filesystem is needed
+  // and this never skips on Linux.
   const error = await cloneFile(source, join(dir, "target"), alwaysDarwin).then(
     () => undefined,
     (failure: unknown) => failure as Error,

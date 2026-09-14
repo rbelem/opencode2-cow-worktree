@@ -624,17 +624,18 @@ test("a name that is not a simple directory name is rejected before any probe", 
   }
 });
 
-test.skipIf(cowRoot === undefined)(
-  "isDirectory distinguishes a directory, a file, and a missing path",
-  async () => {
-    const dir = await scratchDir();
-    const file = join(dir, "a-file");
-    await writeFile(file, "x");
-    expect(await isDirectory(dir)).toBe(true);
-    expect(await isDirectory(file)).toBe(false);
-    expect(await isDirectory(join(dir, "missing"))).toBe(false);
-  },
-);
+test("isDirectory distinguishes a directory, a file, and a missing path", async () => {
+  // The live binding is plain `stat` (src/device.ts): a real directory, file,
+  // and missing path are all it asks for, so no CoW filesystem is needed and
+  // this never skips.
+  const dir = await mkdtemp(join(tmpdir(), "cow-tool-isdir-"));
+  scratchDirs.push(dir);
+  const file = join(dir, "a-file");
+  await writeFile(file, "x");
+  expect(await isDirectory(dir)).toBe(true);
+  expect(await isDirectory(file)).toBe(false);
+  expect(await isDirectory(join(dir, "missing"))).toBe(false);
+});
 
 test("the reported mechanism always equals the strategy that produced the directory", async () => {
   for (const capability of [
