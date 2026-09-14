@@ -32,72 +32,42 @@ Desktop cannot select plugin strategies today, so it ignores the plugin
 entirely
 ([`docs/research/desktop-strategy-hardcode.md`](https://github.com/rbelem/opencode2-cow-worktree/blob/main/docs/research/desktop-strategy-hardcode.md)).
 
-Two forms. Pick one. Having both makes opencode2 load the tree twice, and the
-duplicate load fails.
+### The short version
 
-### Form A: directory discovery
+opencode2 installs the plugin itself from npm. Add the package to the
+`plugins` array of your `opencode.json`:
 
-**From the registry** (server plugin only):
-
-```sh
-mkdir -p ~/.config/opencode/plugins/opencode2-cow-worktree
-cd ~/.config/opencode/plugins/opencode2-cow-worktree
-npm install opencode2-cow-worktree
+```json
+{
+  "plugins": [{ "package": "opencode2-cow-worktree@latest" }]
+}
 ```
 
-Then create the `index.ts` seam file below and stop there — no checkout, no
-symlink. The TUI marker seam is not available this way: it builds on
-opencode2's own UI libraries, which the registry package deliberately does
-not bundle, so the sidebar marker needs the checkout form.
+Or let the CLI write that entry:
 
-**From a checkout** (both seams, live edits):
+```sh
+opencode2 plugin add opencode2-cow-worktree
+```
 
-1. Clone this repository somewhere permanent, e.g. `/path/to/opencode2-cow-worktree`.
-2. Create the plugin directory and its `node_modules`:
+On the next startup opencode2 downloads the package into its own cache
+(`~/.cache/opencode/node_modules/`) and loads it. That is the whole install:
+the `cow` marker in the TUI sidebar ships in the same package and loads with
+it — no seam files, no checkout, no symlink. The first startup waits for the
+download, so give it a few extra seconds.
 
-   ```sh
-   mkdir -p ~/.config/opencode/plugins/opencode2-cow-worktree/node_modules
-   ```
+Declare the plugin exactly once. A duplicate declaration (registry entry plus
+local path, or a discovered plugin directory plus the array) makes one of the
+two loads fail with `Plugin failed to load`.
 
-3. Create two one-line seam files in the plugin directory. The first loads
-   the server plugin; the second loads its TUI half, which shows a small
-   `cow` marker in the sidebar footer while a session runs in a cow
-   worktree:
+### Options
 
-   ```ts
-   // ~/.config/opencode/plugins/opencode2-cow-worktree/index.ts
-   export { default } from "opencode2-cow-worktree";
-   ```
-
-   ```tsx
-   // ~/.config/opencode/plugins/opencode2-cow-worktree/tui.tsx
-   export { default } from "opencode2-cow-worktree/tui";
-   ```
-
-   The server works without the second file; skip it if you do not want the
-   marker.
-
-4. Symlink the checkout into `node_modules` so the bare specifiers resolve:
-
-   ```sh
-   ln -sfn /path/to/opencode2-cow-worktree \
-     ~/.config/opencode/plugins/opencode2-cow-worktree/node_modules/opencode2-cow-worktree
-   ```
-
-Because opencode2's runtime is Bun and the symlink points at the working tree,
-tracked edits are live with no build step.
-
-This form runs with default options. To set options, use form B.
-
-### Form B: the `plugins` array (required for options)
-
-Point a `plugins` entry at the checkout itself — no symlink, no seam files:
+Options ride in the same entry:
 
 ```json
 {
   "plugins": [
     {
-      "package": "/path/to/opencode2-cow-worktree",
+      "package": "opencode2-cow-worktree@latest",
       "options": {
         "hooks": { "postCreate": ["corepack use pnpm@latest"] }
       }
@@ -109,17 +79,40 @@ Point a `plugins` entry at the checkout itself — no symlink, no seam files:
 `hooks`, `fallback`, and `targetRoot` are all optional; anything omitted takes
 its default. Each is described below.
 
+### Development install
+
+To work on the plugin itself, point the entry at a checkout instead of the
+registry. Because opencode2's runtime is Bun and the path points at the
+working tree, tracked edits are live with no build step:
+
+```json
+{
+  "plugins": [{ "package": "/path/to/opencode2-cow-worktree" }]
+}
+```
+
 ### Verify
+
+Confirm the plugin loaded:
+
+```sh
+opencode2 plugin list
+```
+
+`opencode2-cow-worktree` should appear with state `active`.
+
+For a deeper check — that a worktree create with no `strategy` field
+materializes a Deep clone, proving `cow` became the default — the repository
+ships a script:
 
 ```sh
 bun scripts/dogfood-install-check.ts
 ```
 
 Run it from a repository checkout; the script ships with the repo, not the
-npm package. This boots a throwaway server against the installed plugin and
-asserts that it activates (`GET /api/plugin` reports `state.status: "active"`)
-and that a worktree create with no `strategy` field produces a Deep clone,
-which proves `cow` became the default strategy.
+npm package. It boots a throwaway server against the installed plugin and
+asserts that the plugin activates and that the default create is a Deep
+clone.
 
 Two gotchas when checking by hand: `GET /api/plugin` does not await
 activation, so a list taken right after boot can look empty — resolve
@@ -244,6 +237,9 @@ regardless of `fallback`. Only `spawn_workspace` consults the policy.
 - **`cow` fails on an ext4 or tmpfs project** — expected: that filesystem
   cannot clone. Use the `git` fallback for tool calls, or let the project use
   the built-in strategy.
+- **The plugin is stuck on an old version** — opencode2 caches the package
+  under `~/.cache/opencode/node_modules/`. Remove the plugin's cache
+  directory and restart: `rm -rf ~/.cache/opencode/node_modules/opencode2-cow-worktree`.
 - **Plugin looks absent right after boot** — resolve
   `POST /api/plugin/await-activation` before reading `GET /api/plugin`.
 - **`Plugin failed to load`** — the plugin is declared twice (discovered
