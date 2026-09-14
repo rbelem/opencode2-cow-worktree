@@ -116,6 +116,25 @@ conventions are in [`lane-workflow.md`](lane-workflow.md); the verified merge
 mechanics are in
 [`research/lane-merge-mechanics.md`](research/lane-merge-mechanics.md).
 
+## Cutting a release
+
+1. Bump `version` in `package.json` and write the CHANGELOG entry. One
+   concern per commit, as always.
+2. `npm publish` from the working tree — the tarball packs what `files`
+   lists, so there is no build step. The npm account enforces security-key
+   2FA (`auth-and-writes`): the first run exits `EOTP` with a
+   `www.npmjs.com/auth/cli/...` URL. Open it, approve the key, then run
+   `npm publish` again. `bun publish` hangs instead of printing the URL and
+   is not usable with this account.
+3. Verify before celebrating: `npm view <name> version` resolves, and
+   `npm install <name>` into a scratch plugin directory imports the entry
+   under Bun with the expected `default.id`.
+4. Tag and release: `git tag -a vX.Y.Z`, push the tag, then
+   `gh release create vX.Y.Z --title "vX.Y.Z" --notes "$(sed -n '/^## X.Y.Z/,$p' CHANGELOG.md)"`.
+5. Land any README changes the publish exposed as a follow-up commit. The
+   npm package page shows the README inside the published tarball, so docs
+   commits after a release reach npm only with the next version bump.
+
 Design history: ADRs 0001 (rollback on failed create), 0002 (Darwin backend),
 and 0003 (derive listing/attach from the upstream inventory, no plugin-owned
 registry) live in `docs/adr/`, with research notes in `docs/research/` and
