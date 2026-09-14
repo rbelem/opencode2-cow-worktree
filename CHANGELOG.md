@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.1
+
+Documentation-only release; no code changes. It carries the new install
+story to the npm package page: the plugin installs as a single config entry
+(`opencode2` downloads it from npm at startup) or one
+`opencode2 plugin add` command, with options in the same entry and the
+checkout recipe kept for development. Also new: user-side verification with
+`opencode2 plugin list`, the plugin-cache reset for stuck updates, the
+recorded release procedure, and the ecosystem listing draft.
+
 ## 0.1.0
 
 The first release: tagged `v0.1.0` and published to npm.
