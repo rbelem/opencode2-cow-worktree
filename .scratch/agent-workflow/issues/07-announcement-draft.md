@@ -47,7 +47,9 @@ Decisions the announcement/publish step must carry; no code change now:
       un-masks it.
       DECIDED 2026-09-14: documented as an install requirement in the
       README Install section ("What installing changes"); no upstream ask.
-- [ ] Public API: the barrel exports 16 symbols; the only external consumer
+- [x] Public API: the barrel exports 16 symbols; the only external consumer
       (the install shim) uses `default`. Decide the real API at publish
       (likely `export { default }` plus the `./tui` entry) instead of
       freezing an accidental surface.
+      DECIDED 2026-09-14: slimmed to `export { default }` before publish;
+      the barrel pin test holds the surface to that decision.

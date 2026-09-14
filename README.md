@@ -35,6 +35,21 @@ duplicate load fails.
 
 ### Form A: directory discovery
 
+**From the registry** (server plugin only):
+
+```sh
+mkdir -p ~/.config/opencode/plugins/opencode2-cow-worktree
+cd ~/.config/opencode/plugins/opencode2-cow-worktree
+npm install opencode2-cow-worktree
+```
+
+Then create the `index.ts` seam file below and stop there — no checkout, no
+symlink. The TUI marker seam is not available this way: it builds on
+opencode2's own UI libraries, which the registry package deliberately does
+not bundle, so the sidebar marker needs the checkout form.
+
+**From a checkout** (both seams, live edits):
+
 1. Clone this repository somewhere permanent, e.g. `/path/to/opencode2-cow-worktree`.
 2. Create the plugin directory and its `node_modules`:
 
