@@ -921,9 +921,15 @@ test("the registered tool attaches through ctx.worktree.list and reports it", as
     name: string;
     execute: (input: unknown) => Promise<{ output: unknown; content: string }>;
   }> = [];
-  const dir = await scratchDir();
-  // A real existing cow worktree beside the source: the Deep-clone check is
-  // wired to the real filesystem, so the directory and its `.git` must exist.
+  // The attach path consults the real filesystem only for the Deep-clone
+  // signature (`<target>` and `<target>/.git` being directories) — attach
+  // attempts no clone, so it never probes CoW capability (src/tool.ts). A
+  // plain writable directory is a faithful fixture, and the test runs — rather
+  // than skips — on non-CoW machines too.
+  const dir = await mkdtemp(join(tmpdir(), "cow-tool-att-"));
+  scratchDirs.push(dir);
+  // A real directory carrying the Deep-clone signature, beside the source; the
+  // inventory row below is what says "cow".
   const target = join(dir, "..", "att");
   scratchDirs.push(target);
   await mkdir(join(target, ".git"), { recursive: true });
