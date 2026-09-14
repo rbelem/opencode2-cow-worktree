@@ -7,8 +7,9 @@ milliseconds at almost no disk cost. Where a `git worktree` carries tracked
 files only, a **Deep clone** here carries everything, so the agent can run the
 test suite immediately.
 
-In daily use, and published to npm. Install from a local checkout (form A
-below) or from the npm registry.
+Current release: [v0.1.0](https://github.com/rbelem/opencode2-cow-worktree/releases/tag/v0.1.0),
+also on [npm](https://www.npmjs.com/package/opencode2-cow-worktree). Install
+from a local checkout (form A below) or from the npm registry.
 
 ## Requirements
 
@@ -28,7 +29,8 @@ capability gate on that default: on a filesystem that cannot reflink (ext4,
 tmpfs), worktree creation fails loudly until you remove the plugin. Install
 it only on machines whose projects meet the Requirements above. opencode2
 Desktop cannot select plugin strategies today, so it ignores the plugin
-entirely (`docs/research/desktop-strategy-hardcode.md`).
+entirely
+([`docs/research/desktop-strategy-hardcode.md`](https://github.com/rbelem/opencode2-cow-worktree/blob/main/docs/research/desktop-strategy-hardcode.md)).
 
 Two forms. Pick one. Having both makes opencode2 load the tree twice, and the
 duplicate load fails.
@@ -113,10 +115,11 @@ its default. Each is described below.
 bun scripts/dogfood-install-check.ts
 ```
 
-This boots a throwaway server against the installed plugin and asserts that it
-activates (`GET /api/plugin` reports `state.status: "active"`) and that a
-worktree create with no `strategy` field produces a Deep clone, which proves
-`cow` became the default strategy.
+Run it from a repository checkout; the script ships with the repo, not the
+npm package. This boots a throwaway server against the installed plugin and
+asserts that it activates (`GET /api/plugin` reports `state.status: "active"`)
+and that a worktree create with no `strategy` field produces a Deep clone,
+which proves `cow` became the default strategy.
 
 Two gotchas when checking by hand: `GET /api/plugin` does not await
 activation, so a list taken right after boot can look empty — resolve
@@ -253,13 +256,15 @@ regardless of `fallback`. Only `spawn_workspace` consults the policy.
 
 The unit suite (`bun test`), typecheck (`bun run typecheck`), coverage gate
 (`bun run test:coverage`), and the e2e harness (`bun scripts/e2e/harness.ts`)
-are described in [`docs/development.md`](docs/development.md), along with the
-recorded live runs and the parallel-lane tooling this repository is developed
-with.
+are described in
+[`docs/development.md`](https://github.com/rbelem/opencode2-cow-worktree/blob/main/docs/development.md),
+along with the recorded live runs and the parallel-lane tooling this
+repository is developed with.
 
 Terms the output uses: a **Workspace** is a logical handle, a **Location** is
 where a session runs, and a **Worktree** is a directory materialized by a
-**Strategy** — more in [CONTEXT.md](CONTEXT.md).
+**Strategy** — more in
+[CONTEXT.md](https://github.com/rbelem/opencode2-cow-worktree/blob/main/CONTEXT.md).
 
 ## License
 
