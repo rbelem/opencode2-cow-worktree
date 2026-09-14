@@ -34,7 +34,10 @@ duplicate load fails.
    mkdir -p ~/.config/opencode/plugins/opencode2-cow-worktree/node_modules
    ```
 
-3. Create two one-line seam files in the plugin directory:
+3. Create two one-line seam files in the plugin directory. The first loads
+   the server plugin; the second loads its TUI half, which shows a small
+   `cow` marker in the sidebar footer while a session runs in a cow
+   worktree:
 
    ```ts
    // ~/.config/opencode/plugins/opencode2-cow-worktree/index.ts
@@ -45,6 +48,9 @@ duplicate load fails.
    // ~/.config/opencode/plugins/opencode2-cow-worktree/tui.tsx
    export { default } from "opencode2-cow-worktree/tui";
    ```
+
+   The server works without the second file; skip it if you do not want the
+   marker.
 
 4. Symlink the checkout into `node_modules` so the bare specifiers resolve:
 
