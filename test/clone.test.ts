@@ -421,6 +421,30 @@ test("refuses to clone into a pre-existing symlink without following it", async 
   expect(await readFile(pointee, "utf8")).toBe("the link's target\n");
 });
 
+// The walker's loop-exit is reachable only when a clone completes, and a clone
+// containing regular files needs a successful reflink — impossible on a
+// non-CoW filesystem, where every walk dies at the first file. A tree of
+// directories and symlinks completes the walk anywhere, so the walker's exit
+// is covered on every runner rather than only where the real-fs proofs run.
+test("a tree without regular files clones on any filesystem", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "cow-noreg-"));
+  scratchDirs.push(dir);
+  const source = join(dir, "source");
+  await mkdir(source);
+  await mkdir(join(source, "empty"));
+  await mkdir(join(source, "nested", "deeper"), { recursive: true });
+  const pointee = join(source, "nested");
+  await symlink(pointee, join(source, "link"));
+
+  const target = join(dir, "clone");
+  await cloneDirectory(source, target);
+
+  expect((await lstat(join(target, "empty"))).isDirectory()).toBe(true);
+  expect((await lstat(join(target, "nested", "deeper"))).isDirectory()).toBe(true);
+  expect((await lstat(join(target, "link"))).isSymbolicLink()).toBe(true);
+  expect(await readlink(join(target, "link"))).toBe(pointee);
+});
+
 test("a directory appearing between the caller's check and the clone survives the refusal untouched", async () => {
   // The race this pin exists for: a caller (the tool's attach check, the
   // strategy's caller) established that the predicted path was free, and a
