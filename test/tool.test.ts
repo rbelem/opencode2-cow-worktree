@@ -7,6 +7,7 @@ import { probeCowCapability } from "../src/capability";
 import type { CowCapability } from "../src/capability";
 import type { Mechanism } from "../src/mechanism";
 import { deviceOf, isDirectory, nearestExistingDevice } from "../src/device";
+import type { SessionGetResult } from "../types/opencode2-worktree";
 import { listCowWorktrees, spawnWorkspace } from "../src/tool";
 import type {
   CowWorktreeEntry,
@@ -50,6 +51,10 @@ interface Calls {
   readonly listed: number[];
   /** Every path the isDirectory seam was asked about. */
   readonly probedDirectories: string[];
+  /** Every session id the occupancy probe looked up. */
+  readonly sessionLookups: string[];
+  /** Every marker write the guard performed. */
+  readonly markerWrites: Array<{ directory: string; sessionID: string }>;
 }
 
 function fakeDeps(
@@ -64,6 +69,16 @@ function fakeDeps(
     readonly inventory?: ReadonlyArray<{ directory: string; strategy?: string }>;
     /** Paths `isDirectory` answers true for; every other path is "no". */
     readonly directories?: readonly string[];
+    /** Raw marker content `readMarker` reports for every directory; none by default. */
+    readonly marker?: string;
+    /** What `sessionGet` resolves to; absent means the id is not found. */
+    readonly sessionAnswer?: SessionGetResult | undefined;
+    /** Makes `sessionGet` throw instead. */
+    readonly sessionGetError?: Error;
+    /** The epoch `now()` reports; defaults to a fixed instant. */
+    readonly now?: number;
+    /** Makes `writeMarker` throw, exercising the warning path. */
+    readonly failMarkerWrite?: boolean;
   } = {},
 ): { deps: SpawnWorkspaceDeps; calls: Calls } {
   const calls: Calls = {
@@ -72,6 +87,8 @@ function fakeDeps(
     removed: [],
     listed: [],
     probedDirectories: [],
+    sessionLookups: [],
+    markerWrites: [],
   };
   const deps: SpawnWorkspaceDeps = {
     probe: async () => capability,
@@ -96,6 +113,19 @@ function fakeDeps(
     removeWorktree: async (directory) => {
       calls.removed.push(directory);
     },
+    sessionGet: async (id) => {
+      calls.sessionLookups.push(id);
+      if (options.sessionGetError !== undefined) throw options.sessionGetError;
+      // The seam's declared shape is total; a not-found answer rides in as
+      // undefined and the classifier reads it as a positive absence.
+      return options.sessionAnswer as SessionGetResult;
+    },
+    readMarker: async () => options.marker,
+    writeMarker: async (directory, sessionID) => {
+      if (options.failMarkerWrite) throw new Error("marker fs boom");
+      calls.markerWrites.push({ directory, sessionID });
+    },
+    now: () => options.now ?? 1_000_000,
     fallback: options.fallback,
     targetRoot: options.targetRoot,
   };
@@ -548,6 +578,181 @@ test("a failed session start on attach does not remove the existing worktree", a
   expect(calls.removed).toEqual([]);
 });
 
+// ---------------------------------------------------------------------------
+// Occupancy guard (issue #15), driven through spawnWorkspace's attach and
+// create flows. The pure decision table itself is pinned in
+// test/occupancy.test.ts; these pin where the guard sits in the flow.
+// ---------------------------------------------------------------------------
+
+/** An attach fixture: a cow Deep clone under the predicted name, ready to attach. */
+function attachFixture(marker?: string): {
+  deps: SpawnWorkspaceDeps;
+  calls: Calls;
+} {
+  return fakeDeps(
+    { status: "supported" },
+    {
+      targetRoot: "/wt",
+      inventory: [{ directory: "/wt/worker", strategy: "cow" }],
+      directories: ["/wt/worker", join("/wt/worker", ".git")],
+      marker,
+      sessionAnswer: { id: "ses_old", time: { updated: 500 } },
+    },
+  );
+}
+
+test("attach refuses while the marker's session is fresh, naming it and the recoveries", async () => {
+  const { deps, calls } = attachFixture('{"sessionID":"ses_old"}');
+  // now 1_000_000, updated 500: well inside the occupancy window.
+  await expect(
+    spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, deps),
+  ).rejects.toThrow(/refusing to attach to \/wt\/worker.*session ses_old/);
+  expect(calls.sessionLookups).toEqual(["ses_old"]);
+  expect(calls.createSession).toEqual([]);
+  expect(calls.markerWrites).toEqual([]);
+});
+
+test("a fresh refusal spells out all three recoveries", async () => {
+  const { deps } = attachFixture('{"sessionID":"ses_old"}');
+  let message = "";
+  try {
+    await spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, deps);
+  } catch (cause) {
+    message = (cause as Error).message;
+  }
+  expect(message).toContain("Pick another worktree name");
+  expect(message).toContain("DELETE /api/session/<sessionID>");
+  expect(message).toContain("remove the occupancy marker");
+});
+
+test("attach proceeds and rewrites when the marker's session is gone (404)", async () => {
+  // Both 404 shapes the live binding can produce: a plain not-found answer and
+  // the thrown `SessionNotFoundError`. Each proves the marker stale, so the
+  // attach runs and the marker is rewritten for the new session.
+  const notFound = fakeDeps({ status: "supported" }, {
+    targetRoot: "/wt",
+    inventory: [{ directory: "/wt/worker", strategy: "cow" }],
+    directories: ["/wt/worker", join("/wt/worker", ".git")],
+    marker: '{"sessionID":"ses_old"}',
+    sessionAnswer: undefined,
+  });
+  const thrown = fakeDeps({ status: "supported" }, {
+    targetRoot: "/wt",
+    inventory: [{ directory: "/wt/worker", strategy: "cow" }],
+    directories: ["/wt/worker", join("/wt/worker", ".git")],
+    marker: '{"sessionID":"ses_old"}',
+    sessionGetError: Object.assign(new Error("Session not found"), { _tag: "SessionNotFoundError" }),
+  });
+
+  const answered = await spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, notFound.deps);
+  const thrown404 = await spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, thrown.deps);
+
+  expect(answered.attached).toBe(true);
+  expect(thrown404.attached).toBe(true);
+  expect(notFound.calls.markerWrites).toEqual([{ directory: "/wt/worker", sessionID: "ses_test" }]);
+  expect(thrown.calls.markerWrites).toEqual([{ directory: "/wt/worker", sessionID: "ses_test" }]);
+});
+
+test("a malformed marker refuses before any session lookup", async () => {
+  const { deps, calls } = attachFixture("{not json");
+  await expect(
+    spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, deps),
+  ).rejects.toThrow(/malformed.*holder is unknown.*Pick another worktree name/s);
+  expect(calls.sessionLookups).toEqual([]);
+  expect(calls.createSession).toEqual([]);
+});
+
+test("a session lookup that fails for another reason refuses (not a positive absence)", async () => {
+  const { deps } = fakeDeps({ status: "supported" }, {
+    targetRoot: "/wt",
+    inventory: [{ directory: "/wt/worker", strategy: "cow" }],
+    directories: ["/wt/worker", join("/wt/worker", ".git")],
+    marker: '{"sessionID":"ses_old"}',
+    sessionGetError: new Error("503 upstream"),
+  });
+  await expect(
+    spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, deps),
+  ).rejects.toThrow(/could not be checked/);
+});
+
+test("a 200 whose time.updated is missing refuses instead of going dormant", async () => {
+  // The classifier maps the unusable record to a probe error, so the refusal
+  // is the fail-closed one — never the dormant proceed.
+  const { deps } = fakeDeps({ status: "supported" }, {
+    targetRoot: "/wt",
+    inventory: [{ directory: "/wt/worker", strategy: "cow" }],
+    directories: ["/wt/worker", join("/wt/worker", ".git")],
+    marker: '{"sessionID":"ses_old"}',
+    sessionAnswer: { id: "ses_old" } as SessionGetResult,
+  });
+  await expect(
+    spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, deps),
+  ).rejects.toThrow(/refusing to attach.*could not be checked/s);
+  const dormant = fakeDeps({ status: "supported" }, {
+    targetRoot: "/wt",
+    inventory: [{ directory: "/wt/worker", strategy: "cow" }],
+    directories: ["/wt/worker", join("/wt/worker", ".git")],
+    marker: '{"sessionID":"ses_old"}',
+    sessionAnswer: { id: "ses_old", time: { updated: Number.NaN } } as SessionGetResult,
+  });
+  await expect(
+    spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, dormant.deps),
+  ).rejects.toThrow(/refusing to attach/);
+});
+
+test("a worktree with no marker attaches as before and comes out marked", async () => {
+  const { deps, calls } = attachFixture(undefined);
+  const result = await spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, deps);
+
+  expect(result.attached).toBe(true);
+  // No marker means no session to probe: the legacy path asks nothing.
+  expect(calls.sessionLookups).toEqual([]);
+  expect(calls.markerWrites).toEqual([{ directory: "/wt/worker", sessionID: "ses_test" }]);
+});
+
+test("the create flow writes the marker for cow and never for git", async () => {
+  const cow = fakeDeps({ status: "supported" });
+  await spawnWorkspace({ sourceDirectory: "/src" }, cow.deps);
+  expect(cow.calls.markerWrites).toEqual([
+    { directory: "/worktrees/cow-clone", sessionID: "ses_test" },
+  ]);
+
+  const git = fakeDeps({ status: "unsupported" }, { fallback: "git" });
+  await spawnWorkspace({ sourceDirectory: "/src" }, git.deps);
+  expect(git.calls.markerWrites).toEqual([]);
+});
+
+test("the create flow overwrites an inherited marker unconditionally", async () => {
+  // A marker inherited into a fresh clone (or left by anything else) is
+  // replaced, never consulted: the new session is the holder now.
+  const { deps, calls } = fakeDeps(
+    { status: "supported" },
+    { marker: '{"sessionID":"ses_from_source"}' },
+  );
+  await spawnWorkspace({ sourceDirectory: "/src" }, deps);
+
+  expect(calls.markerWrites).toEqual([
+    { directory: "/worktrees/cow-clone", sessionID: "ses_test" },
+  ]);
+  // The create path never probes the inherited marker's session.
+  expect(calls.sessionLookups).toEqual([]);
+});
+
+test("a marker-write failure becomes markerWarning and the call still succeeds", async () => {
+  const attach = attachFixture(undefined);
+  attach.deps = { ...attach.deps, writeMarker: async () => {
+    throw new Error("marker fs boom");
+  } };
+  const attached = await spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, attach.deps);
+  expect(attached.attached).toBe(true);
+  expect(attached.markerWarning).toContain("marker fs boom");
+
+  const created = fakeDeps({ status: "supported" }, { failMarkerWrite: true });
+  const result = await spawnWorkspace({ sourceDirectory: "/src" }, created.deps);
+  expect(result.mechanism).toBe("cow");
+  expect(result.markerWarning).toContain("marker fs boom");
+});
+
 test("a named worktree whose predicted path is free takes the create flow unchanged", async () => {
   const { deps, calls } = fakeDeps(
     { status: "supported" },
@@ -704,11 +909,13 @@ test.skipIf(cowRoot === undefined)(
 
 test.skipIf(cowRoot === undefined)("plugin setup registers the spawn_workspace tool behind the tool seam", async () => {
   const registered: Array<{ name: string; execute: (input: unknown) => Promise<unknown> }> = [];
+  // The cow create writes its occupancy marker into the returned directory, so
+  // the fake hands back the real scratch dir instead of an invented path.
+  const dir = await scratchDir();
   const worktreeCreate = async (input: { strategy?: string }) => ({
-    directory: `/worktrees/${input.strategy}-clone`,
+    directory: dir,
   });
   const sessionCreate = async () => ({ id: "ses_live" });
-  const dir = await scratchDir();
 
   const ctx = {
     worktree: {
@@ -741,7 +948,7 @@ test.skipIf(cowRoot === undefined)("plugin setup registers the spawn_workspace t
     output: { mechanism: string; directory: string; sessionID: string };
   };
   expect(result.output.mechanism).toBe("cow");
-  expect(result.output.directory).toBe("/worktrees/cow-clone");
+  expect(result.output.directory).toBe(dir);
   expect(result.output.sessionID).toBe("ses_live");
 });
 
@@ -884,14 +1091,15 @@ test("spawn_workspace's output schema is pinned to SpawnWorkspaceResult's keys",
   const schema = schemaOf(outputs.get("spawn_workspace"));
 
   // The create result's keys are exactly the schema's `required`, and the
-  // attach result's keys — `attached` is the optional attach marker — are
-  // exactly the schema's `properties`.
+  // attach result's keys — `attached` is the optional attach marker,
+  // `markerWarning` the optional demoted write failure — are exactly the
+  // schema's `properties`.
   const created: SpawnWorkspaceResult = {
     sessionID: "ses_x",
     directory: "/wt/x",
     mechanism: "cow",
   };
-  const attached: SpawnWorkspaceResult = { ...created, attached: true };
+  const attached: SpawnWorkspaceResult = { ...created, attached: true, markerWarning: "w" };
   expect(Object.keys(schema.properties).sort()).toEqual(Object.keys(attached).sort());
   expect([...schema.required].sort()).toEqual(Object.keys(created).sort());
 });
@@ -979,6 +1187,132 @@ test("the registered tool attaches through ctx.worktree.list and reports it", as
   expect(result.content).toContain(`Attached to existing cow worktree at ${target}`);
   expect(result.content).toContain("no new worktree was created");
   expect(created).toBe(0);
+});
+
+// The occupancy guard through the live ctx bindings (issue #15): a real
+// marker file on disk, `ctx.session.get` answering through the fake context.
+test("the registered tool refuses to attach while the marker's session is live", async () => {
+  const registered: Array<{
+    name: string;
+    execute: (input: unknown) => Promise<{ output: unknown; content: string }>;
+  }> = [];
+  const dir = await mkdtemp(join(tmpdir(), "cow-tool-occ-"));
+  scratchDirs.push(dir);
+  const target = join(dir, "..", "occ");
+  scratchDirs.push(target);
+  await mkdir(join(target, ".git"), { recursive: true });
+  await writeFile(
+    join(target, ".cow-session.json"),
+    JSON.stringify({ sessionID: "ses_marked", startedAt: new Date().toISOString() }),
+    "utf8",
+  );
+
+  const lookedUp: string[] = [];
+  const ctx = {
+    worktree: {
+      transform: async (callback: (editor: unknown) => void) => {
+        callback({ add: () => {} });
+        return { dispose: async () => {} };
+      },
+      list: async () => [{ directory: target, strategy: "cow" }],
+      create: async () => {
+        throw new Error("attach must never request a create");
+      },
+      remove: async () => {},
+    },
+    tool: {
+      transform: async (callback: (editor: unknown) => void) => {
+        callback({
+          add: (tool: {
+            name: string;
+            execute: (input: unknown) => Promise<{ output: unknown; content: string }>;
+          }) => {
+            registered.push(tool);
+          },
+        });
+        return { dispose: async () => {} };
+      },
+    },
+    session: {
+      create: async () => ({ id: "ses_new" }),
+      // The augmented structural slice the live binding adapts: the runtime
+      // takes `{ sessionID }`, the tool's seam takes a bare id.
+      get: async ({ sessionID }: { sessionID: string }) => {
+        lookedUp.push(sessionID);
+        return { id: sessionID, time: { updated: Date.now() } };
+      },
+    },
+  } as unknown as Parameters<typeof plugin.setup>[0];
+
+  await plugin.setup(ctx);
+  const tool = registered.find((entry) => entry.name === "spawn_workspace");
+  expect(tool).toBeDefined();
+
+  await expect(tool!.execute({ sourceDirectory: dir, name: "occ" })).rejects.toThrow(
+    /refusing to attach.*session ses_marked.*Pick another worktree name/s,
+  );
+  expect(lookedUp).toEqual(["ses_marked"]);
+});
+
+test("a marker-write failure surfaces as markerWarning on the registered tool", async () => {
+  // `.git/info` as a file blocks the exclude write, so writeMarker fails; the
+  // attach must still succeed and carry the failure as a warning.
+  const registered: Array<{
+    name: string;
+    execute: (input: unknown) => Promise<{
+      output: { attached?: boolean; markerWarning?: string };
+      content: string;
+    }>;
+  }> = [];
+  const dir = await mkdtemp(join(tmpdir(), "cow-tool-warn-"));
+  scratchDirs.push(dir);
+  const target = join(dir, "..", "warn");
+  scratchDirs.push(target);
+  await mkdir(join(target, ".git"), { recursive: true });
+  // A file where the exclude's directory must live: the marker write fails
+  // with ENOTDIR — an obstacle no "treat every error as missing" fallback
+  // could paper over — which is exactly the warning path.
+  await writeFile(join(target, ".git", "info"), "not a directory", "utf8");
+
+  const ctx = {
+    worktree: {
+      transform: async (callback: (editor: unknown) => void) => {
+        callback({ add: () => {} });
+        return { dispose: async () => {} };
+      },
+      list: async () => [{ directory: target, strategy: "cow" }],
+      create: async () => {
+        throw new Error("attach must never request a create");
+      },
+      remove: async () => {},
+    },
+    tool: {
+      transform: async (callback: (editor: unknown) => void) => {
+        callback({
+          add: (tool: {
+            name: string;
+            execute: (input: unknown) => Promise<{
+              output: { attached?: boolean; markerWarning?: string };
+              content: string;
+            }>;
+          }) => {
+            registered.push(tool);
+          },
+        });
+        return { dispose: async () => {} };
+      },
+    },
+    session: { create: async () => ({ id: "ses_new" }) },
+  } as unknown as Parameters<typeof plugin.setup>[0];
+
+  await plugin.setup(ctx);
+  const tool = registered.find((entry) => entry.name === "spawn_workspace");
+  expect(tool).toBeDefined();
+
+  const result = await tool!.execute({ sourceDirectory: dir, name: "warn" });
+  expect(result.output.attached).toBe(true);
+  expect(result.output.markerWarning).toContain("could not be written");
+  expect(result.content).toContain("warning: the occupancy marker could not be written");
 });
 
 // ---------------------------------------------------------------------------

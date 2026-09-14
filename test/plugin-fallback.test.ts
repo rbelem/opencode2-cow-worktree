@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import plugin from "../src/plugin";
 import { findCowRoot, findNonCowRoot } from "./fs-roots";
@@ -42,6 +43,8 @@ interface RegisteredTool {
 interface Harness {
   readonly tool: RegisteredTool;
   readonly recorded: Recorded;
+  /** The real directories each fake create returned. */
+  readonly createdDirs: string[];
 }
 
 /**
@@ -57,12 +60,16 @@ function recordCtx(
   readonly recorded: Recorded;
   readonly registeredToolNames: string[];
   readonly addedStrategies: string[];
+  readonly createdDirs: string[];
   readonly spawnWorkspaceTool: () => RegisteredTool;
 } {
   const recorded: Recorded = { strategies: [], removed: [], parents: [] };
   const registeredToolNames: string[] = [];
   const addedStrategies: string[] = [];
   let registered: RegisteredTool | undefined;
+  // The cow create writes its occupancy marker into the returned directory, so
+  // each create hands back a real scratch dir instead of an invented path.
+  const createdDirs: string[] = [];
 
   const ctx = {
     options,
@@ -70,7 +77,9 @@ function recordCtx(
       create: async (input: { strategy?: string; directory?: string }) => {
         recorded.strategies.push(input.strategy ?? "default");
         recorded.parents.push(input.directory);
-        return { directory: `/worktrees/${input.strategy}-worktree` };
+        const dir = await mkdtemp(join(tmpdir(), "cow-fallback-wt-"));
+        createdDirs.push(dir);
+        return { directory: dir };
       },
       remove: async (input: { directory: string }) => {
         recorded.removed.push(input.directory);
@@ -112,6 +121,7 @@ function recordCtx(
     recorded,
     registeredToolNames,
     addedStrategies,
+    createdDirs,
     spawnWorkspaceTool: () => {
       if (registered === undefined) throw new Error("spawn_workspace was not registered");
       return registered;
@@ -123,9 +133,11 @@ async function harness(
   options: Record<string, unknown> | undefined,
   harnessOptions: { readonly sessionCreateError?: Error } = {},
 ): Promise<Harness> {
-  const { ctx, recorded, spawnWorkspaceTool } = recordCtx(options, harnessOptions);
+  const { ctx, recorded, spawnWorkspaceTool, createdDirs } = recordCtx(options, harnessOptions);
+  // Marker writes land in real scratch directories; clean them up with the rest.
+  scratchDirs.push(...createdDirs);
   await plugin.setup(ctx);
-  return { tool: spawnWorkspaceTool(), recorded };
+  return { tool: spawnWorkspaceTool(), recorded, createdDirs };
 }
 
 // Validation pins (ticket 11): every plugin option is checked once at setup,
@@ -246,7 +258,7 @@ test.skipIf(nonCowRoot === undefined)(
     // directory the create actually returned.
     const dir = await scratchDir(nonCowRoot!);
     const sentinel = new Error("session sentinel");
-    const { tool, recorded } = await harness(
+    const { tool, recorded, createdDirs } = await harness(
       { fallback: "git" },
       { sessionCreateError: sentinel },
     );
@@ -259,9 +271,10 @@ test.skipIf(nonCowRoot === undefined)(
     }
     expect(rejection).toBeInstanceOf(Error);
     const error = rejection as Error;
+    const worktree = createdDirs[0]!;
 
-    expect(error.message).toMatch(/session start failed in \/worktrees\/git-worktree/);
+    expect(error.message).toMatch(new RegExp(`session start failed in ${worktree}`));
     expect(error.cause).toBe(sentinel);
-    expect(recorded.removed).toEqual(["/worktrees/git-worktree"]);
+    expect(recorded.removed).toEqual([worktree]);
   },
 );

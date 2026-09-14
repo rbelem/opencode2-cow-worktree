@@ -42,12 +42,37 @@ export interface SessionInfo {
   readonly id: string;
 }
 
+/**
+ * The slice of a session record the occupancy guard reads back from
+ * `ctx.session.get`. Verified against opencode2 0.0.0-next-20260912.3: the
+ * record carries `time.created`/`time.updated` in epoch milliseconds and no
+ * status field — sessions persist after completion, so last-activity time is
+ * the only liveness signal a probe gets. Kept structural like `SessionInfo`;
+ * the classifier treats odd shapes and throws as answers at runtime.
+ */
+export interface SessionGetResult {
+  readonly id: string;
+  readonly time?: { readonly updated?: number };
+}
+
 /** The slice of the v2 `SessionDomain` this plugin uses. */
 export interface SessionDomain {
   readonly create: (input: {
     readonly title?: string;
     readonly location: { readonly directory: string };
   }) => Promise<SessionInfo>;
+  /**
+   * Reads one session by id. Verified against the running v2 binary
+   * (0.0.0-next-20260912.3): the argument is `{ sessionID }` — a bare string
+   * fails the input schema with `SchemaError: Expected object` — and an absent
+   * id throws with `_tag: "Session.NotFoundError"` (the HTTP payload spells
+   * the same 404 `SessionNotFoundError`). The promise is declared total
+   * because the occupancy guard's classifier (`probeOccupyingSession` in
+   * src/occupancy.ts) treats every throw and every odd shape as its answer.
+   */
+  readonly get: (input: {
+    readonly sessionID: string;
+  }) => Promise<SessionGetResult>;
 }
 
 /** The slice of the v2 `WorktreeApi` this plugin uses, folded into WorktreeDomain below. */

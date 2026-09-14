@@ -168,9 +168,12 @@ async function main(): Promise<number> {
     fallback.simulationFallbackGit = fallbackGit;
     fallback.simulationFallbackNone = fallbackNone;
 
-    // Issue #1: attach. Two real sessions invoke spawn_workspace with the same
-    // name against one server; the second must attach to the existing worktree
-    // instead of materializing another directory.
+    // Issue #1 + #15: attach. Round 1 creates and marks the worktree; round 2
+    // must be refused by the occupancy guard (round 1's session is
+    // seconds-fresh); round 3 walks the refusal's own recovery — deleting the
+    // occupying session out of band — and must attach and rewrite the marker;
+    // a legacy raw worktree (no marker) must attach as before, marked, with
+    // git status clean.
     const attach = await runAttachScenario({ port: PORT + 7 });
     assertions.check(
       "attach: first spawn_workspace created the worktree",
@@ -183,14 +186,52 @@ async function main(): Promise<number> {
       String(attach.worktreeDirectory),
     );
     assertions.check(
-      "attach: second spawn_workspace reported an attach",
-      (attach.secondOutput ?? "").includes("Attached to existing"),
+      "attach: second spawn_workspace refused on the fresh occupancy marker",
+      (attach.secondStatus ?? "").includes("refusing to attach") &&
+        /occupancy|session \S+ appears/i.test(attach.secondStatus ?? ""),
       `${attach.secondStatus} ${attach.secondOutput ?? ""}`,
     );
     assertions.check(
-      "attach: the second call materialized no second directory",
+      "attach: the refusal materialized no second directory",
       attach.inventoryCount === 1,
       String(attach.inventoryCount),
+    );
+    assertions.check(
+      "attach: the marker after round 1 names the occupying session",
+      (attach.occupantSessionID ?? "").length > 0,
+      String(attach.occupantSessionID),
+    );
+    assertions.check(
+      "attach: DELETE of the occupying session was accepted",
+      (attach.deleteStatus ?? 0) >= 200 && (attach.deleteStatus ?? 0) < 300,
+      String(attach.deleteStatus),
+    );
+    assertions.check(
+      "attach: third spawn_workspace attached after the delete",
+      (attach.thirdOutput ?? "").includes("Attached to existing"),
+      `${attach.thirdStatus} ${attach.thirdOutput ?? ""}`,
+    );
+    assertions.check(
+      "attach: round 3 rewrote the marker for the new session",
+      attach.thirdMarkerSessionID !== undefined &&
+        attach.thirdSessionID !== undefined &&
+        attach.thirdMarkerSessionID === attach.thirdSessionID,
+      `${attach.thirdMarkerSessionID} vs ${attach.thirdSessionID}`,
+    );
+    assertions.check(
+      "attach: legacy worktree without a marker still attaches",
+      (attach.legacy?.attachOutput ?? "").includes("Attached to existing"),
+      `${attach.legacy?.attachStatus} ${attach.legacy?.attachOutput ?? ""}`,
+    );
+    assertions.check(
+      "attach: legacy attach wrote the marker",
+      (attach.legacy?.markerSessionID ?? "").length > 0,
+      String(attach.legacy?.markerSessionID),
+    );
+    assertions.check(
+      "attach: legacy worktree's git status stays clean with the marker present",
+      attach.legacy?.gitStatus === "",
+      JSON.stringify(attach.legacy?.gitStatus),
     );
     fallback.notes.push(...attach.notes.map((note) => `attach: ${note}`));
     fallback.attach = attach;

@@ -17,7 +17,9 @@
  * observed facts rather than an expectation that does not hold.
  */
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import { basename, join } from "node:path";
+import { MARKER_NAME } from "../../src/occupancy";
 import { driveModel, type DriveController } from "./drive";
 import { installPlugin, makeConfigRoot, removePath, declarePlugin, exists, git } from "./lib";
 import type { ConfigRoot } from "./lib";
@@ -233,14 +235,17 @@ function findScriptedTool(body: unknown, name: string): ScriptedTool | undefined
 }
 
 // ---------------------------------------------------------------------------
-// Attach (issue #1)
+// Attach (issue #1) + occupancy (issue #15)
 //
-// Two real sessions invoke `spawn_workspace` with the same name against ONE
-// server. The first must create the worktree; the second must attach to it —
-// the tool's own text says so, and the inventory must still list exactly one
-// directory for that name. Everything below the drive controller is production
-// code: the session loop, the tool registry, the plugin's tool execution, and
-// opencode2's real worktree inventory.
+// Real sessions invoke `spawn_workspace` with the same name against ONE
+// server. Round 1 creates the worktree and writes its occupancy marker; round
+// 2 must now be REFUSED by the guard — round 1's session is seconds-fresh —
+// round 3 walks the refusal's own recovery (delete the occupying session out
+// of band) and must attach and rewrite the marker, and a legacy raw worktree
+// (created through the worktree API, which writes no marker) must attach as
+// before and come out marked and clean. Everything below the drive controller
+// is production code: the session loop, the tool registry, the plugin's tool
+// execution, and opencode2's real worktree inventory.
 // ---------------------------------------------------------------------------
 
 export interface AttachResult {
@@ -253,14 +258,32 @@ export interface AttachResult {
   secondOutput?: string;
   /** How many inventory rows carry the scenario's worktree name after round 2. */
   inventoryCount?: number;
+  /** The session id the marker named after round 1 — the occupant round 2 hit. */
+  occupantSessionID?: string;
+  /** DELETE /api/session/<occupant> before round 3. */
+  deleteStatus?: number;
+  thirdStatus?: string;
+  thirdOutput?: string;
+  /** The session id the round-3 attach reported in its own text. */
+  thirdSessionID?: string;
+  /** The session id the marker names after round 3 — must equal thirdSessionID. */
+  thirdMarkerSessionID?: string;
+  /** The legacy raw worktree (no marker): attach, marker, and cleanliness. */
+  legacy?: {
+    readonly directory?: string;
+    attachStatus?: string;
+    attachOutput?: string;
+    markerSessionID?: string;
+    gitStatus?: string;
+  };
 }
 
-/** The scripted name both rounds ask for. */
+/** The scripted name the occupancy rounds ask for. */
 const ATTACH_NAME = "att";
 
 /**
- * The attach scenario: one server, two scripted `spawn_workspace` calls with
- * the same name, one inventory.
+ * The attach scenario: one server, scripted `spawn_workspace` calls with the
+ * same name, one inventory.
  *
  * The scenario's source lives in the config root (a CoW filesystem), so the
  * worktree lands beside it as a sibling — the tool's default parent — and the
@@ -292,8 +315,9 @@ export async function runAttachScenario(options: {
     const endpoint = driveEndpoint(server);
     result.notes.push(`drive backend websocket: ${endpoint}`);
 
-    // Round 1: the named worktree does not exist yet, so the tool creates it.
-    const first = await runScriptedRound({ server, endpoint, source, round: 1, notes: result.notes });
+    // Round 1: the named worktree does not exist yet, so the tool creates it
+    // and marks it with the session it started there.
+    const first = await runScriptedRound({ server, endpoint, source, round: 1, name: ATTACH_NAME, notes: result.notes });
     result.firstStatus = first.status;
     result.firstOutput = first.output;
     const rows = await inventoryRows(server);
@@ -302,15 +326,64 @@ export async function runAttachScenario(options: {
       (entry) => basename(entry.directory) === ATTACH_NAME,
     )?.directory;
 
-    // Round 2: the same name. The tool must attach — its text says so — and
-    // the inventory must not grow a second row for the name.
-    const second = await runScriptedRound({ server, endpoint, source, round: 2, notes: result.notes });
+    // Round 2: the same name, seconds later. The occupancy guard must refuse —
+    // round 1's session is fresh — and no second directory may appear.
+    const second = await runScriptedRound({ server, endpoint, source, round: 2, name: ATTACH_NAME, notes: result.notes });
     result.secondStatus = second.status;
     result.secondOutput = second.output;
     result.inventoryCount = (await inventoryRows(server)).filter(
       (entry) => basename(entry.directory) === ATTACH_NAME,
     ).length;
     result.notes.push(`inventory after round 2: ${result.inventoryCount} row(s) named "${ATTACH_NAME}"`);
+
+    // Round 3: the refusal's own recovery — delete the occupying session out
+    // of band (verified: DELETE answers 204, then the session is gone) — and
+    // the same name must now attach and rewrite the marker for the new session.
+    result.occupantSessionID = await markerSessionID(result.worktreeDirectory);
+    result.notes.push(`marker after round 1 names: ${result.occupantSessionID ?? "nothing"}`);
+    if (result.occupantSessionID !== undefined) {
+      const deleted = await server.api.json("DELETE", `/api/session/${result.occupantSessionID}`);
+      result.deleteStatus = deleted.status;
+      result.notes.push(`round 3: DELETE occupying session -> ${deleted.status}`);
+    }
+    const third = await runScriptedRound({ server, endpoint, source, round: 3, name: ATTACH_NAME, notes: result.notes });
+    result.thirdStatus = third.status;
+    result.thirdOutput = third.output;
+    result.thirdSessionID = /session (\S+)\)/.exec(third.output ?? "")?.[1];
+    result.thirdMarkerSessionID = await markerSessionID(result.worktreeDirectory);
+
+    // Legacy phase: a worktree created through the raw worktree API (the
+    // fanOut pattern) predates the guard — the strategy records the inventory
+    // row but writes no marker. It must sit at the path the tool predicts for
+    // the name (a sibling of the source), so the attach finds it. Its attach
+    // must proceed exactly as before and leave the directory marked and clean.
+    const legacyName = "legacy";
+    const rawCreated = await server.api.json("POST", "/api/worktree", {
+      strategy: "cow",
+      directory: join(source, ".."),
+      name: legacyName,
+    });
+    const legacyDir = (rawCreated.body as { directory?: string }).directory;
+    result.legacy = { directory: legacyDir };
+    result.notes.push(
+      `legacy: POST /api/worktree -> ${rawCreated.status} ${legacyDir ?? rawCreated.text.slice(0, 120)}`,
+    );
+    const legacyRound = await runScriptedRound({ server, endpoint, source, round: 4, name: legacyName, notes: result.notes });
+    result.legacy.attachStatus = legacyRound.status;
+    result.legacy.attachOutput = legacyRound.output;
+    result.legacy.markerSessionID = await markerSessionID(legacyDir);
+    result.legacy.gitStatus =
+      legacyDir === undefined
+        ? undefined
+        : execFileSync("git", ["-C", legacyDir, "status", "--porcelain"], { encoding: "utf8" });
+    result.notes.push(
+      `legacy: scripted spawn_workspace -> ${legacyRound.status ?? "not found"}` +
+        `${legacyRound.output ? `: ${legacyRound.output.slice(0, 200)}` : ""}`,
+    );
+    result.notes.push(
+      `legacy: marker names ${result.legacy.markerSessionID ?? "nothing"}; ` +
+        `git status ${JSON.stringify(result.legacy.gitStatus)}`,
+    );
     return result;
   } finally {
     await server.stop();
@@ -329,13 +402,14 @@ async function runScriptedRound(args: {
   readonly endpoint: string;
   readonly source: string;
   readonly round: number;
+  readonly name: string;
   readonly notes: string[];
 }): Promise<{ status?: string; output?: string }> {
   const drive = await driveModel(args.endpoint, [
     {
       kind: "tool-call",
       name: "spawn_workspace",
-      input: resolveScriptedInput({ name: ATTACH_NAME }, args.source),
+      input: resolveScriptedInput({ name: args.name }, args.source),
     },
     { kind: "text", text: "done" },
   ]);
@@ -363,6 +437,19 @@ async function runScriptedRound(args: {
       `${scripted?.output ? `: ${scripted.output.slice(0, 200)}` : ""}`,
   );
   return { status: scripted?.status, output: scripted?.output };
+}
+
+/** The session id a worktree's occupancy marker names, when readable. */
+async function markerSessionID(directory: string | undefined): Promise<string | undefined> {
+  if (directory === undefined) return undefined;
+  const raw = await readFile(join(directory, MARKER_NAME), "utf8").catch(() => undefined);
+  if (raw === undefined) return undefined;
+  try {
+    const sessionID = (JSON.parse(raw) as { sessionID?: unknown }).sessionID;
+    return typeof sessionID === "string" ? sessionID : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** `GET /api/worktree` returns a bare array here (observed), not `{data}`. */

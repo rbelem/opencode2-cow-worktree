@@ -3,7 +3,9 @@ import { basename, join, resolve } from "node:path";
 import { assertSameDevice } from "./device";
 import type { CowCapability } from "./capability";
 import type { Mechanism } from "./mechanism";
-import type { WorktreeInventoryEntry } from "../types/opencode2-worktree";
+import { MARKER_NAME, RECOVERIES, occupancyDecision, occupancyRefusal, parseMarker, probeOccupyingSession } from "./occupancy";
+import type { OccupancyDecision, ParsedMarker, ProbeResult } from "./occupancy";
+import type { SessionGetResult, WorktreeInventoryEntry } from "../types/opencode2-worktree";
 
 /** What a successful `spawnWorkspace` produced. */
 export interface SpawnWorkspaceResult {
@@ -17,6 +19,13 @@ export interface SpawnWorkspaceResult {
    * directory that was found, not of a clone this call performed.
    */
   readonly attached?: boolean;
+  /**
+   * Set when the occupancy marker could not be written after a successful
+   * session start. The session is live either way — the marker only arms the
+   * occupancy guard for the next spawn — so the failure rides along as a
+   * warning instead of failing the call.
+   */
+  readonly markerWarning?: string;
 }
 
 /** Whether a caller who asked for a CoW clone may be given a Shallow worktree. */
@@ -69,6 +78,23 @@ export interface SpawnWorkspaceDeps {
    * without a filesystem.
    */
   readonly isDirectory: (path: string) => Promise<boolean>;
+  /**
+   * Reads one session by id — the occupancy guard probes the session a marker
+   * names. Declared total because the classifier treats every throw and every
+   * odd shape as an answer (see `probeOccupyingSession`); the live binding's
+   * 404 arrives as a thrown `SessionNotFoundError`.
+   */
+  readonly sessionGet: (id: string) => Promise<SessionGetResult>;
+  /** The raw occupancy marker file's content, or `undefined` when there is none. */
+  readonly readMarker: (directory: string) => Promise<string | undefined>;
+  /**
+   * Writes the occupancy marker for a fresh session, git-excluding it first.
+   * A failure here is demoted to the result's `markerWarning`, never a failed
+   * spawn: an unmarked worktree is the pre-guard status quo, not an error.
+   */
+  readonly writeMarker: (directory: string, sessionID: string) => Promise<void>;
+  /** Wall-clock milliseconds. Injected so dormancy is testable. */
+  readonly now: () => number;
   /** Defaults to `"none"`: a request for `cow` is a statement about what you get. */
   readonly fallback?: FallbackPolicy;
   /** Worktree parent. Defaults to a same-filesystem sibling of the source. */
@@ -155,7 +181,17 @@ export async function spawnWorkspace(
 
   try {
     const sessionID = await deps.createSession(worktree.directory, input.name);
-    return { sessionID, directory: worktree.directory, mechanism };
+    // Cow only: a git worktree's `.git` is a file, so the exclude the marker
+    // needs has no place to live — no marker, no exclude; the guard is a
+    // cow-worktree contract.
+    const markerWarning =
+      mechanism === "cow" ? await markerWarningOf(worktree.directory, sessionID, deps) : undefined;
+    return {
+      sessionID,
+      directory: worktree.directory,
+      mechanism,
+      ...(markerWarning === undefined ? {} : { markerWarning }),
+    };
   } catch (cause) {
     // The cleanup is best-effort: it must never replace the failure that
     // triggered it. `removeWorktree` goes through opencode2's DELETE route,
@@ -277,7 +313,9 @@ async function tryAttach(
  * The attach decision for a path that already exists. The inventory is the
  * source of truth for "ours" (ADR 0003): an entry recorded with `cow` plus the
  * Deep-clone signature (`.git` is a directory) means the `cow` strategy
- * materialized this directory, so a new session may bind to it. Every other
+ * materialized this directory, so a new session may bind to it — and the
+ * occupancy marker then decides whether it may, while the session the marker
+ * names is still alive (`assertOccupancyFree`). Every other
  * answer is refused loudly — before any session is created and with no
  * filesystem change — because a Foreign worktree, another strategy's Worktree,
  * or a `cow` row that lost its Deep-clone shape is not this tool's to attach
@@ -296,13 +334,89 @@ async function attachToExisting(
   if (!(await deps.isDirectory(join(target, ".git")))) {
     throw notDeepCloneError(target);
   }
+  await assertOccupancyFree(target, deps);
   try {
     const sessionID = await deps.createSession(target, name);
-    return { sessionID, directory: target, mechanism: "cow", attached: true };
+    // Written even when no marker existed (a legacy worktree): from the next
+    // spawn onward, this guard is what protects the directory.
+    const markerWarning = await markerWarningOf(target, sessionID, deps);
+    return {
+      sessionID,
+      directory: target,
+      mechanism: "cow",
+      attached: true,
+      ...(markerWarning === undefined ? {} : { markerWarning }),
+    };
   } catch (cause) {
     // No removeWorktree here, unlike the create flow: the directory existed
     // before this call, so a failed session start must leave it untouched.
     throw new Error(`session start failed in existing worktree ${target}`, { cause });
+  }
+}
+
+/**
+ * The occupancy half of attach (issue #15), run after the Deep-clone signature
+ * check: the marker decides whether the worktree is free to attach. No marker
+ * is a legacy worktree — it attaches, and the marker is written on the way
+ * out. A marker naming a live session refuses, naming the holder and the way
+ * out; a marker whose session is gone (a 404) or past the occupancy window is
+ * stale, and the attach proceeds to rewrite it.
+ */
+async function assertOccupancyFree(target: string, deps: SpawnWorkspaceDeps): Promise<void> {
+  const marker = parseMarker(await deps.readMarker(target));
+  if (marker === "malformed") throw malformedMarkerError(target);
+  const probe =
+    marker === undefined
+      ? { kind: "absent" as const }
+      : await probeOccupyingSession(deps.sessionGet, marker.sessionID);
+  const decision = occupancyDecision({ marker, probe, now: deps.now() });
+  if (decision.action === "refuse") throw occupancyThrowFor(target, marker, probe, decision);
+}
+
+/**
+ * The thrown form of a refusal. When the probe answered live, the holder is
+ * known by id and last-activity time and the refusal names both; the other
+ * refusals carry their reason from the decision table.
+ */
+function occupancyThrowFor(
+  target: string,
+  marker: ParsedMarker,
+  probe: ProbeResult,
+  decision: OccupancyDecision & { readonly action: "refuse" },
+): Error {
+  if (marker !== undefined && marker !== "malformed" && probe.kind === "live") {
+    return occupancyRefusal(target, { sessionID: marker.sessionID, updated: probe.updated });
+  }
+  return new Error(`refusing to attach to ${target}: ${decision.reason}`);
+}
+
+/**
+ * The refusal for a marker that cannot be parsed: the guard cannot tell who
+ * holds the worktree, so it will not hand it out.
+ */
+function malformedMarkerError(target: string): Error {
+  return new Error(
+    `refusing to attach to ${target}: ${join(target, MARKER_NAME)} is malformed — ` +
+      `it does not parse as JSON or names no session, so the holder is unknown. ${RECOVERIES}`,
+  );
+}
+
+/**
+ * Writes the occupancy marker through the injected seam, demoting a failure to
+ * the warning string the result carries. The session is live either way; the
+ * marker only arms the guard for the next spawn.
+ */
+async function markerWarningOf(
+  directory: string,
+  sessionID: string,
+  deps: Pick<SpawnWorkspaceDeps, "writeMarker">,
+): Promise<string | undefined> {
+  try {
+    await deps.writeMarker(directory, sessionID);
+    return undefined;
+  } catch (cause) {
+    const reason = cause instanceof Error ? cause.message : String(cause);
+    return `the occupancy marker could not be written to ${directory}: ${reason}`;
   }
 }
 

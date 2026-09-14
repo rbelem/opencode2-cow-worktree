@@ -3,6 +3,7 @@ import { stat } from "node:fs/promises";
 import { probeCowCapability } from "./capability";
 import { fallbackPolicy, postCreateHooks, targetRoot } from "./config";
 import { deviceOf, isDirectory } from "./device";
+import { readMarkerFile, writeMarkerFile } from "./occupancy";
 import { listCowWorktrees, spawnWorkspace } from "./tool";
 import type {
   FallbackPolicy,
@@ -59,6 +60,11 @@ const spawnWorkspaceOutput = {
       type: "boolean",
       description:
         "True when the session was attached to an existing worktree instead of a new clone.",
+    },
+    markerWarning: {
+      type: "string",
+      description:
+        "Set when the occupancy marker could not be written after a successful session start.",
     },
   },
   required: ["sessionID", "directory", "mechanism"],
@@ -155,6 +161,14 @@ function liveDeps(
     },
     removeWorktree: (directory) =>
       ctx.worktree.remove({ directory, force: true }),
+    // `ctx.session.get` exists on the v2 runtime but is untyped in the
+    // installed beta; types/opencode2-worktree.d.ts declares the verified
+    // `{ sessionID }` shape and the structural record slice the occupancy
+    // guard reads.
+    sessionGet: (id) => ctx.session.get({ sessionID: id }),
+    readMarker: readMarkerFile,
+    writeMarker: writeMarkerFile,
+    now: Date.now,
     fallback,
     targetRoot: worktreeRoot,
   };
@@ -203,10 +217,13 @@ export default {
           const result = await spawnWorkspace(input, liveDeps(ctx, fallback, worktreeRoot));
           // The text is what tells attach from create: on attach `mechanism`
           // reports the found directory's mechanism, and the caller must never
-          // read that as a fresh clone having happened.
-          const content = result.attached
-            ? `Attached to existing cow worktree at ${result.directory} (session ${result.sessionID}); no new worktree was created.`
-            : `Created ${result.mechanism} worktree at ${result.directory} (session ${result.sessionID}).`;
+          // read that as a fresh clone having happened. A marker-write failure
+          // never fails the call; it rides along as a warning line.
+          const content =
+            (result.attached
+              ? `Attached to existing cow worktree at ${result.directory} (session ${result.sessionID}); no new worktree was created.`
+              : `Created ${result.mechanism} worktree at ${result.directory} (session ${result.sessionID}).`) +
+            (result.markerWarning === undefined ? "" : `\nwarning: ${result.markerWarning}`);
           return {
             output: result,
             content,
