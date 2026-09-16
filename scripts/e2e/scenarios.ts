@@ -22,12 +22,20 @@ export async function fanOut(
   count: number,
 ): Promise<WorktreeRun[]> {
   const runs: WorktreeRun[] = [];
+  // The nightly (20260915) worktree-create payload demands `projectID`; the
+  // pinned binary (20260912.3) ignores it. Discover the id rather than
+  // hardcode it — for these scratch roots it resolves to "global".
+  const projects = await server.api.json("GET", "/api/project");
+  const projectId =
+    Array.isArray(projects.body) ? projects.body[0]?.id : undefined;
+  assertions.check("project discovery: found an id", typeof projectId === "string", projects.text);
   for (let index = 1; index <= count; index += 1) {
     const id = `w${index}`;
     const created = await server.api.json("POST", "/api/worktree", {
       strategy: "cow",
       directory: join(source, "..", "worktrees"),
       name: id,
+      projectID: projectId,
     });
     assertions.check(`create ${id}: HTTP 200`, created.status === 200, `${created.status} ${created.text}`);
     const directory = (created.body as { directory?: string }).directory;

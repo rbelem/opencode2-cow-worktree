@@ -76,7 +76,13 @@ export async function startServer(
 async function waitForHealth(api: Api): Promise<void> {
   const deadline = Date.now() + READY_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    const { status } = await api.json("GET", "/api/health").catch(() => ({ status: 0 }));
+    // /api/health lost its handler on the 20260915 nightly — 404 with auth,
+    // 401 without (the auth guard fires on every /api/* path, so the 401 says
+    // nothing about route existence; the authenticated 404 does). Readiness
+    // polls /api/plugin instead, which both pinned and nightly binaries
+    // serve; whether the plugin activated is waitForPlugin's question, one
+    // phase later.
+    const { status } = await api.json("GET", "/api/plugin").catch(() => ({ status: 0 }));
     if (status === 200) return;
     await Bun.sleep(100);
   }
