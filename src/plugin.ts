@@ -206,7 +206,9 @@ export default {
         description:
           "Create a worktree and start a session in it, reporting the mechanism that produced the directory. " +
           "When a worktree with the requested name already exists and was produced by the cow strategy, the " +
-          "session is attached to it instead of creating a new directory; anything else at that name is refused.",
+          "session is attached to it instead of creating a new directory; anything else at that name is refused. " +
+          "If the worktree's recorded session still shows activity, the attach is refused and the error names " +
+          "the occupying session and the ways to recover.",
         input: spawnWorkspaceInput,
         output: spawnWorkspaceOutput,
         // A tool defaults into CodeMode, which advertises it to the model only

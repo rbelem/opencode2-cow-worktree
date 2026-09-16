@@ -79,6 +79,8 @@ function fakeDeps(
     readonly now?: number;
     /** Makes `writeMarker` throw, exercising the warning path. */
     readonly failMarkerWrite?: boolean;
+    /** Makes `readMarker` throw, exercising the unreadable-marker refusal. */
+    readonly failMarkerRead?: Error;
   } = {},
 ): { deps: SpawnWorkspaceDeps; calls: Calls } {
   const calls: Calls = {
@@ -120,7 +122,10 @@ function fakeDeps(
       // undefined and the classifier reads it as a positive absence.
       return options.sessionAnswer as SessionGetResult;
     },
-    readMarker: async () => options.marker,
+    readMarker: async () => {
+      if (options.failMarkerRead !== undefined) throw options.failMarkerRead;
+      return options.marker;
+    },
     writeMarker: async (directory, sessionID) => {
       if (options.failMarkerWrite) throw new Error("marker fs boom");
       calls.markerWrites.push({ directory, sessionID });
@@ -606,7 +611,7 @@ test("attach refuses while the marker's session is fresh, naming it and the reco
   // now 1_000_000, updated 500: well inside the occupancy window.
   await expect(
     spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, deps),
-  ).rejects.toThrow(/refusing to attach to \/wt\/worker.*session ses_old/);
+  ).rejects.toThrow(/refusing to attach to \/wt\/worker.*session ses_old/i);
   expect(calls.sessionLookups).toEqual(["ses_old"]);
   expect(calls.createSession).toEqual([]);
   expect(calls.markerWrites).toEqual([]);
@@ -620,9 +625,26 @@ test("a fresh refusal spells out all three recoveries", async () => {
   } catch (cause) {
     message = (cause as Error).message;
   }
+  expect(message).toContain("Session ses_old");
   expect(message).toContain("Pick another worktree name");
   expect(message).toContain("DELETE /api/session/<sessionID>");
   expect(message).toContain("remove the occupancy marker");
+});
+
+test("a live refusal carries the holder's age in human form", async () => {
+  // now 1_000_000, updated 0: well past an hour of silence is dormant, so pin
+  // the fresh side's age wording through the single refusal path.
+  const fixture = fakeDeps({ status: "supported" }, {
+    targetRoot: "/wt",
+    inventory: [{ directory: "/wt/worker", strategy: "cow" }],
+    directories: ["/wt/worker", join("/wt/worker", ".git")],
+    marker: '{"sessionID":"ses_old"}',
+    sessionAnswer: { id: "ses_old", time: { updated: 0 } },
+    now: 60_000,
+  });
+  await expect(
+    spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, fixture.deps),
+  ).rejects.toThrow(/last activity was 1 minute\(s\) ago/);
 });
 
 test("attach proceeds and rewrites when the marker's session is gone (404)", async () => {
@@ -708,6 +730,27 @@ test("a worktree with no marker attaches as before and comes out marked", async 
   // No marker means no session to probe: the legacy path asks nothing.
   expect(calls.sessionLookups).toEqual([]);
   expect(calls.markerWrites).toEqual([{ directory: "/wt/worker", sessionID: "ses_test" }]);
+});
+
+test("an unreadable marker refuses before any session or filesystem change", async () => {
+  // readMarker's live binding answers `undefined` for a missing marker, so a
+  // throw is EACCES-class — an unreadable marker is not evidence of a free
+  // worktree, and the refusal must be the shaped one, not a raw fs error.
+  const { deps, calls } = fakeDeps({ status: "supported" }, {
+    targetRoot: "/wt",
+    inventory: [{ directory: "/wt/worker", strategy: "cow" }],
+    directories: ["/wt/worker", join("/wt/worker", ".git")],
+    failMarkerRead: Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }),
+  });
+
+  await expect(
+    spawnWorkspace({ sourceDirectory: "/src", name: "worker" }, deps),
+  ).rejects.toThrow(
+    /refusing to attach to \/wt\/worker: the occupancy marker at .*\.cow-session\.json could not be read \(EACCES.*\)\..*Pick another worktree name/s,
+  );
+  expect(calls.sessionLookups).toEqual([]);
+  expect(calls.createSession).toEqual([]);
+  expect(calls.markerWrites).toEqual([]);
 });
 
 test("the create flow writes the marker for cow and never for git", async () => {
@@ -1249,7 +1292,7 @@ test("the registered tool refuses to attach while the marker's session is live",
   expect(tool).toBeDefined();
 
   await expect(tool!.execute({ sourceDirectory: dir, name: "occ" })).rejects.toThrow(
-    /refusing to attach.*session ses_marked.*Pick another worktree name/s,
+    /refusing to attach.*session ses_marked.*Pick another worktree name/is,
   );
   expect(lookedUp).toEqual(["ses_marked"]);
 });

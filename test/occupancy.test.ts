@@ -8,7 +8,6 @@ import {
   MARKER_NAME,
   OCCUPIED_AFTER_MS,
   occupancyDecision,
-  occupancyRefusal,
   parseMarker,
   probeOccupyingSession,
   writeMarkerFile,
@@ -130,19 +129,34 @@ test("no marker with a dormant session proceeds without a rewrite", () => {
   expect(decision).toEqual({ action: "proceed", rewrite: false });
 });
 
-test("the refusal names the occupying session, its age, and the recoveries", () => {
-  const error = occupancyRefusal("/wt/worker", { sessionID: "ses_old", updated: Date.now() - 30_000 });
-  expect(error.message).toContain("refusing to attach to /wt/worker");
-  expect(error.message).toContain("session ses_old");
-  expect(error.message).toContain("Pick another worktree name");
-  expect(error.message).toContain("DELETE /api/session/<sessionID>");
-  expect(error.message).toContain("remove the occupancy marker");
-  expect(error.message).toContain("less than a minute");
+test("the fresh refusal's decision reason names holder, age, and the recoveries", () => {
+  // Single refusal path: the decision reason is the message body the tool
+  // wraps, so it must carry the whole escape hatch on its own.
+  const decision = occupancyDecision({
+    marker: marker("ses_old"),
+    probe: live(Date.now() - 30_000),
+    now: Date.now(),
+  });
+  expect(decision.action).toBe("refuse");
+  if (decision.action === "refuse") {
+    expect(decision.reason).toContain("Session ses_old");
+    expect(decision.reason).toContain("less than a minute");
+    expect(decision.reason).toContain("Pick another worktree name");
+    expect(decision.reason).toContain("DELETE /api/session/<sessionID>");
+    expect(decision.reason).toContain("remove the occupancy marker");
+  }
 });
 
-test("an unanswerable last-activity time never reads as fresh in the refusal", () => {
-  const error = occupancyRefusal("/wt/worker", { sessionID: "ses_old", updated: Number.NaN });
-  expect(error.message).toContain("an unknown amount of time");
+test("an unanswerable clock never reads as fresh", () => {
+  // A negative or non-finite idle (an injected `now` behind the record, or
+  // garbage) must refuse, not fall through to the dormant proceed.
+  for (const now of [Number.NaN, -1]) {
+    const decision = occupancyDecision({ marker: marker("ses_old"), probe: live(0), now });
+    expect(decision.action).toBe("refuse");
+    if (decision.action === "refuse") {
+      expect(decision.reason).toContain("an unknown amount of time");
+    }
+  }
 });
 
 // The probe classifier: one `sessionGet` call, four verdicts.
@@ -164,11 +178,13 @@ test("the plugin-side dotted tag with an empty message counts as absent too", as
   expect(verdict).toEqual({ kind: "absent" });
 });
 
-test("a throw whose message says Session not found counts as absent too", async () => {
+test("a throw that merely says Session not found is not a positive absence", async () => {
+  // No message matching: an unrelated gateway error that phrases itself like
+  // a 404 must refuse, not clear the worktree.
   const verdict = await probeOccupyingSession(async () => {
-    throw new Error("GET /api/session/ses_old: Session not found");
+    throw new Error("Session not found");
   }, "ses_old");
-  expect(verdict).toEqual({ kind: "absent" });
+  expect(verdict).toEqual({ kind: "error" });
 });
 
 test("any other throw is a probe error", async () => {
@@ -183,9 +199,14 @@ test("a null or undefined answer counts as absent", async () => {
   expect(await probeOccupyingSession(async () => null, "ses_old")).toEqual({ kind: "absent" });
 });
 
-test("a body without a string id counts as absent", async () => {
-  expect(await probeOccupyingSession(async () => ({}), "ses_old")).toEqual({ kind: "absent" });
-  expect(await probeOccupyingSession(async () => ({ id: 42 }), "ses_old")).toEqual({ kind: "absent" });
+test("any other non-conforming answer refuses, never clears", async () => {
+  // Only null/undefined are positive absences from a resolved answer. A
+  // non-object primitive or a body without a string id proves nothing about
+  // the session, so it must refuse — an id-less object clearing a live
+  // worktree is exactly the fail-open the classifier exists to prevent.
+  for (const answer of ["x", 42, {}, { id: 42 }]) {
+    expect(await probeOccupyingSession(async () => answer, "ses_old")).toEqual({ kind: "error" });
+  }
 });
 
 test("a live record needs a usable epoch-milliseconds time.updated", async () => {

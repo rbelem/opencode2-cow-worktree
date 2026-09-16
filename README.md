@@ -206,7 +206,9 @@ If the requested name already belongs to a cow worktree, the call attaches: a
 new session binds to the existing directory and `attached: true` comes back —
 nothing is cloned. Attach only happens for worktrees this strategy
 materialized; anything else already at that path (a `git` worktree, an unknown
-directory) is refused before anything changes.
+directory) is refused before anything changes. If the worktree's recorded
+session still shows activity, the attach is refused and the error names the
+occupying session and the ways to recover.
 
 A create whose target path already exists is refused before the first write:
 `cow` never merges into, or deletes, a directory it did not create. Resolve

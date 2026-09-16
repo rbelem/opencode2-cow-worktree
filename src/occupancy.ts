@@ -89,10 +89,11 @@ export function parseMarker(raw: string | undefined): ParsedMarker {
  *
  * The verified server contract: an absent id makes the lookup throw with
  * `_tag: "SessionNotFoundError"` (HTTP 404), which is a *positive* absence —
- * the one answer that proves the worktree free. A resolved `null`/`undefined`,
- * a non-object, or a body without a string id counts as absent too. Any other
- * throw is an unanswerable probe, and so is a body whose `time.updated` is not
- * a usable epoch-milliseconds number: a malformed 200 must never become
+ * the one answer that proves the worktree free. A resolved `null` or
+ * `undefined` counts as absent too. Anything else is an unanswerable probe: a
+ * throw with any other tag, a non-object body, or a body without a string id
+ * all refuse rather than guess, and so does a body whose `time.updated` is not
+ * a usable epoch-milliseconds number — a malformed 200 must never become
  * dormancy, because naive `now - updated` arithmetic over a missing or
  * non-numeric value would read as endlessly idle.
  */
@@ -106,11 +107,10 @@ export async function probeOccupyingSession(
   } catch (cause) {
     return isSessionNotFound(cause) ? { kind: "absent" } : { kind: "error" };
   }
-  if (answer === null || answer === undefined || typeof answer !== "object") {
-    return { kind: "absent" };
-  }
+  if (answer === null || answer === undefined) return { kind: "absent" };
+  if (typeof answer !== "object") return { kind: "error" };
   const record = answer as { id?: unknown; time?: { updated?: unknown } };
-  if (typeof record.id !== "string") return { kind: "absent" };
+  if (typeof record.id !== "string") return { kind: "error" };
   const updated = record.time?.updated;
   return typeof updated === "number" && Number.isFinite(updated) && updated >= 0
     ? { kind: "live", updated }
@@ -118,14 +118,18 @@ export async function probeOccupyingSession(
 }
 
 function isSessionNotFound(cause: unknown): boolean {
-  if (typeof cause !== "object" || cause === null) return false;
-  // Both verified spellings: the HTTP payload tags the 404
-  // `SessionNotFoundError`, while the error the plugin-side lookup throws is
-  // `Session.NotFoundError` with an empty message.
-  const tag = (cause as { _tag?: unknown })._tag;
-  if (tag === "SessionNotFoundError" || tag === "Session.NotFoundError") return true;
-  const message = (cause as { message?: unknown }).message;
-  return typeof message === "string" && message.includes("Session not found");
+  // The only positive-absence signals from a throw, both verified: the HTTP
+  // payload tags the 404 `SessionNotFoundError`, while the error the
+  // plugin-side lookup throws is `Session.NotFoundError` with an empty
+  // message. No message matching: a substring is not a tag, and an unrelated
+  // gateway error that happens to phrase itself like a 404 must refuse, not
+  // clear the worktree.
+  return (
+    typeof cause === "object" &&
+    cause !== null &&
+    ((cause as { _tag?: unknown })._tag === "SessionNotFoundError" ||
+      (cause as { _tag?: unknown })._tag === "Session.NotFoundError")
+  );
 }
 
 /**
@@ -158,6 +162,9 @@ export function occupancyDecision(input: {
   }
   if (input.probe.kind === "live") {
     const updated = input.probe.updated;
+    // Deliberate defense-in-depth, not dead code: the classifier already maps
+    // an unusable `updated` to a probe error, so this row only fires if that
+    // classification ever drifts.
     if (!Number.isFinite(updated) || updated < 0) {
       return {
         action: "refuse",
@@ -165,28 +172,12 @@ export function occupancyDecision(input: {
       };
     }
     const idle = input.now - updated;
-    if (idle <= OCCUPIED_AFTER_MS) {
+    if (!Number.isFinite(idle) || idle <= OCCUPIED_AFTER_MS) {
       const holder = input.marker === undefined ? "A session" : `Session ${input.marker.sessionID}`;
       return { action: "refuse", reason: occupiedMessage(holder, idle) };
     }
   }
   return { action: "proceed", rewrite: input.marker !== undefined };
-}
-
-/**
- * The refusal Error for an attach a live session blocks: it names the
- * worktree, the occupying session, how long ago that session was last active,
- * and the three recoveries. This is the message an agent reads to decide what
- * to do next, so it carries the whole escape hatch.
- */
-export function occupancyRefusal(
-  directory: string,
-  occupying: { readonly sessionID: string; readonly updated: number },
-): Error {
-  return new Error(
-    `refusing to attach to ${directory}: ` +
-      occupiedMessage(`session ${occupying.sessionID}`, Date.now() - occupying.updated),
-  );
 }
 
 function occupiedMessage(holder: string, idleMs: number): string {

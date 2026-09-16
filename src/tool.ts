@@ -3,8 +3,7 @@ import { basename, join, resolve } from "node:path";
 import { assertSameDevice } from "./device";
 import type { CowCapability } from "./capability";
 import type { Mechanism } from "./mechanism";
-import { MARKER_NAME, RECOVERIES, occupancyDecision, occupancyRefusal, parseMarker, probeOccupyingSession } from "./occupancy";
-import type { OccupancyDecision, ParsedMarker, ProbeResult } from "./occupancy";
+import { MARKER_NAME, RECOVERIES, occupancyDecision, parseMarker, probeOccupyingSession } from "./occupancy";
 import type { SessionGetResult, WorktreeInventoryEntry } from "../types/opencode2-worktree";
 
 /** What a successful `spawnWorkspace` produced. */
@@ -363,31 +362,37 @@ async function attachToExisting(
  * stale, and the attach proceeds to rewrite it.
  */
 async function assertOccupancyFree(target: string, deps: SpawnWorkspaceDeps): Promise<void> {
-  const marker = parseMarker(await deps.readMarker(target));
+  let raw: string | undefined;
+  try {
+    raw = await deps.readMarker(target);
+  } catch (cause) {
+    // readMarker's live binding answers `undefined` for a marker that is not
+    // there, so a throw here is EACCES-class: an unreadable marker is not
+    // evidence of a free worktree.
+    const reason = cause instanceof Error ? cause.message : String(cause);
+    throw markerReadError(target, reason);
+  }
+  const marker = parseMarker(raw);
   if (marker === "malformed") throw malformedMarkerError(target);
   const probe =
     marker === undefined
       ? { kind: "absent" as const }
       : await probeOccupyingSession(deps.sessionGet, marker.sessionID);
   const decision = occupancyDecision({ marker, probe, now: deps.now() });
-  if (decision.action === "refuse") throw occupancyThrowFor(target, marker, probe, decision);
+  if (decision.action === "refuse") {
+    throw new Error(`refusing to attach to ${target}: ${decision.reason}`);
+  }
 }
 
 /**
- * The thrown form of a refusal. When the probe answered live, the holder is
- * known by id and last-activity time and the refusal names both; the other
- * refusals carry their reason from the decision table.
+ * The refusal for a marker that cannot be read: the guard cannot tell who
+ * holds the worktree, so it will not hand it out.
  */
-function occupancyThrowFor(
-  target: string,
-  marker: ParsedMarker,
-  probe: ProbeResult,
-  decision: OccupancyDecision & { readonly action: "refuse" },
-): Error {
-  if (marker !== undefined && marker !== "malformed" && probe.kind === "live") {
-    return occupancyRefusal(target, { sessionID: marker.sessionID, updated: probe.updated });
-  }
-  return new Error(`refusing to attach to ${target}: ${decision.reason}`);
+function markerReadError(target: string, reason: string): Error {
+  return new Error(
+    `refusing to attach to ${target}: the occupancy marker at ` +
+      `${join(target, MARKER_NAME)} could not be read (${reason}). ${RECOVERIES}`,
+  );
 }
 
 /**

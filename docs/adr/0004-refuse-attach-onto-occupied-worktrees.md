@@ -41,8 +41,11 @@ The tool records the fact itself, because it is the only party that knows it.
   | present | 200, message activity within the window | **refuse**, naming the session id, its last-active age, and the recoveries |
   | present | probe failure that is not a positive absence | **refuse** (fail closed) |
 
-- Absence is classified only from a positive signal — the verified
-  `_tag: "SessionNotFoundError"` 404 (or an absent result). A transient probe
+- Absence is classified only from a positive signal — a thrown error tagged
+  `_tag: "SessionNotFoundError"`, or a probe result of `null`/`undefined`.
+  Every other non-conforming shape — a non-object primitive, a body without a
+  string `id`, a probe failure of any other kind — refuses; nothing that
+  proves nothing about the session may clear its marker. A transient probe
   error must never masquerade as a 404 and clear a live session's marker.
 - The window is 60 minutes. Derivation: updates land at message writes, so a
   turn that writes no message for longer than the window false-clears — and
@@ -82,9 +85,12 @@ its probe are deleted in favor of the inventory answer: migrate, then remove.
 - `session.get` exists on the v2 server-plugin `Context` but the installed
   `@opencode-ai/plugin` beta types only `create`; the augmentation in
   `types/opencode2-worktree.d.ts` grows a minimal structural `get` slice
-  (that file's stated convention). How the wrapper surfaces the 404 — a
-  thrown tagged error or an absent result — is classified defensively and
-  pinned by the e2e suite during implementation.
+  (that file's stated convention). Verified at implementation time: the
+  runtime call takes `{ sessionID }` — a bare string fails the input schema
+  with `SchemaError: Expected object` — and an absent id throws tagged
+  `_tag: "Session.NotFoundError"` with an empty message, while the HTTP
+  payload spells the same 404 `SessionNotFoundError`. Both tags are pinned
+  (unit and e2e); a substring message match is deliberately not a signal.
 
 ## Considered options
 
