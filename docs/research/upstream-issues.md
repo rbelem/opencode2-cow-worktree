@@ -106,8 +106,53 @@ candidate produced by the attach/list design work.
 
 ---
 
+## 6. Nightly 20260915: `/api/health` answers 404 with auth
+
+**Problem.** Observed 2026-09-16 against `0.0.0.0-next-20260915` (devbox
+profile). The server boots and serves every endpoint the plugin and e2e use,
+but `GET /api/health` returns 404 with auth and 401 without — the auth guard
+fires on every `/api/*` path, so the 401 says nothing about route existence
+and the authenticated 404 means no handler is registered. On the pinned
+`0.0.0-next-20260912.3` the same route answers 200.
+
+**Workaround status.** The e2e readiness probe (`scripts/e2e/server.ts`
+`waitForHealth`) polls `GET /api/plugin`, which both binaries serve, and
+comments the why in place.
+
+**File it if** upstream confirms the move was unintentional (the protocol in
+the 2026-08-13 clone still declares `/api/health` at
+`packages/protocol/src/groups/health.ts`). Recommended: **low effort, ask
+first** — one-line question upstream: "did `/api/health` move or regress on
+the 20260915 nightly?"
+
+## 7. Nightly 20260915: worktree create demands `projectID`; the plugin path breaks
+
+**Problem.** Same nightly. `POST /api/worktree` rejects a payload without
+`projectID` (`InvalidRequestError: Missing key at ["projectID"]`), and the
+in-process plugin path fails identically: `ctx.worktree.create` passes
+`strategy`/`name`/`location`/`directory` per the pinned contract, so
+`spawn_workspace` errors on every create — cow and git strategies alike —
+meaning the plugin cannot create any worktree on the nightly. The project id
+is discoverable (`GET /api/project?location[directory]=…` returns it; it
+resolved to `"global"` on the scratch roots).
+
+**Workaround status.** None shipped. The e2e fan-out passes `projectID`
+discovered from `GET /api/project`; the plugin still speaks the pinned
+contract. An adaptation (pass `ctx.location.project.id`) is possible but
+chases a nightly and risks the pinned binary if it rejects unknown keys —
+hence this entry instead of a commit.
+
+**File it if** the projectID requirement survives into a release build: then
+the plugin must grow the field (with a fallback for binaries that ignore it),
+or every plugin-created worktree dies. Recommended: **high value if it
+survives**, since it gates the plugin's core verb.
+
+---
+
 ## Suggested filing batch (when the owner decides)
 
 1. Desktop hardcode (candidate 1) — blocks adoption; write-up ready.
 2. Server-plugin session listing (candidate 5) — small, high-leverage SDK ask.
 3. Optional riders: strategy post-create hook (4), `instanceof` fix (2).
+4. Nightly candidates 6-7 — ask-first; candidate 7 gates the plugin's core
+   verb if it survives into a release.
