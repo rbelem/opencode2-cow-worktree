@@ -12,28 +12,20 @@ where possible; document the rest. Verdicts per candidate below.
 
 ---
 
-## 1. Desktop hardcodes `strategy: "git"` — plugin strategies unreachable from the Desktop UI
+# 14: Desktop hardcodes `strategy: "git"` — RESOLVED upstream
 
-**Problem.** `packages/app/src/workspaces/create.ts:14` sends
+**Problem (historical).** `packages/app/src/workspaces/create.ts` sent
 `strategy: "git"` unconditionally to `POST /api/worktree`, defeating the
-location's selected strategy, so installing (and selecting) `cow` changes
-nothing in the Desktop "new worktree" UI. The TUI equivalent was fixed in PR
-#47991 (merged 2026-09-08) by deleting the same override; App/Desktop was not
-included.
+location's selected strategy. The TUI equivalent was fixed in PR #47991
+(merged 2026-09-08); App/Desktop was not included. Full trace in
+`docs/research/desktop-strategy-hardcode.md`.
 
-**Evidence.** Full trace in `docs/research/desktop-strategy-hardcode.md`:
-introduced with the helper's first commit (`96d8462`, PR #45735) before
-plugin strategies existed; knowingly retained in PR #47358; left behind by
-the TUI fix. The literal is still present on the public `v2` tip.
-
-**Workaround status.** None. The only plugin-side seam that reaches the
-Desktop path (registering a strategy whose id hijacks `"git"`) is unsafe and
-was rejected in this repo's own analysis.
-
-**File it if** Desktop usage of `cow` matters. Recommended: **file when
-announcing the plugin** — it is the single blocker for Desktop adoption, the
-fix is a one-line deletion with an exact in-repo precedent (#47991), and the
-write-up is already done.
+**Resolution (2026-09-17).** Fixed upstream by the projectID refactor: the
+helper on the v2 tip now sends `{ projectID, from, branch }` and no strategy
+literal, and `Worktree.CreateInput` no longer declares a `strategy` field at
+all — core resolves the create through the selected strategy
+(`getStrategy(settings.selected, …)` in `packages/core/src/worktree.ts`).
+Filed as rbelem/opencode2-cow-worktree#14; closed against this evidence.
 
 ## 2. `Worktree.OperationError` `instanceof` broken for installed plugins; `forceRequired: null`
 
@@ -106,18 +98,23 @@ candidate produced by the attach/list design work.
 
 ---
 
-## 6. Nightly 20260915: `/api/health` answers 404 with auth
+## 6. Nightly 20260915: `/api/health` answers 404 with auth; 20260917 also drops `await-activation`
 
 **Problem.** Observed 2026-09-16 against `0.0.0.0-next-20260915` (devbox
 profile). The server boots and serves every endpoint the plugin and e2e use,
 but `GET /api/health` returns 404 with auth and 401 without — the auth guard
 fires on every `/api/*` path, so the 401 says nothing about route existence
 and the authenticated 404 means no handler is registered. On the pinned
-`0.0.0-next-20260912.3` the same route answers 200.
+`0.0.0-next-20260912.3` the same route answers 200. Re-verified
+2026-09-17 against `0.0.0-next-20260917`: `/api/health` is still gone, and
+`POST /api/plugin/await-activation` now answers 404 too — plugin activation
+is observable only through `GET /api/plugin`, whose list shows the plugin
+`active` once the loader finishes.
 
-**Workaround status.** The e2e readiness probe (`scripts/e2e/server.ts`
-`waitForHealth`) polls `GET /api/plugin`, which both binaries serve, and
-comments the why in place.
+**Workaround status.** The e2e readiness probe (`scripts/e2e/server.ts`)
+polls `GET /api/plugin`, and `waitForPlugin` treats the `await-activation`
+404 as "route gone" while still detecting activation through the plugin
+list. The plugin itself never calls either route.
 
 **File it if** upstream confirms the move was unintentional (the protocol in
 the 2026-08-13 clone still declares `/api/health` at
@@ -125,22 +122,23 @@ the 2026-08-13 clone still declares `/api/health` at
 first** — one-line question upstream: "did `/api/health` move or regress on
 the 20260915 nightly?"
 
-## 7. Nightly 20260915: worktree create demands `projectID`; the plugin path breaks
+## 7. Nightly 20260915: worktree create demands `projectID`; the plugin path breaks — ADAPTED plugin-side
 
 **Problem.** Same nightly. `POST /api/worktree` rejects a payload without
 `projectID` (`InvalidRequestError: Missing key at ["projectID"]`), and the
-in-process plugin path fails identically: `ctx.worktree.create` passes
-`strategy`/`name`/`location`/`directory` per the pinned contract, so
-`spawn_workspace` errors on every create — cow and git strategies alike —
-meaning the plugin cannot create any worktree on the nightly. The project id
-is discoverable (`GET /api/project?location[directory]=…` returns it; it
-resolved to `"global"` on the scratch roots).
+in-process plugin path fails identically. The 20260917 nightly keeps the
+requirement and extends it to every worktree endpoint (list, remove,
+refresh), drops the `strategy` request field entirely, and suffixes
+`name-2 … name-10` when the assembled `<parent>/<name>` already exists
+(`packages/core/src/worktree.ts`, verified against the v2 tip).
 
-**Workaround status.** None shipped. The e2e fan-out passes `projectID`
-discovered from `GET /api/project`; the plugin still speaks the pinned
-contract. An adaptation (pass `ctx.location.project.id`) is possible but
-chases a nightly and risks the pinned binary if it rejects unknown keys —
-hence this entry instead of a commit.
+**Workaround status.** Shipped in 0.3.0: the plugin derives `projectID` from
+`ctx.location.project.id` on every worktree call, passes the source as
+`from` (the old `location` key is gone), and still sends `strategy` for
+2.0.2-era binaries, where the field selects the git fallback's mechanism.
+Consequence recorded under the fallback option in the README: on
+projectID-era binaries the git fallback cannot be requested and a non-CoW
+source fails with the cow refusal.
 
 **File it if** the projectID requirement survives into a release build: then
 the plugin must grow the field (with a fallback for binaries that ignore it),
@@ -153,11 +151,12 @@ survives**, since it gates the plugin's core verb.
 
 **Problem.** `DELETE /api/worktree` on a worktree whose directory no longer
 exists answers 400 `Worktree directory unavailable` (`forceRequired: null`),
-even at `force: true`. `Worktree.remove` (`packages/core/src/worktree.ts`,
-`e.fn("Worktree.remove")`) runs the realpath/resolve step *before*
-`a.find(u)`, so `DirectoryUnavailableError` fires before the recorded strategy
-is consulted and `force` never reaches a path that could ignore the missing
-directory. Measured against the pinned `0.0.0-next-20260912.3`; filed as
+even at `force: true`. `Worktree.remove` (`packages/core/src/worktree.ts`)
+runs the realpath/resolve step *before* `ops.find`, so the missing-directory
+error fires before the recorded strategy is consulted and `force` never
+reaches a path that could ignore it. Measured against the pinned
+`0.0.0-next-20260912.3` and re-verified against the v2 tip
+(`0.0.0-next-20260917`, where the op also takes `projectID`); filed as
 rbelem/opencode2-cow-worktree#12 with the full repro.
 
 **Workaround status.** Plugin-side half shipped in v0.1.0: `cow.remove`
@@ -175,8 +174,10 @@ candidate 1.
 
 ## Suggested filing batch (when the owner decides)
 
-1. Desktop hardcode (candidate 1) — blocks adoption; write-up ready.
-2. Server-plugin session listing (candidate 5) — small, high-leverage SDK ask.
+1. Server-plugin session listing (candidate 5) — small, high-leverage SDK ask.
+2. `Worktree.remove` realpath-first (candidate 8) — clears dangling rows.
 3. Optional riders: strategy post-create hook (4), `instanceof` fix (2).
-4. Nightly candidates 6-7 — ask-first; candidate 7 gates the plugin's core
-   verb if it survives into a release.
+4. Nightly candidates 6 — ask-first (health and await-activation routes).
+
+Candidate 1 (Desktop hardcode) resolved itself in the projectID refactor;
+candidate 7 is adapted plugin-side (0.3.0).

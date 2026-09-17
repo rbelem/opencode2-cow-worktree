@@ -25,6 +25,15 @@ const nonCowRoot = await findNonCowRoot();
 
 const scratchDirs: string[] = [];
 
+/**
+ * The location slice `liveDeps` reads: the projectID-era worktree calls derive
+ * their `projectID` from the plugin's own location context.
+ */
+const fakeLocation = {
+  directory: "/src",
+  project: { id: "prj_test", directory: "/src", canonical: "/src" },
+};
+
 afterEach(async () => {
   await Promise.all(
     scratchDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })),
@@ -360,6 +369,7 @@ test.skipIf(cowRoot === undefined)("attach never runs the post-create hooks (tic
 
   const ctx = {
     options: { hooks: { postCreate: ["exit 1"] } },
+    location: fakeLocation,
     worktree: {
       transform: async (callback: (editor: unknown) => void) => {
         callback({ add: () => {} });
@@ -961,6 +971,7 @@ test.skipIf(cowRoot === undefined)("plugin setup registers the spawn_workspace t
   const sessionCreate = async () => ({ id: "ses_live" });
 
   const ctx = {
+    location: fakeLocation,
     worktree: {
       transform: async (callback: (editor: unknown) => void) => {
         callback({ add: () => {} });
@@ -1021,6 +1032,7 @@ test("the registered tool is kept on the native tool list, not behind CodeMode",
   const registered: Array<{ name: string; options?: { codemode?: boolean } }> = [];
 
   const ctx = {
+    location: fakeLocation,
     worktree: {
       transform: async (callback: (editor: unknown) => void) => {
         callback({ add: () => {} });
@@ -1049,6 +1061,7 @@ test("the registered tool declares the output schema it returns", async () => {
   const registered: Array<{ name: string; output?: unknown }> = [];
 
   const ctx = {
+    location: fakeLocation,
     worktree: {
       transform: async (callback: (editor: unknown) => void) => {
         callback({ add: () => {} });
@@ -1107,6 +1120,7 @@ function schemaOf(output: unknown): {
 async function registeredOutputs(): Promise<Map<string, unknown>> {
   const registered: Array<{ name: string; output?: unknown }> = [];
   const ctx = {
+    location: fakeLocation,
     worktree: {
       transform: async (callback: (editor: unknown) => void) => {
         callback({ add: () => {} });
@@ -1188,6 +1202,7 @@ test("the registered tool attaches through ctx.worktree.list and reports it", as
 
   let created = 0;
   const ctx = {
+    location: fakeLocation,
     worktree: {
       transform: async (callback: (editor: unknown) => void) => {
         callback({ add: () => {} });
@@ -1252,6 +1267,7 @@ test("the registered tool refuses to attach while the marker's session is live",
 
   const lookedUp: string[] = [];
   const ctx = {
+    location: fakeLocation,
     worktree: {
       transform: async (callback: (editor: unknown) => void) => {
         callback({ add: () => {} });
@@ -1318,6 +1334,7 @@ test("a marker-write failure surfaces as markerWarning on the registered tool", 
   await writeFile(join(target, ".git", "info"), "not a directory", "utf8");
 
   const ctx = {
+    location: fakeLocation,
     worktree: {
       transform: async (callback: (editor: unknown) => void) => {
         callback({ add: () => {} });
@@ -1454,6 +1471,7 @@ interface RegisteredToolShape {
 async function captureRegisteredTools(): Promise<Array<Record<string, unknown>>> {
   const registered: Array<Record<string, unknown>> = [];
   const ctx = {
+    location: fakeLocation,
     worktree: {
       transform: async (callback: (editor: unknown) => void) => {
         callback({ add: () => {} });
@@ -1508,6 +1526,7 @@ async function registeredListTool(
   }> = [];
   const ctx = {
     options,
+    location: fakeLocation,
     worktree: {
       transform: async (callback: (editor: unknown) => void) => {
         callback({ add: () => {} });

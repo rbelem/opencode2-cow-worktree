@@ -171,3 +171,19 @@ export function makeApi(base: string, password: string, location: string): Api {
     },
   };
 }
+
+/**
+ * Discovers the project id the projectID-era API demands on every worktree
+ * endpoint; on these scratch roots `/api/project` resolves it to "global".
+ */
+export async function projectIdOf(api: Api): Promise<string> {
+  const projects = await api.json("GET", "/api/project");
+  const rows = Array.isArray(projects.body)
+    ? projects.body
+    : (projects.body as { data?: Array<{ id?: string }> }).data ?? [];
+  const id = rows[0]?.id;
+  if (typeof id !== "string") {
+    throw new Error(`could not discover a project id: ${projects.status} ${projects.text}`);
+  }
+  return id;
+}

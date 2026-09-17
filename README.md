@@ -148,7 +148,11 @@ clone (default `"none"`):
 - `"none"`: a request for `cow` produces a Deep clone or fails. Never a
   shallow worktree.
 - `"git"`: on a non-CoW filesystem the tool may build a regular `git`
-  worktree instead and report `mechanism: "git"`.
+  worktree instead and report `mechanism: "git"`. This works on opencode2
+  builds whose worktree create still accepts a `strategy` request
+  (2.0.2-era). From the projectID-era API onward (20260915 nightlies,
+  v2.0.3+) the create always runs the selected strategy and ignores the
+  field, so the non-CoW refusal surfaces and the fallback cannot engage.
 
 **`targetRoot`** — where `spawn_workspace` places the worktree. Unset (the
 default) means a sibling of the source, on the source's filesystem by
@@ -237,8 +241,10 @@ regardless of `fallback`. Only `spawn_workspace` consults the policy.
 - **"the target is on a different filesystem"** — set `worktree.directory` as
   shown above, or point `targetRoot` at the source's filesystem.
 - **`cow` fails on an ext4 or tmpfs project** — expected: that filesystem
-  cannot clone. Use the `git` fallback for tool calls, or let the project use
-  the built-in strategy.
+  cannot clone. On opencode2 builds from the projectID era (20260915
+  nightlies, v2.0.3+) the `git` fallback cannot be requested through the
+  create API, so the refusal is final; on 2.0.2-era builds the `fallback:
+  "git"` option produces a regular git worktree for tool calls.
 - **The plugin is stuck on an old version** — opencode2 caches the package
   under `~/.cache/opencode/node_modules/`. Remove the plugin's cache
   directory and restart: `rm -rf ~/.cache/opencode/node_modules/opencode2-cow-worktree`.

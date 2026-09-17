@@ -15,7 +15,8 @@ post-create commands, and has a Linux backend (per-file
 - A 31-scenario parallel-agent live swarm on `opencode2
   v0.0.0-next-20260912.3` — clone/isolation/extents, remove + dirty guard,
   `spawn_workspace` options, fresh-binary install/defaults — all passing
-  (`docs/e2e/run-2026-09-12-swarm.md`).
+  (`docs/e2e/run-2026-09-12-swarm.md`), re-proven against the projectID-era
+  API on `v0.0.0-next-20260917` (`docs/e2e/run-2026-09-17.md`).
 - A four-scenario e2e harness (105 checks) against a real opencode2 server:
   create + isolation, attach, list, hooks. Each run is recorded under
   `docs/e2e/`.

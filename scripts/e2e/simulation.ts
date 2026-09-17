@@ -21,7 +21,7 @@ import { execFileSync } from "node:child_process";
 import { basename, join } from "node:path";
 import { MARKER_NAME } from "../../src/occupancy";
 import { driveModel, type DriveController } from "./drive";
-import { installPlugin, makeConfigRoot, removePath, declarePlugin, exists, git } from "./lib";
+import { installPlugin, makeConfigRoot, removePath, declarePlugin, exists, git, projectIdOf } from "./lib";
 import type { ConfigRoot } from "./lib";
 import type { Server } from "./server";
 
@@ -358,10 +358,12 @@ export async function runAttachScenario(options: {
     // the name (a sibling of the source), so the attach finds it. Its attach
     // must proceed exactly as before and leave the directory marked and clean.
     const legacyName = "legacy";
+    const projectId = await projectIdOf(server.api);
     const rawCreated = await server.api.json("POST", "/api/worktree", {
       strategy: "cow",
       directory: join(source, ".."),
       name: legacyName,
+      projectID: projectId,
     });
     const legacyDir = (rawCreated.body as { directory?: string }).directory;
     result.legacy = { directory: legacyDir };
@@ -454,7 +456,11 @@ async function markerSessionID(directory: string | undefined): Promise<string | 
 
 /** `GET /api/worktree` returns a bare array here (observed), not `{data}`. */
 async function inventoryRows(server: Server): Promise<Array<{ directory: string; strategy?: string }>> {
-  const listed = await server.api.json("GET", "/api/worktree");
+  const projectId = await projectIdOf(server.api);
+  const listed = await server.api.json(
+    "GET",
+    "/api/worktree?projectID=" + encodeURIComponent(projectId),
+  );
   if (Array.isArray(listed.body)) return listed.body as Array<{ directory: string; strategy?: string }>;
   return (listed.body as { data?: Array<{ directory: string; strategy?: string }> }).data ?? [];
 }
@@ -507,11 +513,13 @@ export async function runListScenario(options: {
     // Create both worktrees through the real HTTP API, the same shape fanOut
     // uses: the parent beside the source, so the reflink crosses no device.
     const parent = join(source, "..", "worktrees");
+    const projectId = await projectIdOf(server.api);
     for (const name of LIST_NAMES) {
       const created = await server.api.json("POST", "/api/worktree", {
         strategy: "cow",
         directory: parent,
         name,
+        projectID: projectId,
       });
       const directory = (created.body as { directory?: string }).directory;
       result.created[name] = directory;
@@ -647,10 +655,12 @@ export async function runHooksScenario(scenario: {
     },
   });
   try {
+    const projectId = await projectIdOf(ok.server.api);
     const created = await ok.server.api.json("POST", "/api/worktree", {
       strategy: "cow",
       directory: ok.parent,
       name: HOOKS_SOURCE_NAME,
+      projectID: projectId,
     });
     const directory = (created.body as { directory?: string }).directory;
     result.createdDirectory = directory;
@@ -685,10 +695,12 @@ export async function runHooksScenario(scenario: {
     pluginOptions: { hooks: { postCreate: ['printf "about to fail"; exit 3'] } },
   });
   try {
+    const projectId = await projectIdOf(bad.server.api);
     const failed = await bad.server.api.json("POST", "/api/worktree", {
       strategy: "cow",
       directory: bad.parent,
       name: "hook-bad",
+      projectID: projectId,
     });
     result.failStatus = failed.status;
     result.failText = failed.text;

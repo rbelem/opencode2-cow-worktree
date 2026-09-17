@@ -146,21 +146,27 @@ function liveDeps(
   return {
     probe: probeCowCapability,
     probeDevice: deviceOf,
-    listWorktrees: () => ctx.worktree.list(),
+    // The projectID-era API (20260915 nightlies onward) requires the project
+    // id on every worktree call and no longer accepts a `location` query, so
+    // all three seams derive it from the plugin's own location context.
+    listWorktrees: () => ctx.worktree.list({ projectID: ctx.location.project.id }),
     isDirectory,
     createWorktree: (input) =>
       ctx.worktree.create({
-        strategy: input.strategy,
-        name: input.name,
-        location: { directory: input.sourceDirectory },
+        projectID: ctx.location.project.id,
+        from: input.sourceDirectory,
         directory: input.parentDirectory,
+        name: input.name,
+        // Ignored by projectID-era binaries (the selected strategy wins);
+        // honored by the 2.0.2-era API, where the git fallback needs it.
+        strategy: input.strategy,
       }),
     createSession: async (directory, name) => {
       const session = await ctx.session.create({ title: name, location: { directory } });
       return session.id;
     },
     removeWorktree: (directory) =>
-      ctx.worktree.remove({ directory, force: true }),
+      ctx.worktree.remove({ projectID: ctx.location.project.id, directory, force: true }),
     // `ctx.session.get` exists on the v2 runtime but is untyped in the
     // installed beta; types/opencode2-worktree.d.ts declares the verified
     // `{ sessionID }` shape and the structural record slice the occupancy
@@ -179,9 +185,11 @@ function liveDeps(
  *
  * `setup` registers the `cow` Strategy through the worktree seam, and the
  * `spawn_workspace` and `list_worktrees` tools through the tool seam.
- * Registering the Strategy also selects it as the Location default; opencode2's
- * registry still lets a caller name the built-in `git` strategy explicitly, so
- * this module does not touch that behavior.
+ * Registering the Strategy also selects it as the default; the projectID-era
+ * create API has no per-request strategy field, so the selected strategy is
+ * what every create uses. The create call still carries `strategy` for
+ * 2.0.2-era binaries, where it is what lets the tool's opt-in `git` fallback
+ * name the built-in git strategy.
  */
 export default {
   id: "opencode2-cow-worktree",
@@ -252,7 +260,7 @@ export default {
             // the inventory and one stat per row, none of spawn_workspace's
             // other seams. (Option validation happens once in setup, so there
             // is no validation side effect to dodge either way.)
-            listWorktrees: () => ctx.worktree.list(),
+            listWorktrees: () => ctx.worktree.list({ projectID: ctx.location.project.id }),
             statEntry: stat,
           });
           const summary =

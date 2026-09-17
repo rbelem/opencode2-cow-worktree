@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Assertions, assertDeepClone, assertGitState, assertSharedExtents } from "./assertions";
-import { NON_COW_ROOT, exists, removePath, tempRootUnder } from "./lib";
+import { NON_COW_ROOT, exists, projectIdOf, removePath, tempRootUnder } from "./lib";
 import type { Server } from "./server";
 import type { ConfigRoot } from "./lib";
 
@@ -130,7 +130,11 @@ export async function assertInventory(
   server: Server,
   runs: WorktreeRun[],
 ): Promise<void> {
-  const listed = await server.api.json("GET", "/api/worktree");
+  const projectId = await projectIdOf(server.api);
+  const listed = await server.api.json(
+    "GET",
+    "/api/worktree?projectID=" + encodeURIComponent(projectId),
+  );
   assertions.check("inventory: GET /api/worktree returns 200", listed.status === 200, String(listed.status));
   const entries = listEntries(listed.body);
   for (const run of runs) {
@@ -176,10 +180,12 @@ export async function runFallbackScenarios(
   const worktrees = join(config.root, "non-cow-worktrees");
   await mkdir(worktrees, { recursive: true });
 
+  const projectId = await projectIdOf(server.api);
   const attempted = await server.api.json("POST", "/api/worktree", {
     strategy: "cow",
     directory: worktrees,
     name: "on-cow-source",
+    projectID: projectId,
   });
   result.notes.push(
     `main server (CoW source): POST /api/worktree -> ${attempted.status}; ` +
@@ -227,13 +233,15 @@ export async function runNonCowServer(options: {
   const { startServer } = await import("./server");
   const server = await startServer(config, { port: options.port, location: source });
   try {
-    await server.api.json("POST", "/api/worktree/refresh");
+    const projectId = await projectIdOf(server.api);
+    await server.api.json("POST", "/api/worktree/refresh", { projectID: projectId });
     const worktrees = join(config.root, "worktrees");
     const name = `cow-${options.fallback}`;
     const created = await server.api.json("POST", "/api/worktree", {
       strategy: "cow",
       directory: worktrees,
       name,
+      projectID: projectId,
     });
     result.notes.push(
       `source on /dev/shm, plugin fallback=${options.fallback}: POST /api/worktree {strategy:"cow"} -> ${created.status} ${created.text.slice(0, 160)}`,
@@ -256,15 +264,20 @@ export async function removeWorktrees(
   server: Server,
   runs: WorktreeRun[],
 ): Promise<void> {
+  const projectId = await projectIdOf(server.api);
   for (const run of runs) {
     const removed = await server.api.json("DELETE", "/api/worktree", {
       directory: run.directory,
       force: true,
+      projectID: projectId,
     });
     assertions.check(`remove ${run.id}: HTTP 204`, removed.status === 204, `${removed.status} ${removed.text}`);
     assertions.check(`remove ${run.id}: directory is gone`, !(await exists(run.directory)));
   }
-  const listed = await server.api.json("GET", "/api/worktree");
+  const listed = await server.api.json(
+    "GET",
+    "/api/worktree?projectID=" + encodeURIComponent(projectId),
+  );
   const entries = listEntries(listed.body);
   for (const run of runs) {
     assertions.check(`remove ${run.id}: not in inventory`, !entries.some((entry) => entry.directory === run.directory));
@@ -303,9 +316,11 @@ export async function removeWorktreeMissingDirectory(
   await removePath(run.directory);
   assertions.check(`issue #12: ${run.id} directory removed out-of-band`, !(await exists(run.directory)));
 
+  const projectId = await projectIdOf(server.api);
   const removed = await server.api.json("DELETE", "/api/worktree", {
     directory: run.directory,
     force: true,
+    projectID: projectId,
   });
   // Today this is a 400; the point is that it must NOT be a silent failure that
   // leaves the row behind. Either a 204 (upstream fixed) or a 400 is acceptable
@@ -318,7 +333,10 @@ export async function removeWorktreeMissingDirectory(
 
   // The supported recovery: listing reconciles the inventory and drops the row
   // for a directory that no longer exists.
-  const listed = await server.api.json("GET", "/api/worktree");
+  const listed = await server.api.json(
+    "GET",
+    "/api/worktree?projectID=" + encodeURIComponent(projectId),
+  );
   const entries = listEntries(listed.body);
   assertions.check(
     `issue #12: ${run.id} row is pruned by the inventory reconcile (not stuck)`,

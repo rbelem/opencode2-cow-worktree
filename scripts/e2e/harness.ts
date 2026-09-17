@@ -135,15 +135,15 @@ async function main(): Promise<number> {
       sourceRoot: nonCowGitRoot,
       scriptedTool: { name: "spawn_workspace", input: { name: "fb" } },
     });
+    // The projectID-era create API has no strategy field, so the fallback
+    // cannot request the built-in git strategy: the selected (cow) strategy
+    // runs and refuses the non-CoW source. The refusal — not a schema error —
+    // is the pass condition: it proves the request reached the strategy. On
+    // 2.0.2-era binaries this scenario completed with mechanism "git".
     assertions.check(
-      "simulation fallback: non-CoW source + fallback git completes",
-      fallbackGit.scriptedToolStatus === "completed",
-      `${fallbackGit.scriptedToolStatus} ${fallbackGit.scriptedToolOutput ?? ""}`,
-    );
-    assertions.check(
-      "simulation fallback: the result reports the git mechanism",
-      (fallbackGit.scriptedToolOutput ?? "").includes("git"),
-      fallbackGit.scriptedToolOutput ?? "no output",
+      "simulation fallback: non-CoW source + fallback git is refused by the cow strategy",
+      (fallbackGit.scriptedToolStatus ?? "").includes("cow strategy failed to clone"),
+      `${fallbackGit.scriptedToolStatus ?? ""} ${fallbackGit.scriptedToolOutput ?? ""}`,
     );
     const nonCowNoneRoot = await mkdtemp(join("/dev/shm", "cow-harness-fl-"));
     const fallbackNone = await runSimulationScenario({

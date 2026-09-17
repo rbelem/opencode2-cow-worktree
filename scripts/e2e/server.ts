@@ -92,7 +92,10 @@ async function waitForHealth(api: Api): Promise<void> {
 /**
  * A plain `GET /api/plugin` does not await activation, so the plugin list is
  * empty until `POST /api/plugin/await-activation` runs. Both facts were
- * discovered against the real binary; see the run log.
+ * discovered against the real binary; see the run log. On the 20260917
+ * nightly `POST /api/plugin/await-activation` answers 404 (route gone), so
+ * activation is detected through `GET /api/plugin` alone; the loop keeps
+ * polling both.
  */
 async function waitForPlugin(server: Server): Promise<void> {
   const deadline = Date.now() + READY_TIMEOUT_MS;

@@ -73,7 +73,12 @@ function recordCtx(
 
   const ctx = {
     options,
+    location: {
+      directory: "/src",
+      project: { id: "prj_test", directory: "/src", canonical: "/src" },
+    },
     worktree: {
+      list: async () => [],
       create: async (input: { strategy?: string; directory?: string }) => {
         recorded.strategies.push(input.strategy ?? "default");
         recorded.parents.push(input.directory);

@@ -131,10 +131,10 @@ export interface WorktreeEntry {
 
 /**
  * A worktree inventory entry as `ctx.worktree.list()` returns it — upstream's
- * `Worktree.Info` (packages/schema/src/worktree.ts): the directory and the id
- * of the strategy that produced it. The checkout root is listed with no
- * strategy. Verified against upstream 2.0.2 (`packages/core/src/worktree.ts`
- * `ops.list`, served by `GET /api/worktree`).
+ * `Worktree.Directory` (packages/schema/src/worktree.ts): the directory and the
+ * id of the strategy that produced it. The checkout root is listed with no
+ * strategy. Verified against 0.0.0-next-20260917 (`GET /api/worktree`
+ * with `projectID`).
  */
 export interface WorktreeInventoryEntry {
   readonly directory: string;
@@ -162,43 +162,64 @@ export interface WorktreeDefinition {
 }
 
 export interface WorktreeEditor {
-  /** Registers an implementation and selects it as the default. */
+  /** Registers an implementation and selects it as the default. Later active registrations win. */
   add(definition: WorktreeDefinition): void;
 }
 
 export interface WorktreeDomain {
   readonly create: (input: {
-    readonly strategy?: string;
-    readonly name?: string;
-    readonly location?: { readonly directory?: string };
     /**
-     * `Worktree.CreateInput.directory` — the **parent** directory for the new
-     * worktree, not the worktree path. opencode2 appends the name. Unset
-     * defaults to the server's data directory.
+     * The project the worktree belongs to. Required by the projectID-era API
+     * (20260915 nightlies onward); `ctx.location.project.id` is the value.
+     * Verified against 0.0.0-next-20260917
+     * (packages/protocol/src/groups/worktree.ts).
+     */
+    readonly projectID: string;
+    /**
+     * The source directory to clone. Optional upstream (it defaults to the
+     * project's canonical checkout and must be a registered row of the
+     * project); passed explicitly so a session running inside a cow worktree
+     * spawns from the directory it actually lives in.
+     */
+    readonly from?: string;
+    readonly branch?: string;
+    /**
+     * Parent directory for the new worktree. opencode2 appends the name.
      *
-     * Assembly contract (pinned upstream fact): opencode2 assembles the
-     * worktree directory as `<parent>/<name>` verbatim — no sanitization, no
-     * suffixing. Both halves of `spawn_workspace` rely on this: the create
-     * flow hands over exactly this parent (`predictedParent` in src/tool.ts),
-     * and attach predicts `<parent>/<name>` as the path an earlier create
-     * under the same input would have produced.
+     * Assembly contract (verified against 0.0.0-next-20260917): when the
+     * assembled `<parent>/<name>` already exists, the server suffixes
+     * `name-2` … `name-10` and fails with `DestinationExistsError` after
+     * that — no longer the verbatim assembly of the 2.0.2-era binary.
+     * `spawn_workspace` predicts the verbatim path and refuses anything there
+     * it cannot attach to before create runs, so the suffix path is only
+     * reachable for unnamed creates, whose names are server-generated slugs.
      */
     readonly directory?: string;
+    readonly name?: string;
+    /**
+     * Requested strategy id. The projectID-era schema dropped the field and
+     * ignores excess keys, so a create always uses the selected strategy —
+     * the last active registration wins. The 2.0.2-era API honors the field,
+     * which is how the tool's opt-in `git` fallback selects its mechanism
+     * there; on projectID-era binaries the fallback cannot be requested and
+     * a non-CoW source fails loudly with the cow refusal.
+     */
+    readonly strategy?: string;
   }) => Promise<WorktreeResult>;
   readonly remove: (input: {
+    readonly projectID: string;
     readonly directory: string;
     readonly force: boolean;
   }) => Promise<void>;
   /**
-   * The Worktree inventory for the current location — one
-   * `WorktreeInventoryEntry` per directory opencode2 has a record of. Verified
-   * against upstream 2.0.2 (`ops.list`): a bare call is answered with the
-   * location's entries. The listing reconciles as it reads — rows whose
-   * directory no longer exists are pruned — so an entry here means the
-   * directory is really there.
+   * The worktree inventory for the project — one `WorktreeInventoryEntry` per
+   * directory opencode2 has a record of. Verified against
+   * 0.0.0-next-20260917: `projectID` is required (a bare call answers 400),
+   * and the listing reconciles as it reads — rows whose directory no longer
+   * exists are pruned — so an entry here means the directory is really there.
    */
-  readonly list: (input?: {
-    readonly location?: { readonly directory?: string };
+  readonly list: (input: {
+    readonly projectID: string;
   }) => Promise<readonly WorktreeInventoryEntry[]>;
   readonly transform: (
     callback: (editor: WorktreeEditor) => void,
