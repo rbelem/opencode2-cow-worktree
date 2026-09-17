@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.2.0
+
+`spawn_workspace` refuses to attach a new session onto a cow worktree a live
+session is still using (ADR 0004). The tool records occupancy itself: on both
+the create and attach flows it writes `.cow-session.json` at the worktree root
+(kept out of `git status` through `.git/info/exclude`), and at attach time it
+probes the recorded session through the session API. Only a positive proof
+that the session is gone lets attach proceed: a 404, or silence past a
+60-minute window. A live session, a malformed marker, or a probe failure that
+proves nothing refuses the attach and names the occupying session plus the
+three recoveries (pick another name, delete the session out of band, remove a
+known-stale marker). Legacy worktrees without a marker keep today's fail-open
+behavior and gain a marker; the git fallback is untouched. A failed marker
+write never fails the call; the result carries an "unguarded" warning.
+
+Verified against a real `opencode2 serve` (`0.0.0-next-20260912.3`): the
+attach scenario refuses on a live session, proceeds after the occupying
+session is deleted, and backfills markers onto legacy worktrees
+(`docs/e2e/run-2026-09-16.md`). Unit suite: 307 tests, coverage gate at 100%
+lines on all 21 shipped files.
+
+Also in this release:
+
+- The e2e harness stays runnable across the 20260915 nightly split; its
+  readiness probe polls `/api/plugin` because the nightly answers 404 on
+  `/api/health`. The pinned `0.0.0-next-20260912.3` is unaffected.
+- Docs: ADR 0004, the announcement draft, the ecosystem listing draft, and
+  upstream filing candidates 6-8 (the nightly's `/api/health` 404, its
+  `projectID` requirement that breaks plugin worktree creates, and the
+  realpath-first `Worktree.remove` that strands dangling rows).
+
 ## 0.1.1
 
 Documentation-only release; no code changes. It carries the new install
