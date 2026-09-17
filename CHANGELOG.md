@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.3.0
+
+Adapted to the projectID-era opencode2 worktree API (20260915 nightlies and
+later; verified against `0.0.0-next-20260917`). The API now requires the
+project id on every worktree call, dropped the per-request `strategy` field,
+and dropped the `location` query. `spawn_workspace` and `list_worktrees`
+derive the id from the plugin's own location context, pass the source as
+`from`, and still send `strategy` for 2.0.2-era binaries, where it is what
+selects the git fallback's mechanism.
+
+Behavior notes:
+
+- On projectID-era binaries the `git` fallback cannot be requested through
+  the create API: a non-CoW source fails with the cow refusal, and the
+  refusal is final. The option still works on 2.0.2-era builds. Documented
+  in the README.
+- Create no longer assembles `<parent>/<name>` verbatim when the path is
+  taken; the server suffixes `name-2` through `name-10`. Named
+  `spawn_workspace` calls are unaffected: the tool refuses anything it
+  cannot attach to before create runs.
+
+Also in this release:
+
+- Issue #14 (Desktop hardcodes `strategy: "git"`) resolved upstream by the
+  same refactor and closed.
+- The e2e harness speaks the projectID-era API end to end: 112 checks, 0
+  failed against a real `0.0.0-next-20260917` server
+  (`docs/e2e/run-2026-09-17.md`). Unit suite: 307 tests, coverage gate at
+  100% lines on all 21 shipped files.
+
 ## 0.2.0
 
 `spawn_workspace` refuses to attach a new session onto a cow worktree a live
