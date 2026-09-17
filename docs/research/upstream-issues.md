@@ -149,6 +149,30 @@ survives**, since it gates the plugin's core verb.
 
 ---
 
+## 8. `Worktree.remove` resolves the real path before reading the record, so a gone directory can never be cleared
+
+**Problem.** `DELETE /api/worktree` on a worktree whose directory no longer
+exists answers 400 `Worktree directory unavailable` (`forceRequired: null`),
+even at `force: true`. `Worktree.remove` (`packages/core/src/worktree.ts`,
+`e.fn("Worktree.remove")`) runs the realpath/resolve step *before*
+`a.find(u)`, so `DirectoryUnavailableError` fires before the recorded strategy
+is consulted and `force` never reaches a path that could ignore the missing
+directory. Measured against the pinned `0.0.0-next-20260912.3`; filed as
+rbelem/opencode2-cow-worktree#12 with the full repro.
+
+**Workaround status.** Plugin-side half shipped in v0.1.0: `cow.remove`
+resolves a vanished directory as an already-complete removal, covering the
+race window. The API path itself is out of plugin reach.
+
+**File it if** users should be able to clear a dangling worktree row through
+the API (anyone who `rm -rf`s a worktree, or whose volume unmounted, currently
+edits `opencode.db` by hand). Proposed fix: read the record first; treat a
+missing directory as nothing to delete on disk, gated on `force`. Recommended:
+**ride the announcement batch** — it is the cleanup half of the same story as
+candidate 1.
+
+---
+
 ## Suggested filing batch (when the owner decides)
 
 1. Desktop hardcode (candidate 1) — blocks adoption; write-up ready.
