@@ -172,12 +172,92 @@ candidate 1.
 
 ---
 
+## 9. No agent-facing worktree removal tool — cleanup required `rm -rf` + hand-editing SQLite
+
+**Problem.** 2026-09-20 field finding: a full-day orchestration run in
+rbelem/shuttle (audit trail at
+`/home/rodrigo/Workspace/github.com/rbelem/shuttle/.audit/overnight-2026-09-20.tsv`)
+spawned 10 cow worktrees, and cleaning up finished lanes required `rm -rf` of
+each clone **plus** hand-editing `~/.local/share/opencode/opencode.db`
+(`DELETE FROM worktree WHERE strategy='cow' AND directory IN (…)`), because
+the agent tool surface exposes only `spawn_workspace` and `list_worktrees`.
+
+**Workaround status.** The plugin's removal mechanics are already complete
+and TOCTOU-safe (`src/removal.ts`, quarantine-renamed deletion), wired to the
+DELETE route via the `removeWorktree` dep and used by the cow strategy's
+`remove` (dirty-guard + quarantine). What is missing is only the agent-facing
+tool.
+
+**File it if** agent-facing worktree lifecycle should not require raw SQLite
+edits. Proposed fix: a `remove_worktree(name|directory, force?)` tool wrapping
+the existing path — default guard refusing unlanded worktrees (HEAD not an
+ancestor of the landing ref, dirty tree, or unique commits), `force` to
+override — de-registering the inventory row in the same operation.
+Recommended: **high** — this is the plugin-side half (shipped as the
+`remove_worktree` tool); the upstream-shaped residue is candidate 8 (dangling
+rows).
+
+## 10. `list_worktrees` fails hard on dangling inventory rows — one ENOENT row bricks the board for all sessions
+
+**Problem.** Same 2026-09-20 run. After the directories were removed, every
+`list_worktrees` call returned `ENOENT: stat …/jdk21-port` — for every call,
+in every session, until the rows were hand-deleted from SQLite. The fail-loud
+policy is deliberate (ADR 0003, "the inventory is truth"; `src/tool.ts`
+`cowEntryOf` fails loud by design), but an ENOENT row is a dangling reference,
+not truth to preserve, and there is no per-call escape hatch.
+
+**Workaround status.** Plugin-side, shipped with the `missing` knob on
+`list_worktrees`: `"fail"` (default, ADR-0003 compliant), `"report"` (rows
+returned with `missing: true`), `"prune"` (de-register ENOENT rows, log the
+prune). ADR 0003 amended with one paragraph. Upstream dependency: prune needs
+`DELETE /api/worktree` to accept a gone directory — exactly upstream candidate
+8 (realpath-first remove, 400 `Worktree directory unavailable` even at
+`force: true`); until candidate 8 lands, prune fails loudly naming candidate 8.
+
+**File it if** a single stale row should not require SQLite surgery.
+Recommended: **medium-high** — rides candidate 8's fix.
+
+## 11. Task tracker wedges on a dead generation: unconfirmed session blocks revive AND cancel for hours
+
+**Problem.** Same 2026-09-20 run. Background lane fix-5 (session
+`ses_f3f7d5dceffeeNnPkzT3l2WLBP`) died with a gateway `ConnectionRefused`.
+Thereafter `task_status` reported state `running (unconfirmed)`,
+`idle_for_seconds: 17922`, `possibly_stuck: false`, and its own probe error:
+`client.session.status is not a function. (In 'client.session.status({ query:
+{ directory } })', 'client.session.status' is undefined)`. For ~5 hours:
+`task_revive` refused ("still running and cannot be resumed") and `task_cancel`
+returned "Session abort returned but task did not stay stopped". Recovery
+required spawning a fresh worktree from the dead lane's directory.
+
+**Diagnosis (upstream opencode2 core, not the plugin).** (a) The tracker calls
+an SDK method that does not exist (`client.session.status`) — remove it or
+implement it. (b) An unconfirmed + idle session must degrade to state
+`unknown` and become revivable after a threshold, instead of blocking both
+revive and cancel. Pairs with candidate 5 (server-plugin session listing —
+same SDK-surface family).
+
+**Workaround status.** None built; recovery was manual — a fresh worktree
+spawned from the dead lane's directory.
+
+**File it if** a dead background lane should not wedge revive and cancel for
+hours. Filing decision (owner, 2026-09-20): record locally first; hold the
+public filing for the filing-batch decision. Target when filed:
+`github.com/anomalyco/opencode`, branch `v2`. Recommended: **core-bug entry**
+in the filing batch; priority to be set when filed.
+
+---
+
 ## Suggested filing batch (when the owner decides)
 
-1. Server-plugin session listing (candidate 5) — small, high-leverage SDK ask.
-2. `Worktree.remove` realpath-first (candidate 8) — clears dangling rows.
-3. Optional riders: strategy post-create hook (4), `instanceof` fix (2).
-4. Nightly candidates 6 — ask-first (health and await-activation routes).
+1. `remove_worktree` tool (candidate 9) — the plugin-shipped half; candidate 8
+   (dangling rows) is its upstream residue.
+2. Server-plugin session listing (candidate 5) — small, high-leverage SDK ask.
+3. `Worktree.remove` realpath-first (candidate 8) — clears dangling rows.
+4. `list_worktrees` `missing` knob (candidate 10) — rides candidate 8's fix.
+5. Task tracker wedge on dead generations (candidate 11) — new core-bug entry;
+   public filing held for this batch decision.
+6. Optional riders: strategy post-create hook (4), `instanceof` fix (2).
+7. Nightly candidates 6 — ask-first (health and await-activation routes).
 
 Candidate 1 (Desktop hardcode) resolved itself in the projectID refactor;
 candidate 7 is adapted plugin-side (0.3.0).
