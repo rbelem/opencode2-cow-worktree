@@ -525,8 +525,17 @@ export interface CowWorktreeEntry {
   /** The worktree directory, verbatim as the inventory records it. */
   readonly directory: string;
   readonly strategy: "cow";
-  /** ISO 8601; derived from a directory stat. See `createdAtOf`. */
-  readonly createdAt: string;
+  /**
+   * ISO 8601; derived from a directory stat. See `createdAtOf`. Absent on a
+   * `missing` entry: with no directory to stat there is no timestamp to derive.
+   */
+  readonly createdAt?: string;
+  /**
+   * Set only under `missing: "report"`: the inventory still lists the row, but
+   * its directory is gone (the stat answered ENOENT). The directory stays
+   * verbatim from the inventory and `createdAt` is absent.
+   */
+  readonly missing?: true;
 }
 
 /**
@@ -548,11 +557,29 @@ export interface ListWorktreesDeps {
    */
   readonly listWorktrees: () => Promise<readonly WorktreeInventoryEntry[]>;
   /**
-   * Stats one inventory-listed directory. A failure here is not absorbed: the
-   * inventory is truth, so an unreadable row is a real anomaly and the list
-   * fails loudly instead of silently dropping the entry.
+   * Stats one inventory-listed directory, for `createdAt`. An ENOENT here is a
+   * dangling inventory row — a directory deleted out from under the inventory —
+   * handled per the `missing` policy. Any other failure is a real anomaly and
+   * fails the list in every mode.
    */
   readonly statEntry: (path: string) => Promise<StatTimes>;
+  /**
+   * What a dangling inventory row (its directory stats ENOENT) costs the call.
+   * `"fail"` — the default — keeps ADR 0003's fail-loud contract. `"report"`
+   * lists the row flagged `missing: true`, without `createdAt`. `"prune"`
+   * de-registers the row through `removeEntry` and drops it from the listing.
+   */
+  readonly missing?: "fail" | "report" | "prune";
+  /**
+   * De-registers one inventory row; the seam behind `missing: "prune"`, wired
+   * by the plugin to `ctx.worktree.remove` with force, so a gone directory is
+   * accepted as an already-completed deletion. A rejection is never absorbed:
+   * upstream candidate 8 ("Worktree.remove resolves the real path before
+   * reading the record", docs/research/upstream-issues.md) makes the delete
+   * answer 400 for a gone directory, so the caller must learn the row is
+   * still there.
+   */
+  readonly removeEntry?: (directory: string) => Promise<void>;
 }
 
 /**
@@ -564,28 +591,143 @@ export interface ListWorktreesDeps {
  * for CoW capability: per ADR 0003 the inventory is the source of truth, and
  * the only filesystem contact is one stat per surviving entry, for
  * `createdAt`.
+ *
+ * A row whose directory stats ENOENT is a dangling reference — deleted out
+ * from under the inventory, not a worktree to preserve. The default
+ * (`missing: "fail"`) keeps ADR 0003's fail-loud contract; `"report"` returns
+ * the row flagged `missing: true` and without `createdAt`; `"prune"`
+ * de-registers the row through `removeEntry` and drops it. Any non-ENOENT
+ * stat failure fails the list in every mode — that is a real anomaly. The
+ * return shape stays the bare listing, so a prune is visible to callers only
+ * through `removeEntry`'s effect on the inventory or its rejection.
  */
 export async function listCowWorktrees(deps: ListWorktreesDeps): Promise<CowWorktreeEntry[]> {
   const entries = await deps.listWorktrees();
   const cow = entries.filter((entry) => entry.strategy === "cow");
-  return Promise.all(cow.map((entry) => cowEntryOf(entry, deps.statEntry)));
+  // Rows are resolved one at a time: prune mode mutates the inventory through
+  // `removeEntry`, and concurrent removes racing the same inventory file buy
+  // nothing for a listing of a handful of rows.
+  const listed: CowWorktreeEntry[] = [];
+  for (const entry of cow) {
+    const resolved = await cowEntryOf(entry, deps);
+    if (resolved !== undefined) listed.push(resolved);
+  }
+  return listed;
 }
 
-/** Derives one listing entry: the basename, the verbatim directory, and the stat. */
+/**
+ * Derives one listing entry — the basename, the verbatim directory, and the
+ * stat — or `undefined` when the row was pruned. The stat failure itself is
+ * classified, not absorbed: ENOENT goes to the `missing` policy, and every
+ * other failure propagates untouched, exactly as before the knob existed.
+ */
 async function cowEntryOf(
   entry: WorktreeInventoryEntry,
-  statEntry: ListWorktreesDeps["statEntry"],
-): Promise<CowWorktreeEntry> {
-  // Fail loud, by design: the inventory is truth, and a row it lists but whose
-  // directory cannot be stat'd is a real anomaly. Skipping it would report an
-  // incomplete list as a complete one.
-  const times = await statEntry(entry.directory);
+  deps: ListWorktreesDeps,
+): Promise<CowWorktreeEntry | undefined> {
+  let times: StatTimes;
+  try {
+    times = await deps.statEntry(entry.directory);
+  } catch (cause) {
+    if (!isEnoent(cause)) throw cause;
+    return missingEntryOf(entry, deps);
+  }
   return {
     name: basename(entry.directory),
     directory: entry.directory,
     strategy: "cow",
     createdAt: createdAtOf(times),
   };
+}
+
+/**
+ * The `missing` policy applied to a dangling row. `"report"` keeps the row,
+ * flagged; `"prune"` de-registers it and answers `undefined` so the row leaves
+ * the listing; the default `"fail"` throws the shaped dangling-row refusal.
+ */
+async function missingEntryOf(
+  entry: WorktreeInventoryEntry,
+  deps: ListWorktreesDeps,
+): Promise<CowWorktreeEntry | undefined> {
+  switch (deps.missing ?? "fail") {
+    case "report":
+      return {
+        name: basename(entry.directory),
+        directory: entry.directory,
+        strategy: "cow",
+        missing: true,
+      };
+    case "prune": {
+      if (deps.removeEntry === undefined) throw pruneWithoutSeamError();
+      try {
+        await deps.removeEntry(entry.directory);
+      } catch (cause) {
+        throw pruneBlockedError(entry.directory, cause);
+      }
+      return undefined;
+    }
+    default:
+      throw danglingRowError(entry.directory);
+  }
+}
+
+/**
+ * The shaped refusal for a dangling row under the default `"fail"` policy: the
+ * raw ENOENT rides as the cause, and the message names the two opt-outs.
+ */
+function danglingRowError(directory: string): Error {
+  return new Error(
+    `the worktree inventory lists ${directory}, but stat answers ENOENT: the ` +
+      "directory was deleted while the inventory still records it — a dangling " +
+      "row, and the default fails loudly rather than report an incomplete list " +
+      'as complete. Pass missing: "report" to list the row flagged missing, or ' +
+      'missing: "prune" to de-register it.',
+  );
+}
+
+/**
+ * The refusal for `missing: "prune"` without a wired `removeEntry`: the policy
+ * asked for a de-registration the call has no seam to perform.
+ */
+function pruneWithoutSeamError(): Error {
+  return new Error(
+    'missing: "prune" was requested but no removeEntry seam is wired, so a ' +
+      "dangling inventory row cannot be de-registered.",
+  );
+}
+
+/**
+ * The refusal when the prune itself fails: never swallowed, because the row
+ * the caller wanted gone is still in the inventory. The message names the row,
+ * the raw failure, and the upstream blocker (candidate 8) that makes a gone
+ * directory refuse deletion even at force.
+ */
+function pruneBlockedError(directory: string, cause: unknown): Error {
+  const reason = cause instanceof Error ? cause.message : String(cause);
+  return new Error(
+    `cow could not prune the dangling inventory row ${directory}: the removal ` +
+      `failed (${reason}). Upstream candidate 8 ("Worktree.remove resolves the ` +
+      "real path before reading the record\", docs/research/upstream-issues.md) " +
+      "makes DELETE /api/worktree answer 400 for a gone directory even at " +
+      "force:true, so the row cannot be de-registered until that lands. Re-run " +
+      'with missing: "report" to see the row flagged instead.',
+    { cause },
+  );
+}
+
+/**
+ * Whether an error is a plain ENOENT — "the path is not there", which for an
+ * inventory row means a dangling reference rather than an anomaly. Node's
+ * filesystem errors carry the code; anything else is not an absence answer.
+ * (Mirrors the classifier in `./removal`, which is module-private there.)
+ */
+function isEnoent(cause: unknown): boolean {
+  return (
+    typeof cause === "object" &&
+    cause !== null &&
+    "code" in cause &&
+    cause.code === "ENOENT"
+  );
 }
 
 /**

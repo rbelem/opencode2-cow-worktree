@@ -33,3 +33,17 @@ no lock, and no on-disk state that can go stale.
   quarantine removal, per-project defaults) need per-worktree bookkeeping of
   facts the inventory does not carry. When that tier starts, a registry
   becomes the right tool and this ADR gets superseded.
+
+An ENOENT on a listed directory is the one place "the inventory is truth"
+meets reality: the row records a directory that no longer exists, so what the
+truth preserves is a dangling reference, not a worktree. The listing still
+fails loudly by default — that contract is unchanged, and any non-ENOENT stat
+failure (a permission problem, I/O corruption) remains a hard failure in every
+mode, because it is a real anomaly rather than a stale row. The per-call
+`missing` knob is the explicit opt-out: `report` returns the row flagged
+`missing: true` without a derived `createdAt`, and `prune` de-registers the
+row through the inventory's own remove and drops it from the listing. Prune
+stays dependent on upstream candidate 8 (`docs/research/upstream-issues.md`):
+`Worktree.remove` resolves the real path before reading the record, so the
+delete answers 400 for a gone directory even at force, and a dangling row
+cannot be de-registered until that lands.
