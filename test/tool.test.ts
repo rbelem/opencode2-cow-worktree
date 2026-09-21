@@ -1175,8 +1175,14 @@ test("list_worktrees's entry schema is pinned to CowWorktreeEntry's keys", async
     strategy: "cow",
     createdAt: new Date(0).toISOString(),
   };
-  expect(Object.keys(entrySchema.properties).sort()).toEqual(Object.keys(entry).sort());
-  expect([...entrySchema.required].sort()).toEqual(Object.keys(entry).sort());
+  // `missing` is declared but optional: a healthy listing never carries it,
+  // and it only appears on a dangling row reported under missing: "report".
+  expect(Object.keys(entrySchema.properties).sort()).toEqual(
+    [...Object.keys(entry), "missing"].sort(),
+  );
+  // createdAt is declared but not required: a dangling row reported with
+  // missing: true has no directory to stat, so it carries no createdAt.
+  expect([...entrySchema.required].sort()).toEqual(["directory", "name", "strategy"]);
 });
 
 // The attach path through the live ctx bindings: the tool must read the
@@ -1382,22 +1388,49 @@ test("a marker-write failure surfaces as markerWarning on the registered tool", 
 // the basename, createdAt from one stat. An unreadable row fails the list.
 // ---------------------------------------------------------------------------
 
-/** Fakes the two seams `listCowWorktrees` reads and records what was stat'd. */
+/** An ENOENT the way node's fs seams throw it: the `code` on the error. */
+function enoentOf(path: string): Error {
+  return Object.assign(new Error(`ENOENT: no such file or directory, stat '${path}'`), {
+    code: "ENOENT",
+  });
+}
+
+/**
+ * Fakes the seams `listCowWorktrees` reads and records what was stat'd and
+ * pruned. A path with no stamp and no injected stat error throws a real
+ * ENOENT — a dangling inventory row, the case the `missing` knob exists for.
+ */
 function fakeListDeps(
   inventory: ReadonlyArray<{ directory: string; strategy?: string }>,
   stamps: Readonly<Record<string, { birthtimeMs: number; mtimeMs: number }>> = {},
-): { deps: ListWorktreesDeps; statted: string[] } {
+  options: {
+    /** What `statEntry` throws for a path, overriding the ENOENT default. */
+    readonly statErrors?: Readonly<Record<string, unknown>>;
+    /** The `missing` policy under test; absent means the default ("fail"). */
+    readonly missing?: ListWorktreesDeps["missing"];
+    /** Makes `removeEntry` reject with this when prune calls it. */
+    readonly removeEntryError?: unknown;
+  } = {},
+): { deps: ListWorktreesDeps; statted: string[]; pruned: string[] } {
   const statted: string[] = [];
+  const pruned: string[] = [];
   const deps: ListWorktreesDeps = {
     listWorktrees: async () => inventory,
     statEntry: async (path) => {
       statted.push(path);
+      const statError = options.statErrors?.[path];
+      if (statError !== undefined) throw statError;
       const stamp = stamps[path];
-      if (stamp === undefined) throw new Error(`ENOENT: ${path}`);
+      if (stamp === undefined) throw enoentOf(path);
       return stamp;
     },
+    missing: options.missing,
+    removeEntry: async (directory) => {
+      pruned.push(directory);
+      if (options.removeEntryError !== undefined) throw options.removeEntryError;
+    },
   };
-  return { deps, statted };
+  return { deps, statted, pruned };
 }
 
 test("list on an empty inventory is an empty list, not an error", async () => {
@@ -1444,8 +1477,9 @@ test("createdAt falls back to mtime when birthtime is zero/epoch (btrfs)", async
 });
 
 test("an inventory-listed directory that cannot be stat'd fails the whole list loudly", async () => {
-  // Fail-loud by design: the inventory is truth, so an unreadable row is a
-  // real anomaly — skipping it would report an incomplete list as complete.
+  // Fail-loud by design: the inventory is truth, so a dangling row (ENOENT —
+  // the fake's default) fails under the default policy. The shaped message
+  // names the row and the two opt-outs.
   const { deps } = fakeListDeps(
     [
       { directory: "/wt/ok", strategy: "cow" },
@@ -1453,7 +1487,121 @@ test("an inventory-listed directory that cannot be stat'd fails the whole list l
     ],
     { "/wt/ok": { birthtimeMs: 1, mtimeMs: 2 } },
   );
-  await expect(listCowWorktrees(deps)).rejects.toThrow(/\/wt\/ghost/);
+  await expect(listCowWorktrees(deps)).rejects.toThrow(
+    /\/wt\/ghost.*missing: "report".*missing: "prune"/s,
+  );
+});
+
+test('missing: "report" lists the dangling row flagged, without createdAt, beside healthy rows', async () => {
+  // The escape hatch for the rm -rf'd board: the dangling row stays visible —
+  // directory verbatim from the inventory, `missing: true`, no timestamp —
+  // while the healthy rows come out exactly as always.
+  const { deps } = fakeListDeps(
+    [
+      { directory: "/wt/ok", strategy: "cow" },
+      { directory: "/wt/ghost", strategy: "cow" },
+    ],
+    { "/wt/ok": { birthtimeMs: 1_000, mtimeMs: 2_000 } },
+    { missing: "report" },
+  );
+  expect(await listCowWorktrees(deps)).toEqual([
+    {
+      name: "ok",
+      directory: "/wt/ok",
+      strategy: "cow",
+      createdAt: new Date(1_000).toISOString(),
+    },
+    {
+      name: "ghost",
+      directory: "/wt/ghost",
+      strategy: "cow",
+      missing: true,
+    },
+  ]);
+});
+
+test('missing: "prune" de-registers the dangling row and drops it from the listing', async () => {
+  // The prune seam is called with the row's verbatim directory and, on
+  // success, the row simply leaves the listing — the return shape stays the
+  // bare array.
+  const { deps, pruned } = fakeListDeps(
+    [
+      { directory: "/wt/ok", strategy: "cow" },
+      { directory: "/wt/ghost", strategy: "cow" },
+    ],
+    { "/wt/ok": { birthtimeMs: 1_000, mtimeMs: 2_000 } },
+    { missing: "prune" },
+  );
+  expect(await listCowWorktrees(deps)).toEqual([
+    {
+      name: "ok",
+      directory: "/wt/ok",
+      strategy: "cow",
+      createdAt: new Date(1_000).toISOString(),
+    },
+  ]);
+  expect(pruned).toEqual(["/wt/ghost"]);
+});
+
+test("a prune whose removeEntry rejects fails the call, naming the row and the upstream blocker", async () => {
+  // Never swallowed: a rejected prune means the dangling row is still in the
+  // inventory, and the message must say why (candidate 8) and offer the way
+  // out.
+  const { deps, pruned } = fakeListDeps(
+    [{ directory: "/wt/ghost", strategy: "cow" }],
+    {},
+    { missing: "prune", removeEntryError: new Error("400 Bad Request") },
+  );
+  await expect(listCowWorktrees(deps)).rejects.toThrow(
+    /\/wt\/ghost.*candidate 8.*DELETE \/api\/worktree.*force:true.*missing: "report"/s,
+  );
+  expect(pruned).toEqual(["/wt/ghost"]);
+});
+
+test("a non-ENOENT stat failure fails the list in every missing mode", async () => {
+  // EACCES is a real anomaly, not a dangling reference: no policy absorbs it.
+  for (const missing of ["fail", "report", "prune"] as const) {
+    const { deps } = fakeListDeps(
+      [{ directory: "/wt/locked", strategy: "cow" }],
+      {},
+      {
+        missing,
+        statErrors: {
+          "/wt/locked": Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }),
+        },
+      },
+    );
+    await expect(listCowWorktrees(deps)).rejects.toThrow(/EACCES: permission denied/);
+  }
+});
+
+test("a healthy listing is identical in every missing mode", async () => {
+  // The knob only prices dangling rows; a clean inventory must come out
+  // byte-for-byte the same regardless of the policy.
+  const inventory = [{ directory: "/wt/ok", strategy: "cow" }];
+  const stamps = { "/wt/ok": { birthtimeMs: 1_000, mtimeMs: 2_000 } };
+  const expected: CowWorktreeEntry[] = [
+    {
+      name: "ok",
+      directory: "/wt/ok",
+      strategy: "cow",
+      createdAt: new Date(1_000).toISOString(),
+    },
+  ];
+  for (const missing of ["fail", "report", "prune"] as const) {
+    const { deps } = fakeListDeps(inventory, stamps, { missing });
+    expect(await listCowWorktrees(deps)).toEqual(expected);
+  }
+});
+
+test('missing: "prune" without a wired removeEntry fails instead of crashing', async () => {
+  // The policy asked for a de-registration the deps have no seam for: a shaped
+  // error, not a TypeError from calling undefined.
+  const { deps } = fakeListDeps([{ directory: "/wt/ghost", strategy: "cow" }], {}, {
+    missing: "prune",
+  });
+  const seamless = { ...deps, removeEntry: undefined };
+  await expect(listCowWorktrees(seamless)).rejects.toThrow(/no removeEntry seam is wired/);
 });
 
 /** The slice of the registered ToolInfo the registration-shape assertions read. */
@@ -1506,9 +1654,10 @@ test("list_worktrees is registered beside spawn_workspace, on the native tool li
     "name",
     "directory",
     "strategy",
-    "createdAt",
+    // createdAt is declared but not required: a dangling row reported with
+    // missing: true has no directory to stat, so it carries no createdAt.
   ]);
-  // The tool takes no input: the schema requires nothing.
+  // The only input is the optional `missing` knob: the schema requires nothing.
   expect(list!.input!.required).toBeUndefined();
 });
 

@@ -176,7 +176,7 @@ test("a misconfigured targetRoot fails setup, registering nothing", async () => 
   expect(recorded.strategies).toEqual([]);
 });
 
-test("a valid configuration registers both tools and the strategy", async () => {
+test("a valid configuration registers all three tools and the strategy", async () => {
   const { ctx, registeredToolNames, addedStrategies } = recordCtx({
     fallback: "git",
     targetRoot: "/mnt/worktrees",
@@ -187,6 +187,7 @@ test("a valid configuration registers both tools and the strategy", async () => 
   expect(addedStrategies).toEqual(["cow"]);
   expect([...registeredToolNames].sort()).toEqual([
     "list_worktrees",
+    "remove_worktree",
     "spawn_workspace",
   ]);
 });
