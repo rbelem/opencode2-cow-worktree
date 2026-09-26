@@ -10,27 +10,47 @@
  */
 
 /** How a directory entry is materialised by the clone walker. */
-export type EntryKind = "file" | "directory" | "symlink";
+export type EntryKind = "file" | "directory" | "symlink" | "special";
 
 /** The slice of a `readdir` Dirent this decision reads. */
 export interface EntryLike {
   isSymbolicLink(): boolean;
   isDirectory(): boolean;
   isFile(): boolean;
+  isSocket(): boolean;
+  isFIFO(): boolean;
+  isBlockDevice(): boolean;
+  isCharacterDevice(): boolean;
 }
 
 /** The slice of `lstat` this decision reads; `lstat` never follows a symlink. */
 export interface StatLike {
   isSymbolicLink(): boolean;
   isDirectory(): boolean;
+  isSocket(): boolean;
+  isFIFO(): boolean;
+  isBlockDevice(): boolean;
+  isCharacterDevice(): boolean;
 }
 
 export async function entryKind(entry: EntryLike, stat: () => Promise<StatLike>): Promise<EntryKind> {
   if (entry.isSymbolicLink()) return "symlink";
   if (entry.isDirectory()) return "directory";
   if (entry.isFile()) return "file";
+  if (isSpecial(entry)) return "special";
   const stats = await stat();
   if (stats.isSymbolicLink()) return "symlink";
   if (stats.isDirectory()) return "directory";
+  if (isSpecial(stats)) return "special";
   return "file";
+}
+
+/** Sockets, FIFOs, and devices: runtime artifacts, never tree content. */
+function isSpecial(s: {
+  isSocket(): boolean;
+  isFIFO(): boolean;
+  isBlockDevice(): boolean;
+  isCharacterDevice(): boolean;
+}): boolean {
+  return s.isSocket() || s.isFIFO() || s.isBlockDevice() || s.isCharacterDevice();
 }
