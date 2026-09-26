@@ -1,6 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import * as net from "node:net";
 import { lstat, link, mkdir, mkdtemp, readFile, readdir, readlink, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -443,6 +444,36 @@ test("a tree without regular files clones on any filesystem", async () => {
   expect((await lstat(join(target, "nested", "deeper"))).isDirectory()).toBe(true);
   expect((await lstat(join(target, "link"))).isSymbolicLink()).toBe(true);
   expect(await readlink(join(target, "link"))).toBe(pointee);
+});
+
+// A live socket is runtime state, not tree content: the walker skips it (and
+// any FIFO or device node) instead of dying on FICLONE's EOPNOTSUPP. The tree
+// below holds no regular file, so the walk needs no reflink and the skip is
+// provable on every filesystem, not only a CoW runner.
+test("a live socket in the tree is skipped and the clone still completes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "cow-sock-"));
+  scratchDirs.push(dir);
+  const source = join(dir, "source");
+  await mkdir(source);
+  const sockPath = join(source, "daemon.sock");
+  const server = net.createServer();
+  await new Promise<void>((resolve) => server.listen(sockPath, resolve));
+  try {
+    const target = join(dir, "clone");
+    await cloneDirectory(source, target);
+
+    let cloned: Awaited<ReturnType<typeof lstat>> | null = null;
+    try {
+      cloned = await lstat(join(target, "daemon.sock"));
+    } catch {
+      // absent is the expectation
+    }
+    expect(cloned).toBeNull();
+    // The skip must not disturb the live socket in the source tree.
+    expect((await lstat(sockPath)).isSocket()).toBe(true);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
 });
 
 test("a directory appearing between the caller's check and the clone survives the refusal untouched", async () => {

@@ -108,6 +108,13 @@ async function cloneInto(source: string, target: string, skip: string): Promise<
       await cloneInto(from, to, skip);
     } else if (kind === "symlink") {
       await symlink(await readlink(from), to);
+    } else if (kind === "special") {
+      // A socket, FIFO, or device node (e.g. a live daemon socket at a
+      // project root) cannot be reflinked — FICLONE fails with EOPNOTSUPP
+      // and would abort the whole clone. It is runtime state, not tree
+      // content, so the clone omits it; whatever created it in the source
+      // creates its own in the clone.
+      continue;
     } else {
       await reflinkFile(from, to);
     }
