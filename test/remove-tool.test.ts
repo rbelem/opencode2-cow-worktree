@@ -1,15 +1,23 @@
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
+import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { removeWorktree } from "../src/remove-tool";
+import { removeWorktree, runGit } from "../src/remove-tool";
 import type { GitRun, RemoveWorktreeDeps } from "../src/remove-tool";
 import type { UncommittedChanges } from "../src/dirty";
+import { hasGit } from "./fs-roots";
 import plugin from "../src/plugin";
 
-// remove_worktree's decision-table pins, driven entirely through fake seams —
+// remove_worktree's decision-table pins, driven through fake seams —
 // no opencode2, no filesystem, no git. The git seam is a responder keyed by
 // the four commands the landed-ness guard runs (`symbolic-ref`,
 // `rev-parse --verify --quiet`, `merge-base --is-ancestor`,
-// `rev-list --count`), so every test states its scenario as data.
+// `rev-list --count`), so every test states its scenario as data. The final
+// block pins the live git binding itself (`runGit`) against a real scratch
+// repository: the fake seam's `GitRun` answers are only meaningful because
+// the real binding keeps the same contract.
 
 const WT = "/wt/worker";
 
@@ -449,4 +457,216 @@ test("plugin setup registers remove_worktree on the native tool list with its ou
   expect(Object.keys(input.properties).sort()).toEqual(["directory", "force", "name"]);
   // Exactly-one-of is validated in execute, so the schema requires neither.
   expect(input.required).toBeUndefined();
+});
+
+// The live git binding, pinned where the code lives (src/remove-tool.ts
+// `runGit`): a successful command resolves stdout with exit code 0, a
+// non-zero git exit is a failed answer with no stdout, and an unreadable
+// failure (no such directory) resolves to exit code 1.
+
+const gitOnPath = hasGit();
+
+const scratchDirs: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(
+    scratchDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })),
+  );
+});
+
+function git(repo: string, ...args: string[]): string {
+  return execFileSync("git", ["-C", repo, ...args], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+}
+
+/** A real scratch repository with one committed file; returns its directory. */
+async function makeScratchRepo(prefix: string): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), prefix));
+  scratchDirs.push(dir);
+  git(dir, "init", "-q");
+  git(dir, "config", "user.email", "test@example.com");
+  git(dir, "config", "user.name", "Test");
+  await writeFile(join(dir, "tracked.txt"), "committed\n");
+  git(dir, "add", "-A");
+  git(dir, "commit", "-qm", "scratch");
+  return dir;
+}
+
+test("runGit resolves a successful command's stdout with exit code 0", async () => {
+  test.skipIf(!gitOnPath);
+  const dir = await makeScratchRepo("cow-remove-git-ok-");
+
+  const run = await runGit(["log", "--oneline"], dir);
+
+  expect(run.code).toBe(0);
+  expect(run.stdout).toContain("scratch");
+});
+
+test("runGit reads a non-zero git exit as a failed answer with no stdout", async () => {
+  test.skipIf(!gitOnPath);
+  const dir = await makeScratchRepo("cow-remove-git-refuse-");
+
+  const run = await runGit(["rev-parse", "--verify", "--quiet", "no-such-ref"], dir);
+
+  expect(run.code).toBe(1);
+  expect(run.stdout).toBe("");
+});
+
+test("runGit resolves an unreadable failure to exit code 1 with no stdout", async () => {
+  test.skipIf(!gitOnPath);
+
+  const run = await runGit(
+    ["status", "--porcelain"],
+    join(tmpdir(), "cow-remove-git-missing-cwd"),
+  );
+
+  expect(run.code).toBe(1);
+  expect(run.stdout).toBe("");
+});
+
+// The plugin's own wiring, driven through a live ctx: real stat
+// (`directoryPresent`) and real git (`runGit`) on a scratch repository, with
+// the inventory and removal faked at the `ctx.worktree` boundary. This pins
+// what the seams-only tests above cannot: the projectID on every remove, the
+// force pass-through, the result text, and the prune seam's forced DELETE.
+
+interface RecordedRemove {
+  projectID: string;
+  directory: string;
+  force: boolean;
+}
+
+/** The remove tool through its live ctx bindings; records ctx.worktree.remove calls. */
+async function registeredRemoveTool(
+  listed: ReadonlyArray<{ directory: string; strategy?: string }>,
+): Promise<{
+  removeCalls: Array<RecordedRemove>;
+  execute: (input: unknown) => Promise<{ output: unknown; content: string }>;
+}> {
+  const registered: Array<{
+    name: string;
+    execute: (input: unknown) => Promise<{ output: unknown; content: string }>;
+  }> = [];
+  const removeCalls: Array<RecordedRemove> = [];
+  const ctx = {
+    location: fakeLocation,
+    worktree: {
+      transform: async (callback: (editor: unknown) => void) => {
+        callback({ add: () => {} });
+        return { dispose: async () => {} };
+      },
+      list: async () => listed,
+      remove: async (input: RecordedRemove) => {
+        removeCalls.push(input);
+      },
+    },
+    tool: {
+      transform: async (callback: (editor: unknown) => void) => {
+        callback({
+          add: (tool: {
+            name: string;
+            execute: (input: unknown) => Promise<{ output: unknown; content: string }>;
+          }) => registered.push(tool),
+        });
+        return { dispose: async () => {} };
+      },
+    },
+  } as unknown as Parameters<typeof plugin.setup>[0];
+
+  await plugin.setup(ctx);
+  const tool = registered.find((entry) => entry.name === "remove_worktree");
+  if (tool === undefined) throw new Error("remove_worktree was not registered");
+  return { removeCalls, execute: (input) => tool.execute(input) };
+}
+
+test("the registered remove_worktree tool removes a landed worktree through the live ctx", async () => {
+  test.skipIf(!gitOnPath);
+  const dir = await makeScratchRepo("cow-remove-live-ok-");
+  const { removeCalls, execute } = await registeredRemoveTool([
+    { directory: dir, strategy: "cow" },
+  ]);
+
+  const result = await execute({ directory: dir });
+
+  expect(result.output).toEqual({ directory: dir });
+  expect(result.content).toBe(`Removed cow worktree ${dir}.`);
+  expect(removeCalls).toEqual([{ projectID: "prj_test", directory: dir, force: false }]);
+});
+
+test("the registered remove_worktree tool carries force through and names the bypass", async () => {
+  test.skipIf(!gitOnPath);
+  const dir = await makeScratchRepo("cow-remove-live-force-");
+  const { removeCalls, execute } = await registeredRemoveTool([
+    { directory: dir, strategy: "cow" },
+  ]);
+
+  const result = await execute({ directory: dir, force: true });
+
+  expect(result.content).toBe(
+    `Removed cow worktree ${dir}. Force was used: the landed-ness guard was bypassed.`,
+  );
+  expect(removeCalls).toEqual([{ projectID: "prj_test", directory: dir, force: true }]);
+});
+
+test("the registered remove_worktree tool refuses a dangling inventory row", async () => {
+  const gone = join(tmpdir(), "cow-remove-live-gone");
+  const { execute } = await registeredRemoveTool([{ directory: gone, strategy: "cow" }]);
+
+  await expect(execute({ directory: gone })).rejects.toThrow(/dangling/);
+});
+
+test("the registered remove_worktree tool propagates a non-ENOENT stat failure", async () => {
+  // A self-referential symlink makes stat answer ELOOP — a real anomaly the
+  // dangling-row pre-check must surface, not absorb. Works on any filesystem,
+  // as any user.
+  const base = await mkdtemp(join(tmpdir(), "cow-remove-live-loop-"));
+  scratchDirs.push(base);
+  const loop = join(base, "loop");
+  await symlink(loop, loop);
+  const { execute } = await registeredRemoveTool([{ directory: loop, strategy: "cow" }]);
+
+  await expect(execute({ directory: loop })).rejects.toThrow(/loop|ELOOP|too many/i);
+});
+
+test("the registered list_worktrees tool prunes a dangling row through the live ctx", async () => {
+  const gone = join(tmpdir(), "cow-list-live-prune-gone");
+  const registered: Array<{
+    name: string;
+    execute: (input: unknown) => Promise<{ output: unknown; content: string }>;
+  }> = [];
+  const removeCalls: Array<RecordedRemove> = [];
+  const ctx = {
+    location: fakeLocation,
+    worktree: {
+      transform: async (callback: (editor: unknown) => void) => {
+        callback({ add: () => {} });
+        return { dispose: async () => {} };
+      },
+      list: async () => [{ directory: gone, strategy: "cow" }],
+      remove: async (input: RecordedRemove) => {
+        removeCalls.push(input);
+      },
+    },
+    tool: {
+      transform: async (callback: (editor: unknown) => void) => {
+        callback({
+          add: (tool: {
+            name: string;
+            execute: (input: unknown) => Promise<{ output: unknown; content: string }>;
+          }) => registered.push(tool),
+        });
+        return { dispose: async () => {} };
+      },
+    },
+  } as unknown as Parameters<typeof plugin.setup>[0];
+  await plugin.setup(ctx);
+  const tool = registered.find((entry) => entry.name === "list_worktrees");
+  if (tool === undefined) throw new Error("list_worktrees was not registered");
+
+  const result = await tool.execute({ missing: "prune" });
+
+  expect(removeCalls).toEqual([{ projectID: "prj_test", directory: gone, force: true }]);
+  expect(result.output).toEqual({ worktrees: [] });
 });
