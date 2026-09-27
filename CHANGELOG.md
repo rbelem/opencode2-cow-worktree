@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.4.0
+
+The cow lifecycle is complete: worktrees can now be removed by the agent, not
+only created and listed. And a class of project roots that could never clone
+at all — those carrying a live socket — now clone cleanly.
+
+- **`remove_worktree`**: agent-facing removal wrapping the strategy remove
+  path. The call names the worktree by `name` or `directory` (exactly one of
+  the two, resolved against the inventory), refuses anything the inventory
+  does not know as a cow worktree, and refuses rows whose directory is
+  already gone — until upstream candidate 8 lands, a dangling row cannot be
+  de-registered through the API. The landed-ness guard fails closed: HEAD
+  must be an ancestor of the landing ref (`origin/HEAD`, else `main`, else
+  `master`), or the tree must be clean with no unique commits; `force: true`
+  bypasses the guard and the result says so.
+- **`list_worktrees` gains the `missing` knob** (ADR 0003's dangling-row
+  story). An ENOENT on a listed directory still fails the listing loudly by
+  default; `missing: "report"` returns the row flagged `missing: true`
+  without a derived `createdAt`, and `missing: "prune"` de-registers the row
+  through the inventory's own remove (forced) and drops it from the listing.
+  Any non-ENOENT stat failure remains a hard failure in every mode. Prune is
+  gated on upstream candidate 8: `Worktree.remove` resolves the real path
+  before reading the record, so a gone directory answers 400 even at force.
+- **Clone skips sockets, FIFOs, and device nodes** (#17). A live daemon
+  socket at a project root (e.g. `.codegraph/daemon.sock`) classified as a
+  plain file, failed FICLONE with `EOPNOTSUPP`, and rolled the whole clone
+  back — every cow clone on such a root aborted. The entries are now
+  classified "special" and omitted: runtime state the clone's own daemons
+  recreate, never tree content. Pinned by a real `node:net` unix-socket
+  integration test that runs on any filesystem.
+
+Also in this release:
+
+- Docs: upstream candidates 9-11 filed from the 2026-09-20 field run.
+- The coverage gate is green again at 100% lines on all 22 gated files:
+  `remove_worktree`'s plugin wiring (the live `ctx.worktree` remove calls,
+  force pass-through, result text, and the prune seam) and the live git
+  binding are now pinned by tests. Suite: 344 tests.
+
 ## 0.3.0
 
 Adapted to the projectID-era opencode2 worktree API (20260915 nightlies and
