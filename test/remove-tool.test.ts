@@ -12,12 +12,13 @@ import plugin from "../src/plugin";
 
 // remove_worktree's decision-table pins, driven through fake seams —
 // no opencode2, no filesystem, no git. The git seam is a responder keyed by
-// the four commands the landed-ness guard runs (`symbolic-ref`,
+// the commands the landed-ness guard runs (`symbolic-ref`,
 // `rev-parse --verify --quiet`, `merge-base --is-ancestor`,
-// `rev-list --count`), so every test states its scenario as data. The final
-// block pins the live git binding itself (`runGit`) against a real scratch
-// repository: the fake seam's `GitRun` answers are only meaningful because
-// the real binding keeps the same contract.
+// `rev-list --count`, and the refusal path's `fetch`), so every test states
+// its scenario as data. The final block pins the live git binding itself
+// (`runGit`) against a real scratch repository: the fake seam's `GitRun`
+// answers are only meaningful because the real binding keeps the same
+// contract.
 
 const WT = "/wt/worker";
 
@@ -36,6 +37,10 @@ interface GitScript {
   readonly mergeBase?: number;
   /** `rev-list --count`'s answer; absent means exit 1 with no output. */
   readonly revList?: { code: number; stdout: string };
+  /** `fetch`'s exit code; absent means 0 (the refresh succeeds). */
+  readonly fetch?: number;
+  /** The script the seam answers with after a successful fetch; absent means unchanged. */
+  readonly afterFetch?: GitScript;
 }
 
 /** Builds the git seam from a script; records every call for the assertions. */
@@ -44,23 +49,29 @@ function gitResponder(script: GitScript): {
   calls: Array<{ args: string[]; cwd: string }>;
 } {
   const calls: Array<{ args: string[]; cwd: string }> = [];
+  let active = script;
   const run = (args: string[], cwd: string): GitRun => {
     calls.push({ args, cwd });
     const [command] = args;
+    if (command === "fetch") {
+      const answer = { code: active.fetch ?? 0, stdout: "" };
+      if (answer.code === 0 && active.afterFetch) active = active.afterFetch;
+      return answer;
+    }
     if (command === "symbolic-ref") {
-      return script.symbolicRef ?? { code: 1, stdout: "" };
+      return active.symbolicRef ?? { code: 1, stdout: "" };
     }
     if (command === "rev-parse") {
       const ref = args[args.length - 1]!;
-      return (script.verifiedRefs ?? []).includes(ref)
+      return (active.verifiedRefs ?? []).includes(ref)
         ? { code: 0, stdout: `${ref}\n` }
         : { code: 1, stdout: "" };
     }
     if (command === "merge-base") {
-      return { code: script.mergeBase ?? 1, stdout: "" };
+      return { code: active.mergeBase ?? 1, stdout: "" };
     }
     if (command === "rev-list") {
-      return script.revList ?? { code: 1, stdout: "" };
+      return active.revList ?? { code: 1, stdout: "" };
     }
     throw new Error(`fake git seam received an unexpected command: ${String(command)}`);
   };
@@ -256,6 +267,82 @@ test("an undetectable landing ref refuses without force", async () => {
 
   await expect(removeWorktree({ directory: WT }, deps)).rejects.toThrow(
     /landing ref could not be determined.*Re-run with force to remove anyway/s,
+  );
+  expect(removed).toEqual([]);
+});
+
+// The refusal path's refresh (issue #16): a cow lane's origin/<branch> refs
+// freeze at clone time, so before refusing the guard fetches once and
+// re-judges on the fresh refs. A fetch failure keeps the refusal and says
+// the verdict is stale-limited.
+
+test("a refusal refreshes origin once and re-judges on the fresh refs", async () => {
+  const git = gitResponder({
+    verifiedRefs: ["main"],
+    mergeBase: 1,
+    revList: { code: 0, stdout: "1\n" },
+    afterFetch: { verifiedRefs: ["main"], mergeBase: 0 },
+  });
+  const { deps, removed, gitCalls } = fakeDeps({
+    inventory: cowInventory(),
+    present: [WT],
+    git: git.run,
+    uncommitted: [],
+  });
+
+  const result = await removeWorktree({ directory: WT }, deps);
+
+  expect(result).toEqual({ directory: WT, forced: false });
+  expect(removed).toEqual([{ directory: WT, force: false }]);
+  const commands = gitCalls.map((call) => call.args[0]);
+  // One fetch, sandwiched between the stale and the fresh ancestry probe.
+  expect(commands).toEqual([
+    "symbolic-ref",
+    "rev-parse",
+    "merge-base",
+    "rev-list",
+    "fetch",
+    "merge-base",
+    "rev-list",
+  ]);
+});
+
+test("a failed fetch refresh keeps the refusal and names the stale verdict", async () => {
+  const git = gitResponder({
+    verifiedRefs: ["main"],
+    mergeBase: 1,
+    revList: { code: 0, stdout: "4\n" },
+    fetch: 1,
+  });
+  const { deps, removed, gitCalls } = fakeDeps({
+    inventory: cowInventory(),
+    present: [WT],
+    git: git.run,
+    uncommitted: ["dirty.txt"],
+  });
+
+  await expect(removeWorktree({ directory: WT }, deps)).rejects.toThrow(
+    /4 unique commit\(s\).*`git fetch origin` refresh failed.*Re-run with force/s,
+  );
+  expect(removed).toEqual([]);
+  expect(gitCalls.filter((call) => call.args[0] === "fetch")).toHaveLength(1);
+});
+
+test("a successful refresh that still finds unlanded work refuses without the stale note", async () => {
+  const git = gitResponder({
+    verifiedRefs: ["main"],
+    mergeBase: 1,
+    revList: { code: 0, stdout: "4\n" },
+  });
+  const { deps, removed } = fakeDeps({
+    inventory: cowInventory(),
+    present: [WT],
+    git: git.run,
+    uncommitted: ["dirty.txt"],
+  });
+
+  await expect(removeWorktree({ directory: WT }, deps)).rejects.toThrow(
+    /4 unique commit\(s\) and 1 uncommitted file\(s\)\. Re-run with force/s,
   );
   expect(removed).toEqual([]);
 });
@@ -669,4 +756,66 @@ test("the registered list_worktrees tool prunes a dangling row through the live 
 
   expect(removeCalls).toEqual([{ projectID: "prj_test", directory: gone, force: true }]);
   expect(result.output).toEqual({ worktrees: [] });
+});
+
+// Issue #16: a cow lane is a separate clone, so its origin/<branch> refs
+// freeze at clone time. Work the lane committed can land on the remote
+// through another clone (a merged PR), and the guard's stale refs must not
+// turn that landed work into a refusal.
+
+/**
+ * A bare origin plus a lane clone whose origin/* refs are stale: the lane
+ * commits work, that exact commit lands on the remote through an author
+ * clone, and the lane never fetches. Returns the lane directory.
+ */
+async function makeStaleLane(prefix: string): Promise<string> {
+  const base = await mkdtemp(join(tmpdir(), prefix));
+  scratchDirs.push(base);
+  const origin = join(base, "origin.git");
+  const seed = join(base, "seed");
+  const lane = join(base, "lane");
+  const author = join(base, "author");
+
+  git(base, "init", "-q", "-b", "main", "seed");
+  git(seed, "config", "user.email", "test@example.com");
+  git(seed, "config", "user.name", "Test");
+  await writeFile(join(seed, "tracked.txt"), "committed\n");
+  git(seed, "add", "-A");
+  git(seed, "commit", "-qm", "scratch");
+  git(base, "clone", "--bare", "--quiet", "seed", "origin.git");
+  git(base, "clone", "--quiet", "origin.git", "lane");
+  git(lane, "config", "user.email", "test@example.com");
+  git(lane, "config", "user.name", "Test");
+
+  await writeFile(join(lane, "lane.txt"), "lane work\n");
+  git(lane, "add", "-A");
+  git(lane, "commit", "-qm", "lane work");
+  const laneHead = git(lane, "rev-parse", "HEAD").trim();
+
+  // Land the lane's exact commit on the remote through another clone; the
+  // lane's origin/main stays at the seed commit.
+  git(base, "clone", "--quiet", "origin.git", "author");
+  git(author, "fetch", lane, "main");
+  git(author, "merge", "--ff-only", "FETCH_HEAD");
+  git(author, "push", "--quiet", "origin", "main");
+
+  const remoteMain = git(author, "rev-parse", "origin/main").trim();
+  const staleLaneOrigin = git(lane, "rev-parse", "origin/main").trim();
+  if (remoteMain !== laneHead || staleLaneOrigin === laneHead) {
+    throw new Error("fixture failed to produce a stale lane");
+  }
+  return lane;
+}
+
+test("a lane commit landed on the remote after clone time still removes (issue #16)", async () => {
+  test.skipIf(!gitOnPath);
+  const lane = await makeStaleLane("cow-remove-live-stale-");
+  const { removeCalls, execute } = await registeredRemoveTool([
+    { directory: lane, strategy: "cow" },
+  ]);
+
+  const result = await execute({ directory: lane });
+
+  expect(result.content).toBe(`Removed cow worktree ${lane}.`);
+  expect(removeCalls).toEqual([{ projectID: "prj_test", directory: lane, force: false }]);
 });

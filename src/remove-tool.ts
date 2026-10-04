@@ -16,9 +16,14 @@
  * `master`) — or when it is clean *and* holds no commits the landing ref
  * lacks. Anything else refuses, naming exactly what is unlanded, because an
  * agent cleaning up a lane must not destroy the only copy of finished-but-
- * unpushed work. An undetectable landing ref also refuses: "cannot judge" is
- * not "landed". `force: true` bypasses the guard entirely — the human's
- * confirmation, same meaning the TUI's remove confirmation carries.
+ * unpushed work. A cow lane is a separate clone whose `origin/*` refs freeze
+ * at clone time, so a would-be refusal first runs one `git fetch origin` and
+ * re-judges on the fresh refs (issue #16); a pass on stale refs is already
+ * sound, so the happy path never fetches, and a failed fetch keeps the
+ * refusal while saying the verdict is stale-limited. An undetectable landing
+ * ref also refuses: "cannot judge" is not "landed". `force: true` bypasses
+ * the guard entirely — the human's confirmation, same meaning the TUI's
+ * remove confirmation carries.
  *
  * `force` is then passed through **verbatim** to opencode2's
  * `ctx.worktree.remove`. When the guard passed because the tree is clean and
@@ -87,8 +92,9 @@ export interface RemoveWorktreeDeps {
   /**
    * Runs one git command inside the worktree. The landed-ness guard's only
    * contact with git: `symbolic-ref`, `rev-parse --verify --quiet`,
-   * `merge-base --is-ancestor`, and `rev-list --count`. A non-zero exit is an
-   * answer ("no", "cannot"), never an exception.
+   * `merge-base --is-ancestor`, `rev-list --count`, and the refusal path's
+   * `fetch origin` refresh. A non-zero exit is an answer ("no", "cannot"),
+   * never an exception.
    */
   readonly runGit: (args: string[], cwd: string) => Promise<GitRun>;
   /**
@@ -257,11 +263,29 @@ async function assertLanded(
 ): Promise<void> {
   const landingRef = await detectLandingRef(directory, deps);
   if (landingRef === undefined) throw landingRefUnknownError(directory);
-  const check = await landingCheck(directory, landingRef, deps);
+  let check = await landingCheck(directory, landingRef, deps);
+  let refreshFailed = false;
+  if (!landed(check)) {
+    // A cow lane is a separate clone whose origin/<branch> refs freeze at
+    // clone time, so work that landed on the remote afterwards (a merged
+    // PR) looks unlanded here (issue #16). Refresh once and re-judge before
+    // refusing; a pass on stale refs is already sound, so the fetch only
+    // ever runs on the refusal path.
+    const fetched = await deps.runGit(["fetch", "origin"], directory);
+    if (fetched.code === 0) {
+      check = await landingCheck(directory, landingRef, deps);
+    } else {
+      refreshFailed = true;
+    }
+  }
+  if (landed(check)) return;
+  throw unlandedError(directory, landingRef, check, refreshFailed);
+}
+
+/** The guard's allow rule over one probe set. */
+function landed(check: LandingCheck): boolean {
   const clean = check.uncommitted !== undefined && check.uncommitted.length === 0;
-  const countedZero = check.uniqueCommits === 0;
-  if (check.landed || (clean && countedZero)) return;
-  throw unlandedError(directory, landingRef, check);
+  return check.landed || (clean && check.uniqueCommits === 0);
 }
 
 /** What the guard learned about one worktree's landed-ness. */
@@ -348,15 +372,24 @@ async function refResolves(
   return answer.code === 0;
 }
 
-/** The unlanded refusal, naming exactly what has not landed. */
+/**
+ * The unlanded refusal, naming exactly what has not landed. A failed
+ * `fetch` refresh is named too, so the operator knows the counts came from
+ * the refs frozen at clone time.
+ */
 function unlandedError(
   directory: string,
   landingRef: string,
   check: LandingCheck,
+  refreshFailed: boolean,
 ): Error {
+  const stale =
+    "A `git fetch origin` refresh failed, so this verdict used the remote " +
+    "refs frozen at clone time. ";
   return new Error(
     `refusing to remove ${directory}: it holds work that has not landed on ` +
       `${landingRef} — ${describeUnlanded(check.uniqueCommits, check.uncommitted)}. ` +
+      (refreshFailed ? stale : "") +
       "Re-run with force to remove anyway.",
   );
 }
