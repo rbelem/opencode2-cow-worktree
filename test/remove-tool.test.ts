@@ -670,3 +670,65 @@ test("the registered list_worktrees tool prunes a dangling row through the live 
   expect(removeCalls).toEqual([{ projectID: "prj_test", directory: gone, force: true }]);
   expect(result.output).toEqual({ worktrees: [] });
 });
+
+// Issue #16: a cow lane is a separate clone, so its origin/<branch> refs
+// freeze at clone time. Work the lane committed can land on the remote
+// through another clone (a merged PR), and the guard's stale refs must not
+// turn that landed work into a refusal.
+
+/**
+ * A bare origin plus a lane clone whose origin/* refs are stale: the lane
+ * commits work, that exact commit lands on the remote through an author
+ * clone, and the lane never fetches. Returns the lane directory.
+ */
+async function makeStaleLane(prefix: string): Promise<string> {
+  const base = await mkdtemp(join(tmpdir(), prefix));
+  scratchDirs.push(base);
+  const origin = join(base, "origin.git");
+  const seed = join(base, "seed");
+  const lane = join(base, "lane");
+  const author = join(base, "author");
+
+  git(base, "init", "-q", "-b", "main", "seed");
+  git(seed, "config", "user.email", "test@example.com");
+  git(seed, "config", "user.name", "Test");
+  await writeFile(join(seed, "tracked.txt"), "committed\n");
+  git(seed, "add", "-A");
+  git(seed, "commit", "-qm", "scratch");
+  git(base, "clone", "--bare", "--quiet", "seed", "origin.git");
+  git(base, "clone", "--quiet", "origin.git", "lane");
+  git(lane, "config", "user.email", "test@example.com");
+  git(lane, "config", "user.name", "Test");
+
+  await writeFile(join(lane, "lane.txt"), "lane work\n");
+  git(lane, "add", "-A");
+  git(lane, "commit", "-qm", "lane work");
+  const laneHead = git(lane, "rev-parse", "HEAD").trim();
+
+  // Land the lane's exact commit on the remote through another clone; the
+  // lane's origin/main stays at the seed commit.
+  git(base, "clone", "--quiet", "origin.git", "author");
+  git(author, "fetch", lane, "main");
+  git(author, "merge", "--ff-only", "FETCH_HEAD");
+  git(author, "push", "--quiet", "origin", "main");
+
+  const remoteMain = git(author, "rev-parse", "origin/main").trim();
+  const staleLaneOrigin = git(lane, "rev-parse", "origin/main").trim();
+  if (remoteMain !== laneHead || staleLaneOrigin === laneHead) {
+    throw new Error("fixture failed to produce a stale lane");
+  }
+  return lane;
+}
+
+test("a lane commit landed on the remote after clone time still removes (issue #16)", async () => {
+  test.skipIf(!gitOnPath);
+  const lane = await makeStaleLane("cow-remove-live-stale-");
+  const { removeCalls, execute } = await registeredRemoveTool([
+    { directory: lane, strategy: "cow" },
+  ]);
+
+  const result = await execute({ directory: lane });
+
+  expect(result.content).toBe(`Removed cow worktree ${lane}.`);
+  expect(removeCalls).toEqual([{ projectID: "prj_test", directory: lane, force: false }]);
+});
