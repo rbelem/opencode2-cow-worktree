@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.1
+
+Fixes a false refusal class in `remove_worktree`: a lane whose work already
+landed on the remote is no longer refused.
+
+- **The landed-ness guard refreshes stale refs before refusing** (#16). A cow
+  lane is a separate clone whose `origin/*` refs freeze at clone time, so a
+  commit that landed through a merged PR read as unlanded, and the guard
+  refused — training operators to reach for `force`. On the refusal path the
+  guard now runs one `git fetch origin`, re-judges on the fresh refs, and
+  reports that verdict. A pass on stale refs is already sound for
+  fast-forward remotes, so the happy path never fetches. A failed fetch
+  keeps the refusal and names the verdict as stale-limited, preserving the
+  guard's fail-closed posture.
+- Suite: 348 tests. The live-git repro of the issue and three new
+  decision-table rows pin the refresh, the failed refresh, and the
+  unchanged verdict.
+
 ## 0.4.0
 
 The cow lifecycle is complete: worktrees can now be removed by the agent, not
